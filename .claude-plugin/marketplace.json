@@ -1,0 +1,6 @@
+{
+  "name": "cc-orchestrator-mod",
+  "description": "The orchestrator mod: context monitoring, handover and restart for long agent runs.",
+  "owner": { "name": "Victor Bajanov" },
+  "plugins": [{ "name": "orchestrator", "source": "./" }]
+}

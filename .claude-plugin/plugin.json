@@ -1,0 +1,46 @@
+{
+  "name": "orchestrator",
+  "version": "0.1.0",
+  "author": { "name": "Victor Bajanov" },
+  "description": "Watches every agent's context, hands over and respawns agents near the ceiling, restarts the main thread from a handover note, and charts it all in a pane.",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "agentThreshold": {
+      "type": "number",
+      "title": "Subagent handover threshold (tokens)",
+      "description": "A subagent whose context crosses this is told to HANDOVER and is replaced.",
+      "default": 450000
+    },
+    "mainThreshold": {
+      "type": "number",
+      "title": "Main thread handover threshold (tokens)",
+      "description": "The main thread past this writes a handover note, is cleared and resumed from it.",
+      "default": 450000
+    },
+    "mainHandover": {
+      "type": "string",
+      "title": "Main thread handover",
+      "description": "auto: restart without asking; ask: offer a button above the prompt; off: never.",
+      "options": ["ask", "auto", "off"],
+      "default": "ask"
+    },
+    "autoRespawn": {
+      "type": "boolean",
+      "title": "Respawn handed-over subagents",
+      "description": "Spawn a fresh agent with the original brief plus the handover note once one hands over.",
+      "default": true
+    },
+    "runRoot": {
+      "type": "string",
+      "title": "Run folder root",
+      "description": "Where handover notes, roster.md and state.json go (one folder per run). Empty: <project>/.orchestrator, excluded from git.",
+      "default": ""
+    },
+    "injectClause": {
+      "type": "boolean",
+      "title": "Add the HANDOVER clause to every subagent brief",
+      "description": "Appends the cold-restart instructions to each Agent prompt so any agent can be handed over.",
+      "default": true
+    }
+  }
+}
