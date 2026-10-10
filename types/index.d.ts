@@ -40,6 +40,8 @@ export type AgentRow = {
   replacedBy?: string
   /** Spawned by this mod: its final answer is forwarded to `parentId`. */
   isOurs?: boolean
+  /** A named teammate: the engine delivers its final reply to its parent, so the mod does not. */
+  isTeammate?: boolean
   /** How many handovers this row has started; numbers its note paths. */
   handovers?: number
   /** A replacement that started too full for another handover to help: left to run. */
@@ -57,6 +59,7 @@ declare module 'claude-code' {
       log: LogEntry[]
       mainPhase: MainPhase
       runId: string
+      pinnedLog: string
     }
   }
 }

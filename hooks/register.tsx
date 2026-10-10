@@ -31,6 +31,8 @@ const agentsAtom = atom({ plugin: 'orchestrator', key: 'agents' } as const, [] a
 const logAtom = atom({ plugin: 'orchestrator', key: 'log' } as const, [] as LogEntry[])
 const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'idle' as MainPhase)
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
+/** The activity line whose full-text card a click pinned open ('' for none). */
+const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 
 const patch = (rows: AgentRow[], id: string, change: Partial<AgentRow>) =>
   rows.map(r => (r.id === id ? { ...r, ...change } : r))
@@ -172,6 +174,10 @@ async function respawn($: $, old: AgentRow) {
     await log($, `${label(old)}: respawn refused (${res.deny ?? 'no agent id'})`, 'warn')
     return
   }
+  // A teammate's name is suffixed when the original still holds it; the engine delivers its final reply itself.
+  const info = (await $.agent.list()).find(a => a.id === newId)
+  const name = info?.name ?? brief.name
+  const isTeammate = info?.teammateId !== undefined
   const now = await $.clock.now()
   await update($, agentsAtom, l => {
     const known = l.some(a => a.id === newId) ? l : [...l, newRow(newId, now)]
@@ -181,13 +187,14 @@ async function respawn($: $, old: AgentRow) {
         : a.id === newId
           ? {
               ...a,
-              name: brief.name,
+              name,
               description: brief.description,
               type: brief.subagentType,
               brief,
               replaces: old.id,
               parentId: old.parentId,
               isOurs: true,
+              isTeammate,
             }
           : a,
     )
@@ -197,8 +204,8 @@ async function respawn($: $, old: AgentRow) {
     $,
     old.parentId,
     `[orchestrator mod] Agent ${label(old)} (id ${old.id}) reached ${fmtTokens(old.tokens)} context and handed over; note at ${old.notePath}. ` +
-      `Replacement id ${newId}${brief.name ? ` (same name "${brief.name}", so SendMessage by name still reaches it)` : ''} continues from the note. ` +
-      `No action needed: do not spawn another.${old.parentId === 'main' || old.parentId === undefined ? ' Its final report will be forwarded to you.' : ''} Update your roster.`,
+      `Replacement id ${newId}${name ? ` (SendMessage name "${name}")` : ''} continues from the note. ` +
+      `No action needed: do not spawn another.${!isTeammate && (old.parentId === 'main' || old.parentId === undefined) ? ' Its final report will be forwarded to you.' : ''} Update your roster.`,
   )
 }
 
@@ -220,7 +227,7 @@ async function onAgentEnd($: $, id: string, answer: string) {
     }
   } else if (r.status === 'running' || r.status === 'idle') {
     await update($, agentsAtom, l => patch(l, id, { status: 'idle' }))
-    if (r.isOurs && r.parentId !== undefined) {
+    if (r.isOurs && !r.isTeammate && r.parentId !== undefined) {
       const text = `[orchestrator mod] ${label(r)} (id ${id}, replacement for ${r.replaces}) reports:\n\n${answer}`
       if (r.parentId === 'main') $.clock.after(0, () => void $.prompt.submit({ text }))
       else await $.session.send({ to: { agentId: r.parentId }, text })
@@ -483,8 +490,9 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const rows = await read($, agentsAtom)
+    const pinned = await read($, pinnedAtom)
     const entries = await read($, logAtom)
     const phase = await read($, phaseAtom)
     const cols = e.props.bodyColumns ?? e.viewport?.columns ?? 80
@@ -537,12 +545,44 @@ export const register: Register = (on, options) => {
         </Text>
         <Text bold>Activity</Text>
         {entries.length === 0 && <Text dimColor>Nothing yet.</Text>}
-        {entries.slice(-room).map((l, i) => (
-          <Text key={`l${i}`} color={l.level === 'warn' ? 'warning' : undefined} wrap="truncate">
-            <Text dimColor>{hhmm(l.t)} </Text>
-            {l.text}
-          </Text>
-        ))}
+        {entries.slice(-room).map((l, i) => {
+          const color = l.level === 'warn' ? 'warning' : undefined
+          const fits = cols - 6
+          if (l.text.length <= fits) {
+            return (
+              <Text key={`l${i}`} color={color} wrap="truncate">
+                <Text dimColor>{hhmm(l.t)} </Text>
+                {l.text}
+              </Text>
+            )
+          }
+          // Too long: cut with an ellipsis; the full text shows in a card above while hovered, or pinned by a click.
+          const id = `log-${l.t}-${l.text.length}`
+          const inner = Math.max(10, cols - 4)
+          const lines = Math.ceil(l.text.length / inner) + 2
+          return (
+            <Box key={`l${i}`}>
+              <Button key={id} plain onPress={() => update($, pinnedAtom, p => (p === id ? '' : id))}>
+                <Text dimColor>{hhmm(l.t)} </Text>
+                <Text color={color}>{`${l.text.slice(0, Math.max(1, fits - 1))}…`}</Text>
+              </Button>
+              <Box
+                position="absolute"
+                top={-lines}
+                left={0}
+                width={cols}
+                borderStyle="round"
+                paddingX={1}
+                display={pinned === id ? 'flex' : 'none'}
+                hover={pinned === id ? undefined : { display: 'flex' }}
+              >
+                <Text color={color} wrap="wrap">
+                  {l.text}
+                </Text>
+              </Box>
+            </Box>
+          )
+        })}
       </Box>
     )
   })
