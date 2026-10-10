@@ -206,3 +206,24 @@ export const rosterMarkdown = (rows: readonly AgentRow[]): string =>
     ),
     '',
   ].join('\n')
+
+/** Word-wraps text to `width` columns, hard-breaking longer words, each line padded so it paints every cell. */
+export const wrapFill = (text: string, width: number): string[] => {
+  const lines: string[] = []
+  let line = ''
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    let w = word
+    if (line && line.length + 1 + w.length <= width) {
+      line += ` ${w}`
+      continue
+    }
+    if (line) lines.push(line)
+    while (w.length > width) {
+      lines.push(w.slice(0, width))
+      w = w.slice(width)
+    }
+    line = w
+  }
+  if (line || lines.length === 0) lines.push(line)
+  return lines.map(l => l.padEnd(width))
+}

@@ -15,6 +15,7 @@ import {
   sparkline,
   timeline,
   handoverMessage,
+  wrapFill,
 } from './core'
 import type { AgentRow } from '../types'
 
@@ -216,5 +217,14 @@ describe('handoverMessage', () => {
   })
   test('tells the parent to respawn when the mod does not', () => {
     expect(handoverMessage('/n.md', false)).toContain('spawn a replacement')
+  })
+})
+
+describe('wrapFill', () => {
+  test('wraps at word breaks and pads every line to the full width', () => {
+    expect(wrapFill('probe2 handed over to the next one', 12)).toEqual(['probe2      ', 'handed over ', 'to the next ', 'one         '])
+  })
+  test('hard-breaks a word longer than the width', () => {
+    expect(wrapFill('/a/very/long/path ok', 8)).toEqual(['/a/very/', 'long/pat', 'h ok    '])
   })
 })
