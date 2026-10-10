@@ -119,11 +119,25 @@ async function startHandover($: $, id: string, why: string) {
   const notePath = notePathFor(await runDir($), r, attempt)
   const now = await $.clock.now()
   await update($, agentsAtom, l =>
-    patch(l, id, { status: 'handing-over', notePath, handoverAt: now, handovers: attempt }),
+    patch(l, id, { status: 'handing-over', notePath, handoverAt: now, handovers: attempt, handoverVia: undefined }),
   )
-  const sent = await $.session.send({ to: { agentId: id }, text: handoverMessage(notePath, cfg.autoRespawn) })
-  if (sent.isDelivered) await log($, `${label(r)} ${why}: HANDOVER sent`)
-  else {
+  if (r.status === 'idle') return sendHandover($, id, why)
+  // A message would wait in a busy teammate's inbox until its turn ends: it rides on the next tool result instead.
+  await log($, `${label(r)} ${why}: HANDOVER goes with its next tool result`)
+  await persist($)
+  return true
+}
+
+/** Sends HANDOVER as a message, which wakes an idle teammate or resumes a finished subagent. */
+async function sendHandover($: $, id: string, why: string) {
+  const r = (await read($, agentsAtom)).find(a => a.id === id)
+  if (!r?.notePath) return false
+  const sent = await $.session.send({ to: { agentId: id }, text: handoverMessage(r.notePath, cfg.autoRespawn) })
+  if (sent.isDelivered) {
+    const now = await $.clock.now()
+    await update($, agentsAtom, l => patch(l, id, { handoverVia: 'message', handoverAt: now }))
+    await log($, `${label(r)} ${why}: HANDOVER sent`)
+  } else {
     await update($, agentsAtom, l => patch(l, id, { status: 'stalled' }))
     await log($, `${label(r)}: HANDOVER could not be delivered (${sent.reason})`, 'warn')
   }
@@ -196,11 +210,15 @@ async function onAgentEnd($: $, id: string, answer: string) {
       await update($, agentsAtom, l => patch(l, id, { status: 'replaced' }))
       await log($, `${label(r)} handed over (${r.notePath})`)
       if (cfg.autoRespawn) await respawn($, { ...r, status: 'replaced' })
+    } else if (r.handoverVia !== 'message') {
+      // It finished before a tool result could carry the HANDOVER: the message wakes it to write the note.
+      await sendHandover($, id, 'ended before seeing it')
+      return
     } else {
       await update($, agentsAtom, l => patch(l, id, { status: 'done' }))
       await log($, `${label(r)} ended without writing its handover note`, 'warn')
     }
-  } else {
+  } else if (r.status === 'running' || r.status === 'idle') {
     await update($, agentsAtom, l => patch(l, id, { status: 'idle' }))
     if (r.isOurs && r.parentId !== undefined) {
       const text = `[orchestrator mod] ${label(r)} (id ${id}, replacement for ${r.replaces}) reports:\n\n${answer}`
@@ -280,7 +298,8 @@ async function finishMainHandover($: $) {
 
 async function checkMain($: $, tokens: number) {
   const phase = await read($, phaseAtom)
-  if (phase === 'cooldown' && tokens < cfg.mainThreshold) await setPhase($, 'idle')
+  // 'clearing' too: a restart cut short (Esc) never reaches cooldown, so the next main step settles it.
+  if ((phase === 'cooldown' || phase === 'clearing') && tokens < cfg.mainThreshold) await setPhase($, 'idle')
   if (phase === 'idle' && cfg.mainMode !== 'off' && tokens >= cfg.mainThreshold) {
     await setPhase($, 'offered')
     if (cfg.mainMode === 'ask') {
@@ -385,6 +404,22 @@ export const register: Register = (on, options) => {
       $.ui.log(`orchestrator: step not recorded: ${String(err)}`)
     }
     return res
+  })
+
+  on('tool.call', async ($, e, next) => {
+    const res = await next(e)
+    if (e.agentId === undefined || res.deny !== undefined) return res
+    try {
+      const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
+      if (r?.status !== 'handing-over' || r.handoverVia || !r.notePath) return res
+      await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
+      await log($, `${label(r)}: HANDOVER delivered with a tool result`)
+      await persist($)
+      return { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+    } catch (err) {
+      $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
+      return res
+    }
   })
 
   on('turn.complete', async ($, e, next) => {

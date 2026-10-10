@@ -31,6 +31,11 @@ export type AgentRow = {
   brief?: Brief
   notePath?: string
   handoverAt?: number
+  /**
+   * How the HANDOVER reached it: with a tool result while it ran, or as a message
+   * once idle (which a teammate only reads between turns). Absent until it has.
+   */
+  handoverVia?: 'tool' | 'message'
   replaces?: string
   replacedBy?: string
   /** Spawned by this mod: its final answer is forwarded to `parentId`. */
