@@ -18,6 +18,8 @@ const world = (on: On) => {
     files: new Map<string, string>(),
     toasts: [] as string[],
     opened: [] as string[],
+    /** Runs while /clear is in flight, as a turn the person starts before the restart finishes. */
+    duringClear: undefined as (() => Promise<unknown>) | undefined,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -35,8 +37,9 @@ const world = (on: On) => {
     w.prompts.push(e.text)
     return { text: e.text }
   })
-  on('command.run', ($, e) => {
+  on('command.run', async ($, e) => {
     w.commands.push(e.command)
+    if (e.command === 'clear') await w.duringClear?.()
     return { text: '' }
   })
   on('agent.spawn', ($, e) => {
@@ -82,7 +85,8 @@ const world = (on: On) => {
     }
   })
   on('turn.complete', ($, e) => ({ text: e.answer }))
-  return { ...w, session }
+  on('tool.call', () => ({ result: 'ok' }) as never)
+  return Object.assign(w, { session })
 }
 
 import type { Engine } from 'claude-code/testing'
@@ -108,6 +112,10 @@ const step = async ($: Engine, agentId?: string) => {
   for await (const _ of s) void _
   return s.result
 }
+
+/** One tool call in an agent's loop; `context` is what the model reads after the result. */
+const tool = async ($: Engine, agentId: string) =>
+  (await $.tool.call({ tool: 'Read', file_path: '/x', tool_use_id: 'tu', agentId } as never)) as { context?: readonly string[] }
 
 const complete = ($: Engine, agentId: string | undefined, answer = 'done') =>
   $.turn.complete({ answer, durationMs: 5, isAborted: false, turnId: 'T', agentId, reason: 'answer' })
@@ -137,23 +145,62 @@ describe('subagents', () => {
     expect(w.spawns[0]!.prompt).toBe('Implement task 1.')
   })
 
-  test('records each step of an agent and sends HANDOVER once past the threshold', async ($, on) => {
+  test('records each step and hands HANDOVER to a running agent with its next tool result', async ($, on) => {
     const w = world(on)
     await start($)
     await spawn($, { prompt: 'P', name: 'impl-1' })
     w.tokens.set('agent1', 200_000)
     await step($, 'agent1')
-    expect(w.sent).toHaveLength(0)
     expect(row(w, 'agent1')!.tokens).toBe(200_000)
+    expect((await tool($, 'agent1')).context).toBeUndefined()
 
     w.tokens.set('agent1', 460_000)
     await step($, 'agent1')
     await step($, 'agent1')
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+    // a message would sit in a busy teammate's inbox until its turn ends: none is sent
+    expect(w.sent).toHaveLength(0)
+
+    const seen = (await tool($, 'agent1')).context ?? []
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toContain('HANDOVER')
+    expect(seen[0]).toContain(`${RUN_DIR}/handover/impl-1-agent1-1.md`)
+    // once only, and never in another agent's loop
+    expect((await tool($, 'agent1')).context).toBeUndefined()
+    expect((await tool($, 'other')).context).toBeUndefined()
+  })
+
+  test('sends HANDOVER to an agent that ended its turn before seeing it, then respawns once it writes the note', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'probe' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await complete($, 'agent1', 'my 16 lines')
     expect(w.sent).toHaveLength(1)
     expect(w.sent[0]!.to).toContain('agent1')
     expect(w.sent[0]!.text).toContain('HANDOVER')
-    expect(w.sent[0]!.text).toContain(`${RUN_DIR}/handover/impl-1-agent1-1.md`)
     expect(row(w, 'agent1')!.status).toBe('handing-over')
+    expect(w.spawns).toHaveLength(1)
+
+    // the message wakes it; it writes the note and ends again
+    w.files.set(`${RUN_DIR}/handover/probe-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    expect(w.spawns).toHaveLength(2)
+    expect(row(w, 'agent1')!.status).toBe('replaced')
+  })
+
+  test('a replaced agent that ends again stays replaced', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1')
+    await complete($, 'agent1', 'woke on a late message')
+    expect(row(w, 'agent1')!.status).toBe('replaced')
+    expect(w.spawns).toHaveLength(2)
   })
 
   test('respawns from the note once the agent ends having written it', async ($, on) => {
@@ -192,7 +239,7 @@ describe('subagents', () => {
     w.tokens.set('agent2', 460_000)
     await step($, 'agent2')
     await step($, 'agent2')
-    expect(w.sent.filter(m => m.text.includes('HANDOVER'))).toHaveLength(1)
+    expect((await tool($, 'agent2')).context).toBeUndefined()
     expect(row(w, 'agent2')!.status).toBe('running')
     expect(w.toasts.some(t => t.includes('starts at'))).toBe(true)
     expect(w.toasts.filter(t => t.includes('starts at'))).toHaveLength(1)
@@ -204,19 +251,20 @@ describe('subagents', () => {
     await spawn($, { prompt: 'P', name: 'impl-1' })
     w.tokens.set('agent1', 460_000)
     await step($, 'agent1')
-    expect(w.sent[0]!.text).toContain('spawn a replacement')
+    expect((await tool($, 'agent1')).context![0]).toContain('spawn a replacement')
     w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
     await complete($, 'agent1')
     expect(w.spawns).toHaveLength(1)
     expect(row(w, 'agent1')!.status).toBe('replaced')
   })
 
-  test('marks an agent done, not replaced, when it ended without writing the note', async ($, on) => {
+  test('marks an agent done, not replaced, when it ended twice without writing the note', async ($, on) => {
     const w = world(on)
     await start($)
     await spawn($, { prompt: 'P', name: 'impl-1' })
     w.tokens.set('agent1', 460_000)
     await step($, 'agent1')
+    await complete($, 'agent1')
     await complete($, 'agent1')
     expect(w.spawns).toHaveLength(1)
     expect(row(w, 'agent1')!.status).toBe('done')
@@ -296,6 +344,26 @@ describe('main thread', () => {
     expect(phase(w)).toBe('idle')
   })
 
+  test('a main step below the threshold leaves a clearing phase the restart never finished', AUTO, async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.tokens.set('main', 150_000)
+    await step($)
+    await complete($, undefined)
+    await w.clock.advance(10)
+    w.files.set(`${RUN_DIR}/handover/main-1.md`, 'THE MAIN NOTE')
+    let seen: string[] = []
+    w.duringClear = async () => {
+      seen.push(phase(w))
+      w.tokens.set('main', 20_000)
+      await step($) // the person types into the fresh context
+      seen.push(phase(w))
+    }
+    await complete($, undefined)
+    await w.clock.advance(10)
+    expect(seen).toEqual(['clearing', 'idle'])
+  })
+
   test('does not clear when the note was not written', AUTO, async ($, on) => {
     const w = world(on)
     await start($)
@@ -366,7 +434,20 @@ describe('pane', () => {
     await spawn($, { prompt: 'P', name: 'impl-1' })
     await step($, 'agent1')
     await $.command.run({ command: 'orch', args: 'handover impl-1' } as never)
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+    expect(w.sent).toHaveLength(0)
+    expect((await tool($, 'agent1')).context![0]).toContain('HANDOVER')
+  })
+
+  test('/orch handover of an idle agent sends HANDOVER, which wakes it', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    await step($, 'agent1')
+    await complete($, 'agent1')
+    await $.command.run({ command: 'orch', args: 'handover impl-1' } as never)
     expect(w.sent).toHaveLength(1)
+    expect(w.sent[0]!.text).toContain('HANDOVER')
     expect(row(w, 'agent1')!.status).toBe('handing-over')
   })
 })
