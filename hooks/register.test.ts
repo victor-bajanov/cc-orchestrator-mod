@@ -20,6 +20,8 @@ const world = (on: On) => {
     opened: [] as string[],
     /** Runs while /clear is in flight, as a turn the person starts before the restart finishes. */
     duringClear: undefined as (() => Promise<unknown>) | undefined,
+    /** What `$.agent.list()` answers. */
+    agents: [] as { id: string; name?: string; teammateId?: string }[],
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -27,7 +29,7 @@ const world = (on: On) => {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
   on('session.root', () => ({ value: '/repo' }))
-  on('agent.list', () => ({ value: [] }))
+  on('agent.list', () => ({ value: w.agents as never }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.send', ($, e) => {
     w.sent.push({ to: e.to, text: e.text })
@@ -285,6 +287,30 @@ describe('subagents', () => {
     expect(w.prompts.some(p => p.includes('FINAL REPORT'))).toBe(true)
   })
 
+  test('a teammate replacement: the parent learns the name the engine gave it, and its report is not forwarded twice', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'Read files.', name: 'probe' })
+    // the original still holds "probe", so the engine suffixes the replacement's name
+    w.agents = [
+      { id: 'agent1', name: 'probe', teammateId: 'probe@s' },
+      { id: 'agent2', name: 'probe-2', teammateId: 'probe-2@s' },
+    ]
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/probe-agent1-1.md`, 'x')
+    await complete($, 'agent1')
+    const told = JSON.stringify(w.session.appended())
+    expect(told).toContain('probe-2')
+    expect(told).not.toContain('same name')
+    expect(row(w, 'agent2')!.name).toBe('probe-2')
+
+    // the engine already delivers a teammate's final reply to its parent
+    await complete($, 'agent2', 'FINAL REPORT')
+    await w.clock.advance(10)
+    expect(w.prompts.some(p => p.includes('FINAL REPORT'))).toBe(false)
+  })
+
   test('keeps the run folder in the project, excluded from git', async ($, on) => {
     const w = world(on)
     w.files.set('/repo/.git/info/exclude', '# git ls-files --others --exclude-from=.git/info/exclude\n')
@@ -426,6 +452,39 @@ describe('pane', () => {
       expect(await ui.find({ text: /300k/ })).toBeDefined()
       await ui.unmount()
     }
+  })
+
+  test('a truncated activity line shows its full text in a card on hover, pinned by a click', async ($, on) => {
+    const w = world(on)
+    await start($)
+    const name = 'a-rather-long-agent-name-that-will-not-fit-in-a-narrow-pane'
+    await spawn($, { prompt: 'P', name })
+    const ui = await $.ui.mount({
+      plugin: 'orchestrator',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'orchestrator',
+      props: { bodyColumns: 40 } as never,
+    })
+    const line = (await ui.findAll({ type: 'Button' })).find(b => b.text.includes('spawned'))!
+    expect(line).toBeDefined()
+    expect(line.text).toContain('…')
+    expect(line.text).not.toContain(name)
+
+    type Drawn = { type: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
+    const walk = (n: unknown): Drawn[] =>
+      n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+    const card = async () =>
+      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes(name))!
+
+    expect((await card()).props!.display).toBe('none')
+    expect((await card()).hover).toMatchObject({ display: 'flex' })
+
+    await ui.press({ key: line.key! })
+    expect((await card()).props!.display).toBe('flex')
+    await ui.press({ key: line.key! })
+    expect((await card()).props!.display).toBe('none')
+    await ui.unmount()
   })
 
   test('/orch handover <name> hands that agent over now', async ($, on) => {
