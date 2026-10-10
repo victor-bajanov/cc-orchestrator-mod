@@ -330,8 +330,8 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'orch',
-      description: 'Orchestrator: open the agents pane, show the roster, or hand an agent (or main) over now',
-      argumentHint: '[roster | handover [name|id]]',
+      description: 'Orchestrator: open or close the agents pane, show the roster, or hand an agent (or main) over now',
+      argumentHint: '[close | roster | handover [name|id]]',
     })
     await runDir($)
     await excludeFromGit($).catch(() => undefined)
@@ -455,6 +455,10 @@ export const register: Register = (on, options) => {
       await $.ui.open({ id: PANE, title: 'Orchestrator' })
       return { text: 'Orchestrator pane opened.' }
     }
+    if (verb === 'close') {
+      await $.ui.close({ id: PANE })
+      return { text: 'Orchestrator pane closed; /orch opens it again.' }
+    }
     if (verb === 'roster') return { text: rosterMarkdown(await read($, agentsAtom)) }
     if (verb === 'handover' && (!target || target === 'main')) {
       $.clock.after(0, () => void startMainHandover($))
@@ -468,7 +472,7 @@ export const register: Register = (on, options) => {
       const ok = await startHandover($, r.id, 'by /orch')
       return { text: ok ? `HANDOVER sent to ${label(r)} (${r.id}).` : `Could not hand ${label(r)} over.` }
     }
-    return { text: 'Usage: /orch [roster | handover [name|id|main]]' }
+    return { text: 'Usage: /orch [close | roster | handover [name|id|main]]' }
   })
 
   // ---- drawing ---------------------------------------------------------

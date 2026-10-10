@@ -22,6 +22,7 @@ const world = (on: On) => {
     duringClear: undefined as (() => Promise<unknown>) | undefined,
     /** What `$.agent.list()` answers. */
     agents: [] as { id: string; name?: string; teammateId?: string }[],
+    closed: [] as string[],
     /** The status line as last set. */
     status: undefined as string | undefined,
   }
@@ -70,6 +71,10 @@ const world = (on: On) => {
     return { value: undefined }
   })
   on('ui.notify', () => ({ value: { isSent: true, channel: 'terminal_bell' } }))
+  on('ui.close', ($, e) => {
+    w.closed.push(e.id)
+    return { value: undefined }
+  })
   on('ui.open', ($, e) => {
     w.opened.push(e.id)
     return { value: { isPlaced: true } }
@@ -507,6 +512,14 @@ describe('pane', () => {
     await ui.press({ key: line.key! })
     expect((await card()).props!.display).toBe('none')
     await ui.unmount()
+  })
+
+  test('/orch close closes the pane', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await $.command.run({ command: 'orch', args: '' } as never)
+    await $.command.run({ command: 'orch', args: 'close' } as never)
+    expect(w.closed).toEqual(['orchestrator'])
   })
 
   test('/orch handover <name> hands that agent over now', async ($, on) => {
