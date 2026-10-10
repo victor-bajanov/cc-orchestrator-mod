@@ -22,6 +22,8 @@ const world = (on: On) => {
     duringClear: undefined as (() => Promise<unknown>) | undefined,
     /** What `$.agent.list()` answers. */
     agents: [] as { id: string; name?: string; teammateId?: string }[],
+    /** The status line as last set. */
+    status: undefined as string | undefined,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -63,7 +65,10 @@ const world = (on: On) => {
     w.toasts.push(e.text)
     return { value: undefined }
   })
-  on('ui.status', () => ({ value: undefined }))
+  on('ui.status', ($, e) => {
+    w.status = e.text
+    return { value: undefined }
+  })
   on('ui.notify', () => ({ value: { isSent: true, channel: 'terminal_bell' } }))
   on('ui.open', ($, e) => {
     w.opened.push(e.id)
@@ -327,6 +332,17 @@ describe('subagents', () => {
     expect(w.files.has('/notes/S1/roster.md')).toBe(true)
   })
 
+  test('the status line counts one agent in the singular', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    await step($, 'agent1')
+    expect(w.status).toMatch(/^1 agent,/)
+    await spawn($, { prompt: 'P', name: 'impl-2' })
+    await step($, 'agent2')
+    expect(w.status).toMatch(/^2 agents,/)
+  })
+
   test('writes the roster file as agents change', async ($, on) => {
     const w = world(on)
     await start($)
@@ -475,10 +491,16 @@ describe('pane', () => {
     const walk = (n: unknown): Drawn[] =>
       n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
     const card = async () =>
-      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes(name))!
+      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('spawned'))!
 
     expect((await card()).props!.display).toBe('none')
     expect((await card()).hover).toMatchObject({ display: 'flex' })
+    // it overlays other lines: every cell inside the border is painted, so nothing shows through
+    const rowsOf = JSON.stringify((await card()).children).match(/"[^"]*"/g)!.map(t => JSON.parse(t) as string)
+    const painted = rowsOf.filter(t => t.length > 10)
+    expect(painted.length).toBeGreaterThan(1)
+    expect(new Set(painted.map(t => t.length)).size).toBe(1)
+    expect((await card()).props!.paddingX).toBeUndefined()
 
     await ui.press({ key: line.key! })
     expect((await card()).props!.display).toBe('flex')

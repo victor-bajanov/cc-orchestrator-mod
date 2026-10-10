@@ -18,6 +18,7 @@ import {
   resumePrompt,
   rosterMarkdown,
   timeline,
+  wrapFill,
 } from './core'
 
 type $ = EngineInterface
@@ -103,7 +104,7 @@ async function persist($: $) {
   const top = live.reduce((m, a) => Math.max(m, a.tokens), 0)
   $.ui.status(
     [
-      live.length ? `${live.length} agents, max ${fmtTokens(top)}/${fmtTokens(cfg.agentThreshold)}` : '',
+      live.length ? `${live.length} agent${live.length === 1 ? '' : 's'}, max ${fmtTokens(top)}/${fmtTokens(cfg.agentThreshold)}` : '',
       main ? `main ${fmtTokens(main.tokens)}/${fmtTokens(cfg.mainThreshold)}` : '',
       mainPhase !== 'idle' && mainPhase !== 'cooldown' ? `handover: ${mainPhase}` : '',
     ]
@@ -558,8 +559,9 @@ export const register: Register = (on, options) => {
           }
           // Too long: cut with an ellipsis; the full text shows in a card above while hovered, or pinned by a click.
           const id = `log-${l.t}-${l.text.length}`
+          // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
           const inner = Math.max(10, cols - 4)
-          const lines = Math.ceil(l.text.length / inner) + 2
+          const wrapped = wrapFill(l.text, inner)
           return (
             <Box key={`l${i}`}>
               <Button key={id} plain onPress={() => update($, pinnedAtom, p => (p === id ? '' : id))}>
@@ -568,17 +570,17 @@ export const register: Register = (on, options) => {
               </Button>
               <Box
                 position="absolute"
-                top={-lines}
+                top={-(wrapped.length + 2)}
                 left={0}
                 width={cols}
                 borderStyle="round"
-                paddingX={1}
+                flexDirection="column"
                 display={pinned === id ? 'flex' : 'none'}
                 hover={pinned === id ? undefined : { display: 'flex' }}
               >
-                <Text color={color} wrap="wrap">
-                  {l.text}
-                </Text>
+                {wrapped.map((w, j) => (
+                  <Text key={`w${j}`} color={color} wrap="truncate">{` ${w} `}</Text>
+                ))}
               </Box>
             </Box>
           )
