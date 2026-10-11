@@ -3457,3 +3457,108 @@ describe('copy', () => {
     await ui.unmount()
   })
 })
+
+describe('engine-assigned names', () => {
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  /** main spawns agent1 asking for `orchestrator`; the engine registers it as `orchestrator-2`. */
+  const renamed = async ($: Engine, w: World, o: { isTeammate?: boolean } = {}) => {
+    await start($)
+    w.agents = [{ id: 'agent1', name: 'orchestrator-2' }]
+    await spawn($, { prompt: 'P', name: 'orchestrator', ...o })
+    await step($, 'agent1')
+  }
+
+  test('the spawn records the name the engine registered and keeps the requested one in the brief', async ($, on) => {
+    const w = world(on)
+    await renamed($, w)
+    expect(row(w, 'agent1')!.name).toBe('orchestrator-2')
+    expect(row(w, 'agent1')!.brief!.name).toBe('orchestrator')
+    const ui = await mountPane($, 'desktop')
+    expect(JSON.stringify(await ui.drawn())).toContain('spawned orchestrator-2 (agent1)')
+    await ui.unmount()
+  })
+
+  test('an unlisted agent keeps its requested name, and a list that fails never fails the spawn', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'orchestrator' })
+    expect(row(w, 'agent1')!.name).toBe('orchestrator')
+    w.agents = null as never
+    const res = await spawn($, { prompt: 'P2', name: 'orchestrator' })
+    expect(res.agentId).toBe('agent2')
+    expect(w.spawns).toHaveLength(2)
+    expect(row(w, 'agent2')!.name).toBe('orchestrator')
+  })
+
+  for (const agent of ['orchestrator-2', 'agent1', 'orchestrator']) {
+    test(`check-in finds a renamed child by its registered name, its id, or the name it asked for (${agent})`, async ($, on) => {
+      const w = world(on)
+      await renamed($, w)
+      const res = String((await call($, undefined, CHECKIN, { agent, minutes: 30 })).result)
+      expect(res).toContain('armed')
+      expect(res).toContain('agent1')
+      expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+    })
+  }
+
+  test('check-in prefers the agent holding a name over one that asked for it', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.agents = [{ id: 'agent1', name: 'orchestrator' }, { id: 'agent2', name: 'orchestrator-2' }]
+    await spawn($, { prompt: 'P', name: 'orchestrator' })
+    await spawn($, { prompt: 'P2', name: 'orchestrator' })
+    await call($, undefined, CHECKIN, { agent: 'orchestrator', minutes: 30 })
+    expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+  })
+
+  test('check-in on an ambiguous requested name changes nothing and names the candidates', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.agents = [{ id: 'agent1', name: 'impl-2' }, { id: 'agent2', name: 'impl-3' }]
+    await spawn($, { prompt: 'P', name: 'impl' })
+    await spawn($, { prompt: 'P2', name: 'impl' })
+    const res = String((await call($, undefined, CHECKIN, { agent: 'impl', minutes: 30 })).result)
+    expect(res).toContain('could mean')
+    expect(res).toContain('agent1')
+    expect(res).toContain('agent2')
+    expect(row(w, 'agent1')!.checkinAt).toBeUndefined()
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+  })
+
+  for (const target of ['orchestrator-2', 'orchestrator']) {
+    test(`/orch handover takes a renamed agent's registered or requested name (${target})`, async ($, on) => {
+      const w = world(on)
+      await renamed($, w)
+      await complete($, 'agent1')
+      const res = (await $.command.run({ command: 'orch', args: `handover ${target}` } as never)) as { text?: string }
+      expect(String(res.text)).toContain('HANDOVER sent')
+      expect(row(w, 'agent1')!.status).toBe('handing-over')
+    })
+  }
+
+  test("a child's SendMessage to its parent's registered name is its report; to the requested name it is not", async ($, on) => {
+    const w = world(on)
+    await renamed($, w)
+    await spawn($, { prompt: 'P2', name: 'impl', parentAgentId: 'agent1' })
+    await step($, 'agent2')
+    await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+    await call($, 'agent2', 'SendMessage', { to: 'orchestrator', message: 'x' })
+    expect(row(w, 'agent2')!.report).toBeUndefined()
+    expect(row(w, 'agent2')!.checkinAt).toBeDefined()
+    await call($, 'agent2', 'SendMessage', { to: 'orchestrator-2', message: 'x' })
+    expect(row(w, 'agent2')!.report).toEqual(expect.objectContaining({ text: 'x', ok: true }))
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+  })
+
+  test("under auto mode, the mod's send to a renamed teammate is allowed", async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await renamed($, w, { isTeammate: true })
+    await complete($, 'agent1')
+    const probes: string[] = []
+    w.duringSend = async (check, e) => probes.push(await check({ to: 'orchestrator-2', message: e.text }))
+    await $.command.run({ command: 'orch', args: 'handover agent1' } as never)
+    expect(probes).toEqual(['allow'])
+  })
+})

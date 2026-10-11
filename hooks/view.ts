@@ -511,6 +511,31 @@ export const namesAgent = (to: unknown, row: Pick<AgentRow, 'id' | 'name'>): boo
   return name !== '' && (row.id === 'main' ? name === 'main' : name === row.id || name === row.name)
 }
 
+/**
+ * The agent `target` means among `rows`: its id; else its registered name (the name SendMessage uses),
+ * a live holder first, else the newest; else the name it asked for at spawn (`brief.name`), when that
+ * picks one agent (or one live agent). A trailing ` [ref]` is ignored. `ambiguous` lists the candidates.
+ */
+export const resolveAgent = (
+  rows: readonly AgentRow[],
+  target: string,
+): { row: AgentRow } | { ambiguous: AgentRow[] } | undefined => {
+  const t = target.replace(/\s*\[[^\]]*\]$/, '').trim()
+  if (t === '') return undefined
+  const byId = rows.find(r => r.id === t)
+  if (byId) return { row: byId }
+  const isLive = (r: AgentRow) => LIVE.includes(r.status)
+  const named = rows.filter(r => r.name === t)
+  const holder = named.filter(isLive).at(-1) ?? named.at(-1)
+  if (holder) return { row: holder }
+  const asked = rows.filter(r => r.brief?.name === t)
+  if (asked.length === 0) return undefined
+  if (asked.length === 1) return { row: asked[0]! }
+  const live = asked.filter(isLive)
+  if (live.length === 1) return { row: live[0]! }
+  return { ambiguous: live.length ? live : asked }
+}
+
 /** The newest agent in an id's `replacedBy` chain: whoever now carries its work (the id itself when never replaced). */
 export const latest = (rows: readonly AgentRow[], id: string): string => {
   const seen = new Set<string>()

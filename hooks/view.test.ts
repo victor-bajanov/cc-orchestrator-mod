@@ -29,6 +29,7 @@ import {
   modelName,
   namesAgent,
   paneHeader,
+  resolveAgent,
   runnerFor,
   sameReport,
   seriesColors,
@@ -810,6 +811,40 @@ describe('namesAgent', () => {
     expect(namesAgent('impl-2 [3fa9c1]', r)).toBe(true)
     expect(namesAgent('agent2 [3fa9c1]', r)).toBe(true)
     expect(namesAgent('impl-3 [3fa9c1]', r)).toBe(false)
+  })
+})
+
+describe('resolveAgent', () => {
+  test('an id, then a registered name, then the name it asked for', () => {
+    const a1 = row({ id: 'a1', name: 'orchestrator-2', brief: { prompt: 'P', subagentType: 'x', description: 'd', name: 'orchestrator' } })
+    for (const t of ['a1', 'orchestrator-2', 'orchestrator']) expect(resolveAgent([a1], t)).toEqual({ row: a1 })
+    expect(resolveAgent([a1], 'nope')).toBeUndefined()
+    expect(resolveAgent([a1], '')).toBeUndefined()
+  })
+
+  test("a registered name beats another agent's requested name", () => {
+    const a1 = row({ id: 'a1', name: 'orchestrator' })
+    const a2 = row({ id: 'a2', name: 'orchestrator-2', brief: { prompt: 'P', subagentType: 'x', description: 'd', name: 'orchestrator' } })
+    expect(resolveAgent([a1, a2], 'orchestrator')).toEqual({ row: a1 })
+    expect(resolveAgent([a2, a1], 'orchestrator')).toEqual({ row: a1 })
+  })
+
+  test('a requested name held by two is ambiguous, unless exactly one is live', () => {
+    const asked = (id: string, name: string, askedFor: string, over: Partial<AgentRow> = {}) =>
+      row({ id, name, brief: { prompt: 'P', subagentType: 'x', description: 'd', name: askedFor }, ...over })
+    const i2 = asked('a1', 'impl-2', 'impl')
+    const i3 = asked('a2', 'impl-3', 'impl')
+    expect(resolveAgent([i2, i3], 'impl')).toEqual({ ambiguous: [i2, i3] })
+    const done = { ...i2, status: 'done' as const }
+    expect(resolveAgent([done, i3], 'impl')).toEqual({ row: i3 })
+    const original = asked('a1', 'probe-x', 'probe', { status: 'replaced', replacedBy: 'a2' })
+    const replacement = asked('a2', 'probe-2', 'probe')
+    expect(resolveAgent([original, replacement], 'probe')).toEqual({ row: replacement })
+  })
+
+  test('a trailing [ref] is ignored', () => {
+    const a1 = row({ id: 'a1', name: 'orchestrator-2' })
+    expect(resolveAgent([a1], 'orchestrator-2 [a1]')).toEqual({ row: a1 })
   })
 })
 

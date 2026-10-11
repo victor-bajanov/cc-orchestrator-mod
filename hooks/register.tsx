@@ -42,6 +42,7 @@ import {
   foldGlyph,
   latest,
   namesAgent,
+  resolveAgent,
   seriesColors,
   statusEmoji,
   statusStyle,
@@ -672,7 +673,7 @@ const argsOf = (e: object): Record<string, unknown> => {
 /**
  * Serves the `checkin` tool: the calling loop (`agentId`, else main) arms, re-arms or (minutes <= 0)
  * cancels a check-in on one of its own children (a child of a loop it replaced counts), named by id
- * or name. Every answer is one line of result text starting `checkin:`; an unknown child or a bad
+ * or name (`resolveAgent`: registered name, else an unambiguous requested name). Every answer is one line of result text starting `checkin:`; an unknown child or a bad
  * length stores nothing.
  */
 async function checkin($: $, agentId: string | undefined, args: Record<string, unknown>) {
@@ -686,9 +687,13 @@ async function checkin($: $, agentId: string | undefined, args: Record<string, u
     await restore($)
     const rows = await read($, agentsAtom)
     const kids = rows.filter(r => r.id !== 'main' && latest(rows, r.parentId ?? 'main') === parent)
-    const named = kids.filter(r => r.name === target)
-    const r = kids.find(k => k.id === target) ?? named.filter(k => LIVE.includes(k.status)).at(-1) ?? named.at(-1)
-    if (!r) return { result: `checkin: no agent "${target}" among the agents you spawned; nothing changed.` }
+    const hit = resolveAgent(kids, target)
+    if (!hit) return { result: `checkin: no agent "${target}" among the agents you spawned; nothing changed.` }
+    if ('ambiguous' in hit) {
+      const list = hit.ambiguous.map(k => `${label(k)} (id ${k.id})`).join(', ')
+      return { result: `checkin: "${target}" could mean ${list}; name one by id or registered name; nothing changed.` }
+    }
+    const r = hit.row
     if (minutes <= 0) {
       await update($, agentsAtom, l => patch(l, r.id, DISARMED))
       await persist($)
@@ -1096,12 +1101,20 @@ export const register: Register = (on, options) => {
     const id = res.agentId
     lastSpawned = id
     const type = e.subagentType ?? (e as typeof e & { subagent_type?: string }).subagent_type ?? 'agent'
+    // The engine suffixes a taken name (`orchestrator` → `orchestrator-2`): SendMessage, check-ins and
+    // reports go by the one it registered, which only its list says (F19).
+    let name = e.name
+    try {
+      name = (await $.agent.list()).find(a => a.id === id)?.name ?? e.name
+    } catch {
+      // the requested name stands
+    }
     const now = await $.clock.now()
     await update($, agentsAtom, l => [
       ...l.filter(a => a.id !== id),
       {
         ...newRow(id, now),
-        name: e.name,
+        name,
         description: e.description,
         type,
         parentId: e.parentAgentId ?? 'main',
@@ -1116,7 +1129,7 @@ export const register: Register = (on, options) => {
         },
       },
     ])
-    await log($, `spawned ${e.name ?? e.description} (${id})`)
+    await log($, `spawned ${name ?? e.description} (${id})`)
     await persist($)
     if (!paneOffered) {
       paneOffered = true
@@ -1344,8 +1357,13 @@ export const register: Register = (on, options) => {
       if (verb === 'handover') {
         const rows = await read($, agentsAtom)
         const live = rows.filter(canHandOver)
-        const r = live.find(a => a.id === target) ?? live.filter(a => a.name === target).at(-1)
-        if (!r) return { text: `No live agent named or with id "${target}".` }
+        const hit = resolveAgent(live, target)
+        if (!hit) return { text: `No live agent named or with id "${target}".` }
+        if ('ambiguous' in hit) {
+          const list = hit.ambiguous.map(a => `${label(a)} (id ${a.id})`).join(', ')
+          return { text: `"${target}" could mean ${list}; name one by id.` }
+        }
+        const r = hit.row
         const ok = await startHandover($, r.id, 'by /orch')
         return { text: ok ? `HANDOVER sent to ${label(r)} (${r.id}).` : `Could not hand ${label(r)} over.` }
       }
