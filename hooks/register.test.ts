@@ -3579,18 +3579,18 @@ describe('copy', () => {
     await ui.unmount()
   })
 
-  test('each tool-detail section has a copy control (desktop dialog)', async ($, on) => {
+  test('a prose tool-detail section has a copy control; a code section has the desktop’s own (desktop dialog)', async ($, on) => {
     const w = world(on)
-    on('session.messages', () => said(bashUse))
+    on('session.messages', () => said({ ...bashUse, input: { command: 'npm test', description: 'Run the tests' } }))
     const ui = await opened($, w, 'desktop')
     await ui.press({ key: 'tool:agent1:b' })
     await w.clock.settle()
     let tool = await mountTool($, 'desktop')
+    // Description (text), then Command and Output (code): the desktop draws a copy button on each Code itself.
+    expect((await copyKeys(tool)).map(b => b.key)).toEqual(['copy:sec:b:0'])
     await tool.press({ key: 'copy:sec:b:0' })
     await w.clock.settle()
-    await tool.press({ key: 'copy:sec:b:1' })
-    await w.clock.settle()
-    expect(w.copies.map(c => c.text)).toEqual(['npm test', 'PASS 3 tests'])
+    expect(w.copies.map(c => c.text)).toEqual(['Run the tests'])
     await tool.unmount()
     tool = await mountTool($, 'terminal')
     expect(await copyKeys(tool)).toHaveLength(0)
@@ -3601,11 +3601,12 @@ describe('copy', () => {
   test('the inline detail on a desktop that places no dialog has the same controls', async ($, on) => {
     const w = world(on)
     w.placesTool = false
-    on('session.messages', () => said(bashUse))
+    on('session.messages', () => said({ ...bashUse, input: { command: 'npm test', description: 'Run the tests' } }))
     const ui = await opened($, w, 'desktop')
     await ui.press({ key: 'tool:agent1:b' })
     await w.clock.settle()
     expect(await ui.find({ key: 'copy:sec:b:0' })).toBeDefined()
+    expect(await ui.find({ key: 'copy:sec:b:1' })).toBeUndefined()
     await ui.unmount()
   })
 
