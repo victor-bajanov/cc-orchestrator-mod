@@ -12,6 +12,9 @@ export type Brief = {
 
 export type AgentStatus = 'running' | 'idle' | 'handing-over' | 'replaced' | 'done' | 'stalled'
 
+/** What the pane shows for a row: its status, or `waiting` for an idle row with live descendants. Never stored. */
+export type DisplayStatus = AgentStatus | 'waiting'
+
 /** One agent loop as the mod tracks it; the main thread is the row with id `main`. */
 export type AgentRow = {
   id: string

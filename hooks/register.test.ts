@@ -3,7 +3,7 @@ import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
 import { PEEK_TIMEOUT_MS, liveSelection } from './register'
-import { PEEK_DENIED as DENIED } from './view'
+import { PEEK_DENIED as DENIED, runnerFor } from './view'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
 const STATE = `${RUN_DIR}/state.json`
@@ -29,6 +29,8 @@ const world = (on: On) => {
     status: undefined as string | undefined,
     /** Makes the next main turn end fail beneath the plugin, once. */
     failMainEnd: false,
+    /** The model each step's usage reports as answering. */
+    usageModel: 'claude-opus-5-5',
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -96,7 +98,7 @@ const world = (on: On) => {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: tokens - 10,
         output_tokens: 50,
-        model: 'claude-opus-5-5',
+        model: w.usageModel,
       },
     }
   })
@@ -115,7 +117,7 @@ import type { Engine } from 'claude-code/testing'
 
 const start = ($: Engine) => $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
 
-const spawn = ($: Engine, o: { prompt: string; name?: string; parentAgentId?: string }) =>
+const spawn = ($: Engine, o: { prompt: string; name?: string; parentAgentId?: string; model?: string }) =>
   $.agent.spawn({
     tool_use_id: 'tu1',
     prompt: o.prompt,
@@ -124,13 +126,14 @@ const spawn = ($: Engine, o: { prompt: string; name?: string; parentAgentId?: st
     provider: { plugin: 'engine', tier: 'core' },
     parentModel: 'claude-opus-5-5',
     name: o.name,
+    model: o.model,
     parentAgentId: o.parentAgentId,
     background: true,
     fork: false,
   } as never)
 
-const step = async ($: Engine, agentId?: string) => {
-  const s = $.turn.step({ turnId: 'T', index: 0, model: 'claude-opus-5-5', messageCount: 3, agentId })
+const step = async ($: Engine, agentId?: string, o: { model?: string; effort?: string } = {}) => {
+  const s = $.turn.step({ turnId: 'T', index: 0, model: o.model ?? 'claude-opus-5-5', effort: o.effort, messageCount: 3, agentId } as never)
   for await (const _ of s) void _
   return s.result
 }
@@ -850,15 +853,15 @@ describe('agent in view', () => {
   type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
   const walk = (n: unknown): Drawn[] =>
     n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
-  /** Each terminal row's name cell (a Text keeps no key, so it is found as the first child of the row's Box). */
+  /** Each terminal row's name Text (a Text keeps no key, so it is found after the glyph Text that opens the row's Box). */
   const names = async (ui: Awaited<ReturnType<typeof mountViewed>>) =>
     new Map(
       walk(await ui.drawn())
         .filter(b => b.type === 'Box' && typeof b.props?.key === 'string' && /^(main|agent\d+)$/.test(b.props.key as string))
         .map(b => {
-          // A subagent's name cell sits inside its pressable Button; main's is the bare Text.
+          // A subagent's glyph and name sit inside its pressable Button; main's are bare Texts.
           const first = b.children![0] as Drawn
-          const cell = first.type === 'Button' ? (first.children![0] as Drawn) : first
+          const cell = first.type === 'Button' ? (first.children![1] as Drawn) : (b.children![1] as Drawn)
           return [b.props!.key as string, cell.props ?? {}]
         }),
     )
@@ -1309,5 +1312,149 @@ describe('terminal pane header', () => {
   test('the Hand over main button costs the activity one line', async ($, on) => {
     world(on)
     expect(await crowded($)).toBe(ROOM - 1)
+  })
+})
+
+describe('model and status', () => {
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const own = (n: Drawn): string => (n.children ?? []).filter(c => typeof c === 'string').join('')
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  /** The terminal row Box keyed by the agent's id. */
+  const termRow = async (ui: Ui, id: string) =>
+    walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === id)!
+  /** The row text: the desktop's `agent:<id>` Button, the terminal's row Box. */
+  const rowText = async (ui: Ui, surface: 'terminal' | 'desktop', id: string) =>
+    surface === 'desktop' ? (await ui.find({ key: `agent:${id}` }))!.text : textOf(await termRow(ui, id))
+  const glyphOf = async (ui: Ui, id: string) => walk(await termRow(ui, id)).find(b => b.type === 'Text' && /[●○✓◐]/.test(own(b)))!
+  const wordOf = async (ui: Ui, id: string, word: string) =>
+    walk(await termRow(ui, id)).find(b => b.type === 'Text' && own(b).trim() === word)!
+  const styleOf = (n: Drawn) => ({ color: n.props?.color, dimColor: n.props?.dimColor, bold: n.props?.bold })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a step's model and effort show on the row and persist (${surface})`, async ($, on) => {
+      const w = world(on)
+      w.usageModel = 'claude-sonnet-5-5'
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1' })
+      await step($, 'agent1', { model: 'claude-sonnet-5-5', effort: 'medium' })
+      const ui = await mountPane($, surface)
+      expect(await rowText(ui, surface, 'agent1')).toContain('Sonnet 5.5 med')
+      expect(row(w, 'agent1')!.model).toBe('claude-sonnet-5-5')
+      expect(row(w, 'agent1')!.effort).toBe('medium')
+      await ui.unmount()
+    })
+
+    test(`with no effort the row shows the answering model alone (${surface})`, async ($, on) => {
+      const w = world(on)
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1' })
+      await step($, 'agent1', { model: 'claude-sonnet-5-5' })
+      const ui = await mountPane($, surface)
+      const text = await rowText(ui, surface, 'agent1')
+      expect(text).toContain('Opus 5.5')
+      expect(text).not.toContain('Sonnet')
+      expect(text).not.toMatch(/Opus 5\.5 (low|med|high|xhigh|max)/)
+      await ui.unmount()
+    })
+
+    test(`before any step the spawn's model shows (${surface})`, async ($, on) => {
+      const w = world(on)
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1', model: 'haiku' })
+      const ui = await mountPane($, surface)
+      expect(await rowText(ui, surface, 'agent1')).toContain('Haiku')
+      await ui.unmount()
+      void w
+    })
+
+    test(`an idle agent with a running child draws waiting (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+      await step($, 'agent2')
+      await complete($, 'agent1')
+      expect(row(w, 'agent1')!.status).toBe('idle')
+      const ui = await mountPane($, surface)
+      if (surface === 'desktop') {
+        const text = await rowText(ui, surface, 'agent1')
+        expect(text).toContain('⏳')
+        expect(text).toContain('waiting')
+      } else {
+        const glyph = await glyphOf(ui, 'agent1')
+        expect(own(glyph)).toContain('◐')
+        expect(glyph.props?.color).toBe('planMode')
+        expect(glyph.props?.dimColor).toBeFalsy()
+        expect((await wordOf(ui, 'agent1', 'waiting')).props?.color).toBe('planMode')
+      }
+      await ui.unmount()
+    })
+
+    test(`a waiting agent still gets its HANDOVER as a message (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+      await step($, 'agent2')
+      await complete($, 'agent1')
+      const ui = await mountPane($, surface)
+      expect(await rowText(ui, surface, 'agent1')).toContain('waiting')
+      if (surface === 'desktop') {
+        expect(await ui.find({ key: 'handover:agent1' })).toBeDefined()
+        await ui.press({ key: 'handover:agent1' })
+      } else {
+        await $.command.run({ command: 'orch', args: 'handover impl-1' } as never)
+      }
+      expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('HANDOVER'))).toBe(true)
+      expect(row(w, 'agent1')!.handoverVia).toBe('message')
+      await ui.unmount()
+    })
+  }
+
+  test('terminal: the glyph and status word take the status colours', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'terminal')
+    expect(styleOf(await glyphOf(ui, 'agent1'))).toEqual({ color: 'success', dimColor: undefined, bold: true })
+    expect(own(await glyphOf(ui, 'agent1'))).toContain('●')
+    expect(styleOf(await wordOf(ui, 'agent1', 'running'))).toEqual({ color: 'success', dimColor: undefined, bold: true })
+    await complete($, 'agent1')
+    expect(own(await glyphOf(ui, 'agent1'))).toContain('○')
+    expect(styleOf(await glyphOf(ui, 'agent1'))).toEqual({ color: 'warning', dimColor: true, bold: undefined })
+    expect(styleOf(await wordOf(ui, 'agent1', 'idle'))).toEqual({ color: 'warning', dimColor: true, bold: undefined })
+    await w.clock.advance(30_000)
+    expect(row(w, 'agent1')!.status).toBe('done')
+    expect(styleOf(await glyphOf(ui, 'agent1'))).toEqual({ color: 'success', dimColor: true, bold: undefined })
+    expect(styleOf(await wordOf(ui, 'agent1', 'done'))).toEqual({ color: 'success', dimColor: true, bold: undefined })
+    await ui.unmount()
+  })
+
+  test('desktop: the status emoji is the agent own runner, then sleep, then done', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    let ui = await mountPane($, 'desktop')
+    const runner = runnerFor('agent1')
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain(runner)
+    await ui.unmount()
+    ui = await mountPane($, 'desktop')
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain(runner)
+    await complete($, 'agent1')
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain('😴')
+    await w.clock.advance(30_000)
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain('✅')
+    await ui.unmount()
+  })
+
+  test('terminal: the model cell narrows the timeline by 17 columns', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'terminal', 100)
+    const NAME = Math.min(24, Math.max(12, Math.floor(100 * 0.25)))
+    const kids = (await termRow(ui, 'agent1')).children as Drawn[]
+    const timeline = kids[kids.length - 2]!
+    expect(own(timeline)).toHaveLength(Math.max(8, 100 - NAME - 7 - 14 - 17))
+    await ui.unmount()
   })
 })

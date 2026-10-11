@@ -1,7 +1,9 @@
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 
-import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek, Sample, Transcript, TranscriptItem } from '../types'
+import type { AgentRow, AgentStatus, DisplayStatus, LogEntry, MainPhase, Peek, Sample, Transcript, TranscriptItem } from '../types'
 import { fmtTokens, label } from './core'
+
+export type { DisplayStatus }
 
 export const MAIN_COLOR = '#6B7280'
 export const PALETTE: readonly string[] = ['#0072B2', '#E69F00', '#009E73', '#CC79A7', '#56B4E9', '#D55E00']
@@ -137,9 +139,25 @@ export const modelLabel = (model?: string, effort?: string): string => {
   return e ? `${name} ${e}` : name
 }
 
+/** Statuses a child can hold that keep its idle parent waiting. */
+const BUSY: readonly AgentStatus[] = ['running', 'idle', 'handing-over']
+
+/**
+ * What the pane shows for a row: `waiting` when it is idle and a child (its
+ * `parentId` is this row's id) is running, idle or handing over, else its own
+ * status. An idle child counts, so waiting holds up a whole chain. Display only:
+ * every handover, stall and sync check keeps reading `row.status`.
+ */
+export const displayStatus = (row: AgentRow, rows: readonly AgentRow[]): DisplayStatus =>
+  row.status === 'idle' && rows.some(r => r.parentId === row.id && r.id !== row.id && BUSY.includes(r.status))
+    ? 'waiting'
+    : row.status
+
 /** The terminal's glyph and status-word style per status, in theme keys so it follows the theme. */
-export const statusStyle = (status: AgentStatus): { color: string; dimColor?: true; bold?: true } => {
+export const statusStyle = (status: DisplayStatus): { color: string; dimColor?: true; bold?: true } => {
   switch (status) {
+    case 'waiting':
+      return { color: 'planMode' }
     case 'running':
       return { color: 'success', bold: true }
     case 'idle':
@@ -169,8 +187,10 @@ export const hashText = (s: string): string => djb2(s).toString(36)
 export const runnerFor = (id: string): string => (djb2(id) % 2 === 0 ? '🏃‍♂️' : '🏃‍♀️')
 
 /** The desktop's status emoji, placed before the status word. */
-export const statusEmoji = (status: AgentStatus, id: string): string => {
+export const statusEmoji = (status: DisplayStatus, id: string): string => {
   switch (status) {
+    case 'waiting':
+      return '⏳'
     case 'running':
       return runnerFor(id)
     case 'idle':

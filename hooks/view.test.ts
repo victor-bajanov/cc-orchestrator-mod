@@ -11,6 +11,7 @@ import {
   chartWidthPx,
   contextChart,
   cut,
+  displayStatus,
   effortAbbrev,
   hashText,
   hhmm,
@@ -517,6 +518,60 @@ describe('runnerFor and statusEmoji', () => {
     expect(statusEmoji('handing-over', 'x')).toBe('📝')
     expect(statusEmoji('replaced', 'x')).toBe('♻️')
     for (const id of ['a', 'b', 'agent3']) expect(statusEmoji('running', id)).toBe(runnerFor(id))
+  })
+})
+
+describe('displayStatus', () => {
+  const kid = (id: string, parentId: string, status: AgentStatus) => row({ id, parentId, status })
+
+  test('an idle parent with a running, idle or handing-over child displays waiting', () => {
+    for (const s of ['running', 'idle', 'handing-over'] as const) {
+      const p = row({ id: 'p', status: 'idle' })
+      expect(displayStatus(p, [p, kid('c', 'p', s)])).toBe('waiting')
+    }
+  })
+
+  test('an idle parent whose children are settled, or who has none, displays idle', () => {
+    for (const s of ['done', 'replaced', 'stalled'] as const) {
+      const p = row({ id: 'p', status: 'idle' })
+      expect(displayStatus(p, [p, kid('c', 'p', s)])).toBe('idle')
+    }
+    const lone = row({ id: 'p', status: 'idle' })
+    expect(displayStatus(lone, [lone, kid('c', 'other', 'running')])).toBe('idle')
+  })
+
+  test('only idle becomes waiting: a running parent with a running child is running', () => {
+    const p = row({ id: 'p', status: 'running' })
+    expect(displayStatus(p, [p, kid('c', 'p', 'running')])).toBe('running')
+    const d = row({ id: 'p', status: 'done' })
+    expect(displayStatus(d, [d, kid('c', 'p', 'running')])).toBe('done')
+  })
+
+  test('nesting: main and its idle child both wait on a running grandchild', () => {
+    const m = main({ status: 'idle' })
+    const c = kid('c', 'main', 'idle')
+    const g = kid('g', 'c', 'running')
+    const rows = [m, c, g]
+    expect(displayStatus(m, rows)).toBe('waiting')
+    expect(displayStatus(c, rows)).toBe('waiting')
+    expect(displayStatus(g, rows)).toBe('running')
+  })
+
+  test("main is the parent of rows whose parentId is 'main'", () => {
+    const m = main({ status: 'idle' })
+    expect(displayStatus(m, [m, kid('c', 'main', 'running')])).toBe('waiting')
+  })
+
+  test('waiting has its own style and emoji', () => {
+    expect(statusStyle('waiting')).toEqual({ color: 'planMode' })
+    expect(statusEmoji('waiting', 'x')).toBe('⏳')
+  })
+
+  test('leaves the rows unchanged', () => {
+    const rows = [main({ status: 'idle' }), kid('c', 'main', 'idle'), kid('g', 'c', 'running')]
+    const before = JSON.parse(JSON.stringify(rows))
+    for (const r of rows) displayStatus(r, rows)
+    expect(rows).toEqual(before)
   })
 })
 

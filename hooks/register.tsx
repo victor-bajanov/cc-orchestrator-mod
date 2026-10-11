@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek } from '../types'
+import type { AgentRow, DisplayStatus, LogEntry, MainPhase, Peek } from '../types'
 import {
   HANDOVER_CLAUSE,
   contextOf,
@@ -26,13 +26,17 @@ import {
   chartWidthPx,
   contextChart,
   cut,
+  displayStatus,
   hhmm,
   logId,
   mainButtonShown,
+  modelLabel,
   paneHeader,
   peekLines,
   peekView,
   seriesColors,
+  statusEmoji,
+  statusStyle,
 } from './view'
 
 type $ = EngineInterface
@@ -524,6 +528,10 @@ export const register: Register = (on, options) => {
       }
       const tokens = contextOf(res.usage)
       await update($, agentsAtom, l => recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }))
+      // The answering model wins over the requested one; an engine without effort leaves it out.
+      await update($, agentsAtom, l =>
+        patch(l, id, { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }),
+      )
       if (id === 'main') await checkMain($, tokens)
       else if (tokens >= cfg.agentThreshold) {
         const r = (await read($, agentsAtom)).find(a => a.id === id)
@@ -730,15 +738,19 @@ export const register: Register = (on, options) => {
             {orderRows(rows).flatMap(({ row, depth }) => {
               const ceiling = ceilingOf(row, cfg)
               const pct = Math.round((row.tokens / ceiling) * 100)
+              const shows = displayStatus(row, rows)
+              const model = modelLabel(row.model ?? row.brief?.model, row.effort)
               return [
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
                   <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
                     <Text bold={hl === row.id}>{label(row)} </Text>
+                    {model !== '' && <Text dimColor>{model} </Text>}
                     <Text color={tone[level(row.tokens, ceiling)]}>
                       {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
                     </Text>
-                    <Text dimColor>{row.status}</Text>
+                    <Text>{statusEmoji(shows, row.id)} </Text>
+                    <Text dimColor>{shows}</Text>
                     {viewed === row.id && <Text dimColor> · in view</Text>}
                   </Button>
                   {canHandOver(row) && (
@@ -803,11 +815,14 @@ export const register: Register = (on, options) => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const NAME = Math.min(24, Math.max(12, Math.floor(cols * 0.25)))
-    const width = Math.max(8, cols - NAME - 7 - 14)
+    // The model cell: 16 columns padded, plus a space.
+    const MODEL = 17
+    const width = Math.max(8, cols - NAME - 7 - 14 - MODEL)
     const t0 = rows.reduce((m, r) => Math.min(m, r.startedAt), now)
     const ordered = orderRows(rows)
-    const glyph: Record<AgentStatus, string> = {
+    const glyph: Record<DisplayStatus, string> = {
       running: '●',
+      waiting: '◐',
       idle: '○',
       'handing-over': '↻',
       replaced: '⤳',
@@ -836,26 +851,40 @@ export const register: Register = (on, options) => {
         {ordered.flatMap(({ row, depth }) => {
           const ceiling = ceilingOf(row, cfg)
           const live = LIVE.includes(row.status)
-          const name = `${'  '.repeat(depth)}${glyph[row.status]} ${label(row)}`
-          const cell = (
-            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
-              {name.slice(0, NAME).padEnd(NAME)}
+          const shows = displayStatus(row, rows)
+          const style = statusStyle(shows)
+          // The glyph takes the status colour; the name keeps its own marks. Together they fill NAME columns.
+          const lead = `${'  '.repeat(depth)}${glyph[shows]} `.slice(0, NAME)
+          const glyphCell = (
+            <Text color={style.color} dimColor={style.dimColor} bold={style.bold} wrap="truncate">
+              {lead}
             </Text>
           )
+          const nameCell = (
+            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
+              {label(row).slice(0, NAME - lead.length).padEnd(NAME - lead.length)}
+            </Text>
+          )
+          const model = modelLabel(row.model ?? row.brief?.model, row.effort)
           return [
             <Box key={row.id}>
               {row.id === 'main' ? (
-                cell
+                glyphCell
               ) : (
                 <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
-                  {cell}
+                  {glyphCell}
+                  {nameCell}
                 </Button>
               )}
+              {row.id === 'main' && nameCell}
               <Text dimColor={!live}>{fmtTokens(row.tokens).padStart(6)} </Text>
+              <Text dimColor>{model.slice(0, MODEL - 1).padEnd(MODEL - 1)} </Text>
               <Text color={live ? tone[level(row.tokens, ceiling)] : 'subtle'}>
                 {timeline(row.samples, width, t0, now, ceiling, live)}
               </Text>
-              <Text dimColor> {row.status.padEnd(12)}</Text>
+              <Text color={style.color} dimColor={style.dimColor} bold={style.bold}>
+                {` ${shows.padEnd(12)}`}
+              </Text>
             </Box>,
             peek && selected === row.id && (
               <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
@@ -875,7 +904,7 @@ export const register: Register = (on, options) => {
           ]
         })}
         <Text dimColor>
-          {' '.repeat(NAME + 7)}
+          {' '.repeat(NAME + 7 + MODEL)}
           {hhmm(t0).padEnd(Math.max(0, width - 5))}
           {hhmm(now)}
         </Text>
