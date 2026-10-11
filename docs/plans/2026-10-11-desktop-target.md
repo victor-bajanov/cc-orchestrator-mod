@@ -152,7 +152,7 @@ export const contextChart = (i: ChartInput) => { source: string; alt: string; wi
 
 ### Desktop pane tree (Task 2), top to bottom
 
-1. **Header:** a `Box` (row, wrap) holding a bold `Text` with `paneHeader(...)`, plus `Button key="handover:main" variant="secondary" label="Hand over main"` (per D6). The press runs `startMainHandover($)` through `$.clock.after(0, …)`, as `/orch handover` does.
+1. **Header:** a `Box` (row, wrap) holding a bold `Text` with `paneHeader(...)`, plus `Button key="handover:main" variant="secondary" label="Hand over main"` (per D6). The press calls `startMainHandover($)` directly, as the AbovePrompt button does.
 2. **Chart:**
    - With no rows: `<Text dimColor>No model requests yet.</Text>`.
    - Otherwise: `<Svg key="chart" isInteractive source alt width height />` from `contextChart({ …, width: chartWidthPx(cols), height: 180, colors: seriesColors(rows), selected })`.
@@ -223,7 +223,7 @@ npx -p typescript@5.6.3 tsc -p .
 - The Pane hook reads the state as today.
   - **Terminal** (`e.surface === 'terminal'`): returns today's tree byte-for-byte, except that the header `Text` child becomes `paneHeader(rows, { agentThreshold: cfg.agentThreshold, mainThreshold: cfg.mainThreshold, mainMode: cfg.mainMode, phase })`, which is the same text. The terminal card id uses `logId(l)`, the same string.
   - **Any other surface:** returns the desktop tree from "Desktop pane tree". Narrow on `e.surface` so `Svg` is typed. Never emit `Svg` on the terminal, and never `Raster`/`Image` elsewhere.
-- New top-level `toggleSelected($, id)`. The per-row handover press calls the existing top-level `startHandover($, id, 'from the pane')`. The header button calls `$.clock.after(0, () => void startMainHandover($))`.
+- New top-level `toggleSelected($, id)`. The per-row handover press calls the existing top-level `startHandover($, id, 'from the pane')`. The header button calls `startMainHandover($)` directly, as the AbovePrompt button does.
 - The AbovePrompt hook is unchanged, and so are all event hooks and `/orch`.
 
 **Failing tests to write first** (in `register.test.ts`, new `describe('desktop pane')`, reusing `world`, `start`, `spawn`, `step` and `complete`, and mounting with `requestId: 'orchestrator'`, `props: { bodyColumns: 100 }`):
