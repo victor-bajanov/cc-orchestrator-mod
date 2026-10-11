@@ -250,3 +250,23 @@ The user approved Escalation P: clicking an agent in the Orchestrator pane shows
 5. (terminal) Main has no `agent:main` Button; (desktop) pressing `agent:main` draws no `peek:main`.
 6. (terminal) An open transcript takes its rows from the activity: with twelve agents logged, opening a three-message transcript leaves `ROOM - 1 - (3 + 2)` activity lines.
 7. The existing terminal `names` helper descends into the row's Button so the in-view `inverse` checks keep passing.
+
+### Async read (follow-up request)
+
+`ui.render` never awaits `$.session.messages`. That supersedes P3's read-while-drawing.
+- **Cache:** the pane draws only the cached `peeks` state (`types/index.d.ts`: `Peek = { lines, t } | { denied: true, t }` per agent id), through the pure `peekView(peek, width, n)`. With nothing cached yet it draws a dim `loading…`.
+- **Read:** the top-level `refreshPeek($, id)` reads off the render. It is started through `schedulePeek` (`$.clock.after(0, …)`: plugin-authoring's "Work that outlives a dispatch") on:
+  - the press that opens a transcript;
+  - `turn.step` and `tool.call` from the selected agent;
+  - the 30 s sync, so a peek left loading after a reload settles.
+- **One at a time:** a module-level in-flight `Set` allows one read per agent.
+- **Timeout:** the read races a cancellable `$.clock.after(PEEK_TIMEOUT_MS = 3000)`, cancelled once the race settles. A refusal, a failure or a timeout is stored as `denied`, which draws `PEEK_DENIED`. The agent stays in flight until the read itself settles, so a hung read never has more reads piled behind it.
+- **Lines:** stored cleaned, up to 8, each capped at 500 characters (`PEEK_CHARS`); the render cuts them to its width.
+- **Rules:** state writes happen only in presses, events and timers, never while drawing. The Hand over buttons never wait on a read.
+- **Tests:** `describe('transcript read off the render')` in `register.test.ts` covers four cases. Each failed first by timing out because the render awaited the read.
+  - (a) a read that never answers blocks neither the pane nor Hand over / Hand over main (both surfaces);
+  - (b) `loading…` then the lines;
+  - (c) past the timeout, the not-readable line;
+  - (d) triggers during an in-flight read make one call.
+
+  Plus `peekView` in `view.test.ts`. The earlier transcript tests now settle the clock after the opening press.

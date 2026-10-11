@@ -14,6 +14,7 @@ import {
   mainButtonShown,
   paneHeader,
   peekLines,
+  peekView,
   seriesColors,
 } from './view'
 import type { SessionMessage } from 'claude-code'
@@ -301,6 +302,24 @@ describe('peekLines', () => {
     expect(line!.endsWith('…')).toBe(true)
     expect(line!.startsWith('assistant: ⚙ Edit · x')).toBe(true)
     expect(peekLines([msg('user', 'short')], 40, 5)).toEqual(['user: short'])
+  })
+})
+
+describe('peekView', () => {
+  const DENIED = 'transcript not readable (teammate in another pane, or finished)'
+  test('nothing read yet is loading; denied is the not-readable line; no lines is nothing yet', () => {
+    expect(peekView(undefined, 40, 5)).toEqual({ dim: 'loading…' })
+    expect(peekView({ denied: true, t: 1 }, 40, 5)).toEqual({ dim: DENIED })
+    expect(peekView({ lines: [], t: 1 }, 40, 5)).toEqual({ dim: 'no messages yet' })
+  })
+
+  test('keeps the last n lines and cuts each to the width', () => {
+    const lines = ['user: one', 'assistant: two', `assistant: ${'x'.repeat(60)}`]
+    const v = peekView({ lines, t: 1 }, 20, 2) as { lines: string[] }
+    expect(v.lines).toHaveLength(2)
+    expect(v.lines[0]).toBe('assistant: two')
+    expect(v.lines[1]).toHaveLength(20)
+    expect(v.lines[1]!.endsWith('…')).toBe(true)
   })
 })
 
