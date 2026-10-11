@@ -531,7 +531,8 @@ function detailBody($: $, ui: Ui, d: ToolDetail, copy?: { toolUseId: string }) {
             <Text dimColor bold>
               {sec.label}
             </Text>
-            {copy && copyButton($, ui, `sec:${copy.toolUseId}:${i}`, bodyOf(sec))}
+            {/* A Code block carries the desktop's own copy button: ours would be a second one. */}
+            {copy && sec.kind !== 'code' && copyButton($, ui, `sec:${copy.toolUseId}:${i}`, bodyOf(sec))}
           </Box>
           {sec.kind === 'code' ? (
             <Code
