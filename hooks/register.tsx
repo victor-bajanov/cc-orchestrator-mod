@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, AgentStatus, LogEntry, MainPhase } from '../types'
+import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek } from '../types'
 import {
   HANDOVER_CLAUSE,
   contextOf,
@@ -20,7 +20,20 @@ import {
   timeline,
   wrapFill,
 } from './core'
-import { LIVE, ceilingOf, chartWidthPx, contextChart, cut, hhmm, logId, paneHeader, seriesColors } from './view'
+import {
+  LIVE,
+  ceilingOf,
+  chartWidthPx,
+  contextChart,
+  cut,
+  hhmm,
+  logId,
+  mainButtonShown,
+  paneHeader,
+  peekLines,
+  peekView,
+  seriesColors,
+} from './view'
 
 type $ = EngineInterface
 
@@ -34,8 +47,10 @@ const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'i
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 /** The activity line whose full-text card a click pinned open ('' for none). */
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
-/** The agent whose chart line the desktop pane highlights ('' for none). */
+/** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
+/** Each agent's transcript tail, read off the render by refreshPeek. */
+const peeksAtom = atom({ plugin: 'orchestrator', key: 'peeks' } as const, {} as Record<string, Peek>)
 /** Mirrors `mainHandoverQueued` for drawing: the buttons say a handover waits on this turn. */
 const queuedAtom = atom({ plugin: 'orchestrator', key: 'mainQueued' } as const, false)
 
@@ -69,6 +84,10 @@ let mainBusy = false
 let mainHandoverQueued = false
 /** A main handover is being set up: a second press in the meantime does nothing. */
 let mainHandoverStarting = false
+/** Agents whose transcript read is in flight: one read per agent at a time. */
+const peeking = new Set<string>()
+/** Agents triggered while their read was in flight: each is read once more when it settles. */
+const peekAgain = new Set<string>()
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
 
@@ -139,8 +158,69 @@ function togglePinned($: $, id: string) {
   return update($, pinnedAtom, p => (p === id ? '' : id))
 }
 
-function toggleSelected($: $, id: string) {
-  return update($, selectedAtom, s => (s === id ? '' : id))
+async function toggleSelected($: $, id: string) {
+  await update($, selectedAtom, s => (s === id ? '' : id))
+  // Opening a transcript starts its read; the pane shows `loading…` until it settles.
+  if ((await read($, selectedAtom)) === id) schedulePeek($, id)
+}
+
+/** How long a transcript read may take before the pane calls it not readable. */
+export const PEEK_TIMEOUT_MS = 3_000
+/** The most lines a transcript peek keeps: the desktop's; the terminal shows fewer. */
+const PEEK_MAX = 8
+/** The longest line a peek stores: wider than any pane draws, short enough to keep state small. */
+const PEEK_CHARS = 500
+
+/**
+ * Reads an agent's transcript tail into `peeksAtom`, off the render (a drawing never awaits it).
+ * The agent counts as in flight until the read itself settles, so a hung read never has others
+ * piled behind it; a trigger meanwhile is remembered, and one reread follows once it settles.
+ * A refusal, a failure or a read past PEEK_TIMEOUT_MS is stored as denied, unless lines are
+ * already cached: an agent that finished, or a slow read, keeps the last lines shown.
+ */
+async function refreshPeek($: $, id: string) {
+  if (id === 'main') return
+  if (peeking.has(id)) {
+    peekAgain.add(id)
+    return
+  }
+  peeking.add(id)
+  const found = $.session
+    .messages({ agentId: id })
+    .then(f => ('deny' in f ? undefined : peekLines(f, PEEK_CHARS, PEEK_MAX)))
+    .catch(() => undefined)
+    .finally(() => {
+      peeking.delete(id)
+      if (peekAgain.delete(id)) schedulePeek($, id)
+    })
+  let timer: { cancel: () => void } | undefined
+  const late = new Promise<undefined>(resolve => {
+    timer = $.clock.after(PEEK_TIMEOUT_MS, () => resolve(undefined))
+  })
+  const lines = await Promise.race([found, late])
+  timer?.cancel()
+  await update($, peeksAtom, p =>
+    lines ? { ...p, [id]: { lines } } : p[id] && 'lines' in p[id] ? p : { ...p, [id]: { denied: true as const } },
+  )
+}
+
+/** Starts a transcript read outside the dispatch that asked for it, so no hook or press waits on it. */
+function schedulePeek($: $, id: string) {
+  if (id === 'main') return
+  if (peeking.has(id)) {
+    peekAgain.add(id)
+    return
+  }
+  $.clock.after(0, () => void refreshPeek($, id).catch(() => undefined))
+}
+
+/** Rereads the transcript of the agent an event came from, when it is the one open in the pane. Never throws. */
+async function peekIfSelected($: $, id: string | undefined) {
+  try {
+    if (id && id === (await read($, selectedAtom))) schedulePeek($, id)
+  } catch {
+    // The peek is a convenience: whatever fails here must not reach a handover or a step's record.
+  }
 }
 
 // ---- subagents -------------------------------------------------------
@@ -286,6 +366,9 @@ async function sync($: $) {
     }
   }
   if (changed) await persist($)
+  // The open transcript is read again now and then, so one left loading (a reload, a lost read) settles.
+  const selected = liveSelection(await read($, agentsAtom), await read($, selectedAtom))
+  if (selected) schedulePeek($, selected)
 }
 
 // ---- main thread -----------------------------------------------------
@@ -372,6 +455,8 @@ export const register: Register = (on, options) => {
   mainBusy = false
   mainHandoverQueued = false
   mainHandoverStarting = false
+  peeking.clear()
+  peekAgain.clear()
 
   // ---- events ----------------------------------------------------------
 
@@ -461,23 +546,29 @@ export const register: Register = (on, options) => {
     } catch (err) {
       $.ui.log(`orchestrator: step not recorded: ${String(err)}`)
     }
+    // Last, after the step is recorded and any handover started: the peek can cost them nothing.
+    await peekIfSelected($, e.agentId)
     return res
   })
 
   on('tool.call', async ($, e, next) => {
     const res = await next(e)
     if (e.agentId === undefined || res.deny !== undefined) return res
+    let out = res
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
-      if (r?.status !== 'handing-over' || r.handoverVia || !r.notePath) return res
-      await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
-      await log($, `${label(r)}: HANDOVER delivered with a tool result`)
-      await persist($)
-      return { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+      if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
+        await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
+        await log($, `${label(r)}: HANDOVER delivered with a tool result`)
+        await persist($)
+        out = { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+      }
     } catch (err) {
       $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
-      return res
     }
+    // Last, after the HANDOVER is attached: the peek can cost it nothing.
+    await peekIfSelected($, e.agentId)
+    return out
   })
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.
@@ -590,14 +681,19 @@ export const register: Register = (on, options) => {
       phase,
     })
     const tone = { ok: 'success', warn: 'warning', hot: 'error' } as const
+    const shown = mainButtonShown(cfg.mainMode, phase)
+    // A press while queued does nothing: startMainHandover returns on the queued flag.
+    const queued = await read($, queuedAtom)
+    // The transcript the host has open beside the pane (read-only; absent on older hosts and kit mounts). Main is never marked.
+    const viewed = liveSelection(rows, e.props.view?.agentId ?? '')
 
     if (e.surface !== 'terminal') {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
       const { Box, Button, Text, Svg } = $.ui.resolve(e)
       const selected = liveSelection(rows, await read($, selectedAtom))
-      // A press while queued does nothing: startMainHandover returns on the queued flag.
-      const queued = await read($, queuedAtom)
       const colors = seriesColors(rows)
+      // A click selection wins; with none, the agent in view stands out.
+      const hl = selected || viewed
       const chart = contextChart({
         rows,
         now,
@@ -606,15 +702,17 @@ export const register: Register = (on, options) => {
         agentThreshold: cfg.agentThreshold,
         mainThreshold: cfg.mainThreshold,
         colors,
-        selected,
+        selected: hl,
       })
-      const canHandMain = cfg.mainMode !== 'off' && phase !== 'writing' && phase !== 'clearing'
       const fits = cols - 6
+      // Main is the main view already: only a subagent's transcript is shown.
+      // Drawn from the cache alone: the read is refreshPeek's, never the render's.
+      const peek = selected && selected !== 'main' ? peekView((await read($, peeksAtom))[selected], fits, PEEK_MAX) : undefined
       return (
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
             <Text bold>{header}</Text>
-            {canHandMain && (
+            {shown && (
               <Button
                 key="handover:main"
                 variant="secondary"
@@ -629,18 +727,19 @@ export const register: Register = (on, options) => {
             <Svg key="chart" isInteractive source={chart.source} alt={chart.alt} width={chart.width} height={chart.height} />
           )}
           <Box flexDirection="column">
-            {orderRows(rows).map(({ row, depth }) => {
+            {orderRows(rows).flatMap(({ row, depth }) => {
               const ceiling = ceilingOf(row, cfg)
               const pct = Math.round((row.tokens / ceiling) * 100)
-              return (
+              return [
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
                   <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
-                    <Text bold={selected === row.id}>{label(row)} </Text>
+                    <Text bold={hl === row.id}>{label(row)} </Text>
                     <Text color={tone[level(row.tokens, ceiling)]}>
                       {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
                     </Text>
                     <Text dimColor>{row.status}</Text>
+                    {viewed === row.id && <Text dimColor> · in view</Text>}
                   </Button>
                   {canHandOver(row) && (
                     <Button
@@ -650,8 +749,21 @@ export const register: Register = (on, options) => {
                       onPress={() => startHandover($, row.id, 'from the pane')}
                     />
                   )}
-                </Box>
-              )
+                </Box>,
+                peek && selected === row.id && (
+                  <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" marginLeft={depth * 2}>
+                    {'dim' in peek ? (
+                      <Text dimColor>{peek.dim}</Text>
+                    ) : (
+                      peek.lines.map((l, j) => (
+                        <Text key={`p${j}`} wrap="truncate">
+                          {l}
+                        </Text>
+                      ))
+                    )}
+                  </Box>
+                ),
+              ]
             })}
           </Box>
           <Box flexDirection="column">
@@ -702,27 +814,65 @@ export const register: Register = (on, options) => {
       done: '✓',
       stalled: '!',
     }
-    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8)
+    const selected = liveSelection(rows, await read($, selectedAtom))
+    // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.
+    const peek = selected && selected !== 'main' ? peekView((await read($, peeksAtom))[selected], Math.max(10, cols - 4), 5) : undefined
+    const peekRows = peek ? ('lines' in peek ? peek.lines.length : 1) + 2 : 0
+    // The header's button can wrap onto a row of its own.
+    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0) - peekRows)
     return (
       <Box flexDirection="column">
-        <Text bold>{header}</Text>
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          <Text bold>{header}</Text>
+          {shown && (
+            <Button
+              key="handover:main"
+              label={queued ? 'Handover queued' : 'Hand over main'}
+              onPress={() => startMainHandover($)}
+            />
+          )}
+        </Box>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
-        {ordered.map(({ row, depth }) => {
+        {ordered.flatMap(({ row, depth }) => {
           const ceiling = ceilingOf(row, cfg)
           const live = LIVE.includes(row.status)
           const name = `${'  '.repeat(depth)}${glyph[row.status]} ${label(row)}`
-          return (
+          const cell = (
+            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
+              {name.slice(0, NAME).padEnd(NAME)}
+            </Text>
+          )
+          return [
             <Box key={row.id}>
-              <Text dimColor={!live} wrap="truncate">
-                {name.slice(0, NAME).padEnd(NAME)}
-              </Text>
+              {row.id === 'main' ? (
+                cell
+              ) : (
+                <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
+                  {cell}
+                </Button>
+              )}
               <Text dimColor={!live}>{fmtTokens(row.tokens).padStart(6)} </Text>
               <Text color={live ? tone[level(row.tokens, ceiling)] : 'subtle'}>
                 {timeline(row.samples, width, t0, now, ceiling, live)}
               </Text>
               <Text dimColor> {row.status.padEnd(12)}</Text>
-            </Box>
-          )
+            </Box>,
+            peek && selected === row.id && (
+              <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
+                {'dim' in peek ? (
+                  <Text dimColor wrap="truncate">
+                    {peek.dim}
+                  </Text>
+                ) : (
+                  peek.lines.map((l, j) => (
+                    <Text key={`p${j}`} wrap="truncate">
+                      {l}
+                    </Text>
+                  ))
+                )}
+              </Box>
+            ),
+          ]
         })}
         <Text dimColor>
           {' '.repeat(NAME + 7)}

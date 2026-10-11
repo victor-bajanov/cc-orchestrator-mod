@@ -50,6 +50,13 @@ export type AgentRow = {
 
 export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }
 
+/**
+ * An agent's transcript tail as the pane last read it, off the render: its lines
+ * (cleaned, each capped), or `denied` when no read has given lines (refused,
+ * failed or timed out).
+ */
+export type Peek = { lines: string[] } | { denied: true }
+
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
 
 declare module 'claude-code' {
@@ -60,8 +67,10 @@ declare module 'claude-code' {
       mainPhase: MainPhase
       runId: string
       pinnedLog: string
-      /** The agent whose chart line the desktop pane highlights ('' for none). */
+      /** The agent a click selected: its chart line highlighted, its transcript shown beneath its row ('' for none). */
       selectedAgent: string
+      /** Each agent's transcript tail by id, read off the render; the pane draws the selected one's. */
+      peeks: Record<string, Peek>
       /** A main handover asked for mid-turn, waiting for that turn to end. */
       mainQueued: boolean
     }

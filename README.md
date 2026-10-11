@@ -23,24 +23,29 @@ If the agent ends again without writing its note, it is marked `done` and not re
 2. The mod runs `/clear`.
 3. The mod submits a fresh prompt containing the note, the live agents (name, id, type, status, context) and the roster path.
 
-Running agents survive `/clear`. This prompt is how the new context learns about them. With `mainHandover: ask` (the default) the mod offers a **Hand over & restart** button above the prompt. With `auto` it acts on its own. With `off` it never acts. If you ask for a handover mid-turn (with that button, the desktop pane's `Hand over main` or `/orch handover`), it waits and starts when the turn ends, even a stopped one; meanwhile the buttons read "Handover queued". After a restart, the mod doesn't offer again until the main context has read below the threshold once.
+Running agents survive `/clear`. This prompt is how the new context learns about them. With `mainHandover: ask` (the default), the pane carries a `Hand over main` button at any time, on the terminal and in the desktop app; past `mainThreshold`, a **Hand over & restart** band also appears above the prompt. With `auto` the mod acts on its own and shows no button. With `off` it never acts. `/orch handover main` works in every mode. If you ask for a handover mid-turn (with either button or `/orch handover`), it waits and starts when the turn ends, even a stopped one; meanwhile the buttons read "Handover queued". After a restart, the mod doesn't offer again until the main context has read below the threshold once.
 
 **Visual.** The **Orchestrator** pane opens on the first spawn, or with `/orch`. In the desktop app it also opens on the first spawn, but `/orch` may not be listed in the desktop prompt.
 
 *Terminal.* The pane has:
-- a tree of agents (main, then each agent under its parent)
+- a `Hand over main` button in the header (with `mainHandover: ask`; hidden while main is handing over)
+- a tree of agents (main, then each agent under its parent); the agent you opened from `/tasks` is shown inverted
+- click a subagent's name to show its last five messages in a box beneath it (role, any tools it called, the text cut to the pane); click again to close it. The box takes its rows from the activity log
 - each agent's context drawn on one shared time axis, so you can see when each agent was active and how close it is to its limit (green, then amber from 60%, red at the threshold)
 - an activity log; a line too long for the pane ends in `…`, and hovering it shows the full text in a card (a click pins it open)
 
 *Desktop app.* The pane has:
 - a chart of each agent's context over time, one coloured line per agent, with the limits as dashed red lines; hover a line for the agent's name, context and status
-- a tree of agents, each with its colour, context and status; click one to highlight its line in the chart, click again to clear
-- a `Hand over` button beside each live subagent, and a `Hand over main` button in the header (hidden when `mainHandover` is `off` or main is already handing over)
+- a tree of agents, each with its colour, context and status; click one to highlight its line in the chart and show its last eight messages beneath it (role, any tools it called, the text cut to the pane), click again to clear both (the agent in view stays highlighted)
+- the agent open in the main view is marked *in view* and its line highlighted, unless you clicked another
+- a `Hand over` button beside each live subagent, and a `Hand over main` button in the header (hidden unless `mainHandover` is `ask`, and while main is handing over)
 - an activity log; a line too long for the pane ends in `…`, and clicking it expands the full text beneath it
 
 VS Code and the mobile app get the desktop pane.
 
-On both the terminal and the desktop app, the status line shows live agents, the largest context and main's context; toasts show; and the **Hand over & restart** band shows above the prompt. The desktop app has no notifications; the stall toast still shows there.
+Clicking a subagent shows its transcript inside the pane, read through the host's own transcript API. Main has none there, since it is the main view already. The box says `loading…` until the first read comes back, and it updates as the agent works. A teammate running in another pane's process, or a finished agent whose transcript was not saved, can't be read; the box says "transcript not readable (teammate in another pane, or finished)". The host gives mods no way to switch the main view to an agent, so to read a whole transcript open it with `/tasks` (terminal) or the app's agent panel (desktop).
+
+On both the terminal and the desktop app, the status line shows live agents, the largest context and main's context; toasts show; and in ask mode the **Hand over & restart** band shows above the prompt past the threshold. The desktop app has no notifications; the stall toast still shows there.
 
 **Records.** The run folder, `<project>/.orchestrator/<run>/` by default, holds `roster.md` (one row per agent: name, id, type, status, context, peak, note, replaced by/replaces), `state.json` and `handover/*.md`. The run id is the first session id, so it stays the same across `/clear`. The folder sits inside the project so agents can write notes there under ordinary edit permissions (`~/.claude` is a protected path, so they can't write there). The mod adds `.orchestrator/` to `.git/info/exclude` so it never shows in `git status`. Set `runRoot` to put run folders elsewhere.
 

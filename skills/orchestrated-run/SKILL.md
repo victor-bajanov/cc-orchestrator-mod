@@ -23,7 +23,7 @@ the mod ── context of every agent, HANDOVER, respawn, run roster, pane (/orc
 1. **Ask the decisions only the user can make, in one AskUserQuestion**, and pass the answers into the brief as "already decided, do not re-ask". Typical: who picks design parameters (orchestrator decides vs proposes-and-waits), how existing assets/data are treated, whether paid API calls are allowed (and a cap), and how the run finishes (stop on branch vs merge and push).
 2. **Create the work branch** yourself (`git checkout -b <task-slug>`) so the orchestrator never touches the default branch.
 3. Make `<scratchpad>/<task>/roster.md` for the orchestrator's **task roster**. Handover notes and the mod's run roster live in the mod's run folder (`<project>/.orchestrator/<run>/`); don't make a handover folder.
-4. Check the mod's settings in `/config` match the run: `agentThreshold` and `mainThreshold` (450000 for a 500k ceiling), `mainHandover` (`ask` offers a button above the prompt, `auto` restarts on its own), `autoRespawn` and `injectClause` on.
+4. Check the mod's settings in `/config` match the run: `agentThreshold` and `mainThreshold` (450000 for a 500k ceiling), `mainHandover` (`ask` offers a pane button at any time and a band above the prompt past the threshold, `auto` restarts on its own), `autoRespawn` and `injectClause` on.
 
 ## 2. The orchestrator brief (checklist)
 
@@ -61,11 +61,11 @@ Hard ceiling 500k tokens per agent; the mod acts at `agentThreshold` (450k).
 - Never hand agents over itself, and never send `HANDOVER` on its own initiative.
 - Its own handover works the same way: its note lists every live child (name, id, state) and the task roster path, and its replacement adopts them.
 
-**Main session.** Near `mainThreshold` the mod offers **Hand over & restart** above the prompt (or acts, with `auto`): the main session writes its note, the mod runs `/clear` and submits the note with the live agents and the run roster. Running agents survive `/clear`. If a restart is cut short (Esc), the next message carries on and the mod settles itself.
+**Main session.** With `ask`, the pane's `Hand over main` button restarts it at any time, and near `mainThreshold` the mod also offers **Hand over & restart** above the prompt (with `auto` it acts on its own): the main session writes its note, the mod runs `/clear` and submits the note with the live agents and the run roster. Running agents survive `/clear`. If a restart is cut short (Esc), the next message carries on and the mod settles itself.
 
 **Rosters.** The orchestrator's task roster (`<scratchpad>/<task>/roster.md`): one line per agent with name, id, role, task and status. It maps agents to roles. The mod's run roster (`.orchestrator/<run>/roster.md`, also `/orch roster`) has each agent's status, context, peak, note path and replaced-by links.
 
-**Tools:** `/orch` opens the pane (agent tree, context over time, activity log) and `/orch close` closes it; `/orch handover <name or id>` hands an agent over now; `/orch handover` restarts the main session. In the desktop app the pane shows a context chart, a `Hand over` button beside each live subagent and a `Hand over main` button, which do what `/orch handover` does, so `/orch` is optional there.
+**Tools:** `/orch` opens the pane (agent tree, context over time, activity log; clicking a subagent shows its last messages there, for the person, not your context) and `/orch close` closes it; `/orch handover <name or id>` hands an agent over now; `/orch handover` restarts the main session. In ask mode the pane has a `Hand over main` button on both the terminal and the desktop app. In the desktop app the pane also shows a context chart and a `Hand over` button beside each live subagent, which do what `/orch handover` does, so `/orch` is optional there.
 
 ## 4. Main session while it runs
 

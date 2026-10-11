@@ -1,4 +1,6 @@
-import type { AgentRow, AgentStatus, LogEntry, MainPhase, Sample } from '../types'
+import type { SessionMessage } from 'claude-code'
+
+import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek, Sample } from '../types'
 import { fmtTokens, label } from './core'
 
 export const MAIN_COLOR = '#6B7280'
@@ -19,6 +21,10 @@ export const paneHeader = (
   return `${live} live · ${replaced} handed over · limits ${fmtTokens(o.agentThreshold)} / main ${fmtTokens(o.mainThreshold)} (${o.mainMode}${o.phase !== 'idle' ? `, ${o.phase}` : ''})`
 }
 
+/** Whether either pane offers Hand over main: only in ask mode, and not while main is already handing over. */
+export const mainButtonShown = (mode: string, phase: MainPhase): boolean =>
+  mode === 'ask' && phase !== 'writing' && phase !== 'clearing'
+
 /**
  * main → MAIN_COLOR; every other row in `rows` order (spawn order) → PALETTE[i % PALETTE.length],
  * so a later spawn never shifts an earlier agent's colour.
@@ -37,6 +43,56 @@ export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 1
 
 /** An activity line cut to `fits` characters, ending in an ellipsis. */
 export const cut = (text: string, fits: number): string => `${text.slice(0, Math.max(1, fits - 1))}…`
+
+/** Text safe for one pane line: ANSI escapes and control characters removed. */
+const clean = (s: string): string =>
+  s.replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+
+/** `Bash×2, Read`: each tool once, in first-use order, with its count past one. */
+const toolSummary = (uses: SessionMessage['toolUses']): string => {
+  const counts = new Map<string, number>()
+  for (const u of uses) {
+    const tool = clean(u.tool)
+    counts.set(tool, (counts.get(tool) ?? 0) + 1)
+  }
+  return [...counts].map(([tool, n]) => (n > 1 ? `${tool}×${n}` : tool)).join(', ')
+}
+
+/**
+ * An agent's last `n` messages, one line each, for the pane's transcript peek:
+ * `role: ⚙ tools · text`, whitespace collapsed, escapes and control characters
+ * stripped, cut to `width`. Messages with no text and no tool use (a user row of
+ * tool results alone) are left out. It reads from the end and stops once it has
+ * `n` lines, so a long transcript costs only its tail; the lines come oldest first.
+ */
+export const peekLines = (messages: readonly SessionMessage[], width: number, n: number): string[] => {
+  const out: string[] = []
+  for (let i = messages.length - 1; i >= 0 && out.length < n; i--) {
+    const m = messages[i]!
+    const text = clean(m.text.replace(/\s+/g, ' ')).trim()
+    const tools = m.toolUses.length ? `⚙ ${toolSummary(m.toolUses)}` : ''
+    const body = [tools, text].filter(Boolean).join(' · ')
+    if (body === '') continue
+    const line = `${m.role}: ${body}`
+    out.push(line.length > width ? cut(line, width) : line)
+  }
+  return out.reverse()
+}
+
+/** What the pane shows when an agent's transcript cannot be read. */
+export const PEEK_DENIED = 'transcript not readable (teammate in another pane, or finished)'
+
+/**
+ * What the pane draws for a selected agent's cached transcript: one dim line
+ * (`loading…` before the first read settles, the not-readable line, or
+ * `no messages yet`), or its last `n` lines cut to `width`.
+ */
+export const peekView = (peek: Peek | undefined, width: number, n: number): { dim: string } | { lines: string[] } => {
+  if (!peek) return { dim: 'loading…' }
+  if ('denied' in peek) return { dim: PEEK_DENIED }
+  if (peek.lines.length === 0) return { dim: 'no messages yet' }
+  return { lines: peek.lines.slice(-n).map(l => (l.length > width ? cut(l, width) : l)) }
+}
 
 /** The context limit a row is held to: main's for main, the agents' otherwise. */
 export const ceilingOf = (r: AgentRow, t: { agentThreshold: number; mainThreshold: number }): number =>
