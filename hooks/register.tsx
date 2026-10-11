@@ -604,6 +604,8 @@ export const register: Register = (on, options) => {
     const shown = mainButtonShown(cfg.mainMode, phase)
     // A press while queued does nothing: startMainHandover returns on the queued flag.
     const queued = await read($, queuedAtom)
+    // The transcript the host has open beside the pane (read-only; absent on older hosts and kit mounts). Main is never marked.
+    const viewed = liveSelection(rows, e.props.view?.agentId ?? '')
 
     if (e.surface !== 'terminal') {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
@@ -618,7 +620,8 @@ export const register: Register = (on, options) => {
         agentThreshold: cfg.agentThreshold,
         mainThreshold: cfg.mainThreshold,
         colors,
-        selected,
+        // A click selection wins; with none, the line in view stands out.
+        selected: selected || viewed,
       })
       const fits = cols - 6
       return (
@@ -652,6 +655,7 @@ export const register: Register = (on, options) => {
                       {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
                     </Text>
                     <Text dimColor>{row.status}</Text>
+                    {viewed === row.id && <Text dimColor> · in view</Text>}
                   </Button>
                   {canHandOver(row) && (
                     <Button
@@ -733,7 +737,7 @@ export const register: Register = (on, options) => {
           const name = `${'  '.repeat(depth)}${glyph[row.status]} ${label(row)}`
           return (
             <Box key={row.id}>
-              <Text dimColor={!live} wrap="truncate">
+              <Text dimColor={!live} inverse={viewed === row.id} wrap="truncate">
                 {name.slice(0, NAME).padEnd(NAME)}
               </Text>
               <Text dimColor={!live}>{fmtTokens(row.tokens).padStart(6)} </Text>
