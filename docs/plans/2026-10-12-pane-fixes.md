@@ -7,6 +7,8 @@ Date: 2026-10-12 · Branch: `pane-fixes` · Mod version now: 0.3.4 → **0.3.5**
 1. **Collapse that works.** Double-click can never work: the host turns a second click into a word-select multi-click, and `UiPressArgument` has no click count. Remove it. Add a disclosure glyph (`▾` expanded, `▸` collapsed) on every row that can fold, plus a `c` hotkey in the header that folds the selected row (or main).
 2. **Hand over under auto mode.** A Hand over press fails with `HANDOVER could not be delivered (The server-side auto mode classifier gave no verdict for SendMessage: the request that produced this action did not ask for one. …)`. The mod's own `$.session.send` is judged as a SendMessage tool call that no user request asked for. Fix: a `tool.check` hook that allows exactly the sends the mod is making at that moment.
 3. **Copy on the desktop.** Nothing in a desktop plugin pane can be selected. Add one shared copy control beside each agent row, in each expanded activity card and transcript card, and on each tool-detail section.
+4. **Renamed agents (Task 5).** When a requested name is taken, the engine registers a suffixed one (`orchestrator` → `orchestrator-2`). The mod records the requested name, so `checkin { agent: "orchestrator-2" }` fails. Record the engine's name, and resolve agents by id, registered name, or an unambiguous requested name.
+5. **Reports to the wrong agent (Task 6).** Tell a renamed agent its real name with a queued notice. The skill has main give each orchestrator a unique name and check spawn results for suffixes.
 
 ## Baseline (run 2026-10-12 on `f85cf7f`, branch `pane-fixes`, clean)
 
@@ -117,7 +119,7 @@ Date: 2026-10-12 · Branch: `pane-fixes` · Mod version now: 0.3.4 → **0.3.5**
 
 ## Order
 
-**Recommended: Task 2 → Task 1 → Task 3 → Task 4**, serially, because all touch R and RT.
+**Recommended: Task 2 → Task 1 → Task 3 → Task 5 → Task 6 → Task 4**, serially, because all touch R and RT. Task 6 builds on Task 5 (it needs the assigned name Task 5 records), and the version bump stays last.
 
 - Task 2 fixes a broken core path (Hand over under auto mode) and is the smallest. Its only RT change is in the shared `world` (opt-in fields), so landing it first keeps the later diffs clean.
 - Task 3 builds on Task 1's new row layout: the copy control sits in the desktop row next to the fold glyph. So 1 must come before 3.
@@ -128,7 +130,9 @@ Date: 2026-10-12 · Branch: `pane-fixes` · Mod version now: 0.3.4 → **0.3.5**
 | 2 | `hooks/register.tsx`, `hooks/register.test.ts` |
 | 1 | `hooks/view.ts`, `hooks/view.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `README.md`, `skills/orchestrated-run/SKILL.md` |
 | 3 | `hooks/register.tsx`, `hooks/register.test.ts`, `README.md` |
-| 4 | `.claude-plugin/plugin.json` (version 0.3.5), after 1-3 are green |
+| 5 | `hooks/view.ts`, `hooks/view.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `README.md` |
+| 6 | `hooks/core.ts`, `hooks/core.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `README.md`, `skills/orchestrated-run/SKILL.md` |
+| 4 | `.claude-plugin/plugin.json` (version 0.3.5), after 1-3, 5 and 6 are green |
 
 ---
 
@@ -469,9 +473,212 @@ on('ui.copy', ($, e) => {
 
 ---
 
+### Task 5: record the engine-assigned name; resolve agents by id, registered name, or requested name
+
+**Line numbers below are from the working tree on 2026-10-12 with Task 2 applied (Tasks 1 and 3 not yet).** Tasks 1 and 3 shift R, RT, V and VT. Find each site by the function or string named, not by the number.
+
+**Facts (sources).**
+- **F19. The root cause, confirmed.** The `agent.spawn` hook writes the row's `name: e.name`, the name the call *asked for* (R:1091), and `brief.name: e.name` (R:1102). It never reads the name back. `AgentSpawnResult` is `{ model, agentId?, teammateId? }` and carries no name (T:401-429). The engine suffixes a taken name: "A teammate whose name the team has already gets a suffix (`scout-2`), which the answer's `teammateId` and `$.agent.list()` show" (T:376-378). `AgentInfo.name` is "what SendMessage addresses it by… with a suffix when the call's was taken" (T:177-183). So main asks for `orchestrator`, the engine registers `orchestrator-2`, and the mod's row still says `orchestrator`.
+- **F20. `respawn` already reads the name back.** After `$.agent.spawn` resolves it calls `(await $.agent.list()).find(a => a.id === newId)` and uses `info?.name ?? brief.name` (R:609-611). So the list does hold a just-started agent once its spawn resolves. RT:408-425 (`a teammate replacement: the parent learns the name the engine gave it…`) proves the shape with `w.agents`.
+- **F21. Every by-name resolution site:**
+  1. `checkin` (R:666-693): `kids.filter(r => r.name === target)` (R:674). With the requested name stored, `orchestrator-2` matches nothing: `no agent "orchestrator-2" among the agents you spawned` (R:676). The id works (R:675). **This is the reported bug.**
+  2. `/orch handover <name|id>` in the `command.run` hook (R:1331-1337): `live.find(a => a.id === target) ?? live.filter(a => a.name === target).at(-1)`. Same flaw.
+  3. `namesAgent(to, row)` (V:505-512), used by `noteReport` (R:~700-712) to decide whether a child's SendMessage went to its parent. With the requested name stored, a child that correctly sends to `orchestrator-2` is **not** counted as reporting (its check-in still fires), and one that sends to `orchestrator` (a different agent!) **is** counted. Recording the assigned name fixes both; `namesAgent` itself does not change.
+  4. Task 2's `tool.check` hook (R:~1236-1266) matches `input.to` with `namesAgent` against the row. The engine spells a live teammate's `to` as its **name** (F11), so a mod send to a renamed teammate is not matched under auto mode and is refused. Also fixed by recording the assigned name.
+  5. Display only, no lookup: `label(r)` (core.ts:155), `rosterMarkdown` (core.ts:203), `handoverPath` (`slug(r.name)`, core.ts:153). They show the assigned name once it is recorded. That is intended.
+  6. `turn.step` adoption already uses `info.name` from the list (R:1123-1130). Nothing to change.
+- **F22. The requested name is already kept** as `brief.name` (R:1102), and `respawn` must keep asking for it (R:602). So no new `AgentRow` field is needed: the requested name is `r.brief?.name`.
+- **F23. The spawn hook's failure path.** The hook ends with `.catch(($, e, next) => next(e))` (R:1113). A throw *after* `next(e)` answered would ask that `.catch`, which calls `next(e)` again (T:418-422 on a failed hook). So the new list read must sit in its own try/catch and fall back to `e.name`. It must never throw out of the hook.
+- **F24. The test world** answers `agent.list` with `w.agents` (RT:28-29, RT:78), empty by default, and numbers spawns `agent1`, `agent2`, … (RT:121). Most tests set `w.agents` *after* spawning (`family`, RT:2114-2119), so their rows keep the requested name and stay green. A test that sets `w.agents` *before* a spawn, with a different name for that id, would change. Grep for it before you start, and fix such a test by key, not by deleting it.
+
+**Design.**
+- **Pure resolver** in V, next to `namesAgent`:
+  ```ts
+  /**
+   * The agent `target` means among `rows`: its id; else its registered name (the name SendMessage uses),
+   * a live holder first, else the newest; else the name it asked for at spawn (`brief.name`), when that
+   * picks one agent (or one live agent). A trailing ` [ref]` is ignored. `ambiguous` lists the candidates.
+   */
+  export const resolveAgent = (
+    rows: readonly AgentRow[],
+    target: string,
+  ): { row: AgentRow } | { ambiguous: AgentRow[] } | undefined
+  ```
+  - `t = target.replace(/\s*\[[^\]]*\]$/, '').trim()` (the same strip as `namesAgent`). If `t === ''`, return `undefined`.
+  - Match the id, then `r.name === t` (`named.filter(live).at(-1) ?? named.at(-1)`, today's rule), then `r.brief?.name === t`.
+  - For the requested name: one match → it. Several, but exactly one live (`LIVE`, V:13) → that one. That covers an original and its replacement, which share `brief.name`. Otherwise `{ ambiguous: live.length ? live : asked }`.
+  - A registered name always beats another agent's requested name. If main has `orchestrator` (agent1) and `orchestrator-2` (agent2, asked for `orchestrator`), then `orchestrator` means agent1.
+- **`checkin`** (R:674-676): replace the two lines with `const hit = resolveAgent(kids, target)`.
+  - `undefined` → today's `no agent "<target>" among the agents you spawned; nothing changed.`
+  - `ambiguous` → `checkin: "<target>" could mean ${list}; name one by id or registered name; nothing changed.`, where each entry of `list` is `<label> (id <id>)`.
+  - `{ row }` → today's flow with `r = hit.row`.
+- **`/orch handover <target>`** (R:1334-1335): `resolveAgent(live, target)`.
+  - `undefined` → today's text.
+  - `ambiguous` → `"<target>" could mean …; name one by id.`
+- **The spawn hook** (R:1088-1113), after `const id = res.agentId`:
+  ```ts
+  // The engine suffixes a taken name (`orchestrator` → `orchestrator-2`): SendMessage, check-ins and
+  // reports go by the one it registered, which only its list says (F19).
+  let name = e.name
+  try {
+    name = (await $.agent.list()).find(a => a.id === id)?.name ?? e.name
+  } catch {
+    // the requested name stands
+  }
+  ```
+  - The row gets `name`. `brief.name` stays `e.name`, the requested name, which `respawn` asks for again.
+  - The log line becomes `spawned ${name ?? e.description} (${id})`. It is unchanged when nothing was renamed.
+  - `name` becomes the list's name even when the call gave none (a background agent the engine names). See Decisions.
+
+**Failing tests first.**
+- VT, `describe('resolveAgent')`, using VT's `row()` factory (VT:44):
+  1. `an id, then a registered name, then the name it asked for`:
+     - rows `a1 {name:'orchestrator-2', brief:{name:'orchestrator'}}`;
+     - `'a1'`, `'orchestrator-2'` and `'orchestrator'` each give `{ row: a1 }`;
+     - `'nope'` and `''` give `undefined`.
+  2. `a registered name beats another agent's requested name`: `a1 {name:'orchestrator'}` and `a2 {name:'orchestrator-2', brief:{name:'orchestrator'}}`; `'orchestrator'` gives a1.
+  3. `a requested name held by two is ambiguous, unless exactly one is live`:
+     - `impl-2` and `impl-3`, both asked for `impl`, both running → `{ ambiguous: [both] }`;
+     - make one `done` → the live one;
+     - an original (`replaced`) and its live replacement, both asked for `probe` → the replacement.
+  4. `a trailing [ref] is ignored`: `'orchestrator-2 [a1]'` gives a1.
+- RT, new `describe('engine-assigned names')`:
+  5. `the spawn records the name the engine registered and keeps the requested one in the brief`:
+     - `w.agents = [{ id: 'agent1', name: 'orchestrator-2' }]` **before** `spawn($, { prompt: 'P', name: 'orchestrator' })`;
+     - `row(w,'agent1').name` is `orchestrator-2`, and `.brief.name` is `orchestrator`;
+     - the log has `spawned orchestrator-2 (agent1)`.
+     - **Watch it fail:** the name is `orchestrator` today.
+  6. `an unlisted agent keeps its requested name, and a list that fails never fails the spawn`:
+     - with `w.agents = []`, the name is `orchestrator`;
+     - with `w.agents = null as never`, so `.find` throws in the plugin, the spawn resolves with `agentId` and **one** entry in `w.spawns` (no second `next`), and the name is `orchestrator`.
+  7. `check-in finds a renamed child by its registered name, its id, or the name it asked for` (the reported regression):
+     - main spawns `orchestrator`, listed as `orchestrator-2`;
+     - for each of `'orchestrator-2'`, `'agent1'` and `'orchestrator'`, `call($, undefined, CHECKIN, { agent, minutes: 30 })` gives a result containing `armed` and `agent1`.
+     - **Fails today** for `orchestrator-2`.
+  8. `check-in prefers the agent holding a name over one that asked for it`:
+     - spawn agent1 `orchestrator` (listed as is), then agent2 asking for `orchestrator` (listed `orchestrator-2`);
+     - `checkin { agent: 'orchestrator' }` arms agent1 only.
+  9. `check-in on an ambiguous requested name changes nothing and names the candidates`:
+     - two live children asked for `impl`, registered as `impl-2` and `impl-3`;
+     - the result contains `could mean`, `agent1` and `agent2`;
+     - neither row has `checkinAt`.
+  10. `/orch handover takes a renamed agent's registered or requested name`:
+      - an idle renamed agent (`complete` first);
+      - `$.command.run({ command: 'orch', args: 'handover orchestrator-2' })` gives text containing `HANDOVER sent`;
+      - a fresh world with `handover orchestrator` gives the same.
+  11. `a child's SendMessage to its parent's registered name is its report; to the requested name it is not`:
+      - agent1 asks for `orchestrator` and is listed `orchestrator-2`; agent2 is its child; agent1 arms a check-in on agent2;
+      - `call($, 'agent2', 'SendMessage', { to: 'orchestrator', message: 'x' })` leaves `report` undefined;
+      - `{ to: 'orchestrator-2', … }` records the report and disarms the check-in.
+      - **Fails today** (both halves invert).
+  12. `under auto mode, the mod's send to a renamed teammate is allowed` (uses Task 2's `autoMode` and `duringSend`):
+      - a renamed, idle agent1 (`isTeammate: true`); press or `/orch handover agent1`;
+      - inside `duringSend`, `check({ to: 'orchestrator-2', message: e.text })` is `allow`.
+      - **Fails today:** the row says `orchestrator`.
+
+**Acceptance:**
+- Tests 1-12 pass, and every existing test passes unchanged, except any F24 test fixed by key.
+- `grep -n "\.name === target" hooks/register.tsx` returns nothing: both sites go through `resolveAgent`.
+- The spawn hook cannot throw after `next(e)` (test 6).
+- `orchestrator.agents` is unchanged in validate (no new state key).
+- README.md:20 (check-ins): "naming the child by id, by the name it is registered under (the engine's, suffixed when taken: `orchestrator-2`), or by the name it was spawned with when that picks one child". README.md:81: `/orch handover <name or id>` stays, and the same sentence applies.
+- Gates are green.
+
+---
+
+### Task 6: tell a renamed agent its name; skill text for unique names
+
+**Facts (sources).**
+- **F25. When the assigned name is known.** Only after `next(e)` resolves inside the `agent.spawn` hook, and only through `$.agent.list()` (F19, F20).
+  - By then the prompt has gone to the engine: the hook rewrites `e.prompt` only *before* `next` (R:1089, the HANDOVER clause).
+  - `name` is pinned: "Pinned: the address the parent routes by" (T:373-375), so the mod cannot choose the name itself.
+  - The suffix rule is the engine's (`scout-2`, T:377). The mod could only guess it.
+  - **So the brief cannot carry the line. The channel is a queued message.**
+- **F26. Why queued, not sent from the spawn hook.** The mod's rule (R:722-728): "a run woken from inside a hook registration runs without that registration alone… timers never send… both queue". A `sendOwn` inside the `agent.spawn` registration that wakes the new agent would run it **without `agent.spawn`**, so the orchestrator's own children would go untracked: no rows, no check-ins, no HANDOVER clause. The outbox is the mod's existing path:
+  - `enqueue($, { agentId, text, what })` (R:734-739) persists to `state.json`;
+  - `drain` (R:747) sends it with `sendOwn` from the drain-only `turn.complete` registration (R:1272) or `/orch` (R:1343), and Task 2's `tool.check` allows it under auto mode;
+  - `nudgeIfStuck` (R:819-825) prompts main if it waits a whole sync.
+- **F27. Latency.** The notice arrives at the next turn end of any loop (main usually ends its turn right after spawning a background orchestrator), so the new agent may already have spawned children by then. That is why part (b), unique names in the skill, is the primary fix, and the notice is the safety net.
+- **F28. Respawn renames too.** A replacement asks for `brief.name` while the original holds it (README.md:12, R:609-611). Its children would be told to report to the old name, the same bug. `respawn` runs inside `drain` (R:769-772), where `enqueue` is safe: the next drain delivers it. The plugin's own `$.agent.spawn` may or may not pass through its `agent.spawn` hook (`lastSpawned` comment, R:164). So both paths may notice the same rename, and the notice must be deduplicated.
+- **F29. Delivery** is `{ agentId, text, what, kind?, row? }` (`types/index.d.ts`), and a plain message has no `kind`.
+
+**Design.**
+- **Pure text** in core.ts, beside `replacementPrompt`:
+  ```ts
+  /** Tells an agent the engine registered it under a suffixed name, so its children report to the right one. */
+  export const nameNotice = (name: string, requested: string): string =>
+    `[orchestrator mod] You are registered as \`${name}\` (\`${requested}\` was taken); tell your children to SendMessage \`${name}\`.`
+  ```
+- **One top-level helper** in R, beside `respawn`:
+  ```ts
+  /** When the engine registered an agent under another name than it asked for, queues it a notice (once) and logs it. Never throws. */
+  async function noticeRename($: $, id: string, requested: string | undefined, name: string | undefined) {
+    try {
+      if (!requested || !name || name === requested) return
+      const text = nameNotice(name, requested)
+      if ((await read($, outboxAtom)).some(d => d.agentId === id && d.text === text)) return
+      await enqueue($, { agentId: id, text, what: `${name}: name notice not delivered` })
+      await log($, `"${requested}" was taken: ${id} is registered as ${name}; told it so`)
+    } catch (err) {
+      $.ui.log(`orchestrator: name notice not queued: ${String(err)}`)
+    }
+  }
+  ```
+  - It is called in the spawn hook after the row is written: `await noticeRename($, id, e.name, name)`.
+  - It is called in `respawn` after the row update: `await noticeRename($, newId, brief.name, info?.name)`.
+  - An unnamed agent the engine names (`requested` undefined) gets no notice. Nothing was taken.
+  - Dedupe is by the queued message, so a reload (which restores the outbox) also keeps it to one.
+
+**Failing tests first.**
+- core.test.ts: `nameNotice names the registered and the requested name` asserts the exact string for (`orchestrator-2`, `orchestrator`).
+- RT, `describe('engine-assigned names')` (Task 5's):
+  1. `a renamed agent is told its registered name once, at the next turn end`:
+     - `w.agents = [{ id: 'agent1', name: 'orchestrator-2' }]`, then spawn asking for `orchestrator`;
+     - no `w.sent` entry yet;
+     - `complete($, undefined)` and `w.clock.settle()`: exactly one `w.sent` entry to agent1, whose text is `nameNotice('orchestrator-2', 'orchestrator')`;
+     - the log has `"orchestrator" was taken: agent1 is registered as orchestrator-2`;
+     - another turn end sends nothing more.
+  2. `an agent that got the name it asked for is told nothing`: listed under its requested name, so after a turn end there is no notice in `w.sent` and no `was taken` log line.
+  3. `an unnamed agent the engine names is told nothing`: spawn with no `name`, listed as `bg-1`, so the row name is `bg-1` and there is no notice.
+  4. `a renamed replacement is told its name, once`:
+     - the RT:408 flow (`probe` → `probe-2`);
+     - after the respawn's drain, a later `complete($, undefined)` sends exactly one notice to agent2 naming `probe-2` and `probe`.
+  5. `the notice is queued in state.json, so a reload keeps it`: after the spawn and before a turn end, `snapshot`'s outbox (or `JSON.parse(w.files.get(STATE)).outbox`) has the notice.
+- **Watch each fail first.** Test 2 and 3 pass trivially before the change, so write them alongside 1 and confirm 1 fails.
+
+**Docs (content, exempt):**
+- **SKILL.md.**
+  - At :30: replace `name: orchestrator` with "`name: orch-<task-slug>` (a name no other agent in this session holds: the engine suffixes a taken name, `orchestrator` → `orchestrator-2`, and SendMessage to the plain name then reaches the other agent). Check the `name` in the spawn result. If it is suffixed, use that name for check-ins and messages, and tell the orchestrator in a SendMessage (the mod also tells it, at the next turn end)."
+  - At :44-47 (the clause): the clause's example name becomes `orch-<task-slug>`. Replace "The orchestrator puts its own name in the clause…" with "The orchestrator puts its **registered** name in the clause: the name main gave it, unless an `[orchestrator mod] You are registered as …` notice says otherwise (a replacement uses its new name). After each spawn it checks the spawn result's `name`. A suffixed one (`impl-3-2`) is the child's real name for check-ins, messages and the roster."
+  - At :42 (hygiene): "give every agent a `name` unique in the session".
+  - At :64 and :78: add that an `[orchestrator mod] You are registered as …` notice to the orchestrator means it must use that name in every later child's clause.
+- **README.md:12-13**: add "The engine suffixes any taken name the same way, at the first spawn too. The mod records the registered name, and check-ins and `/orch handover` accept it, the id, or the requested name when that picks one agent. It also queues the agent a message: `[orchestrator mod] You are registered as \`<name>\` (\`<requested>\` was taken); tell your children to SendMessage \`<name>\`.`"
+
+**Acceptance:**
+- All tests pass, and existing tests are unchanged.
+- validate lists no new state key.
+- `grep -n "nameNotice" hooks/` shows the core.ts definition, its test, and the one R use.
+- Gates are green.
+
+#### Decisions taken (review these)
+
+| question | choice | why | rejected alternative |
+| --- | --- | --- | --- |
+| How is the assigned name learned? | `$.agent.list()` after `next(e)`, in a try/catch, falling back to `e.name` | It is the one documented source, and `respawn` already relies on it (F20) | Parse `res.teammateId` (`<name>@<team>`). It covers teammates only, and `@` in names is replaced, so splitting it is guesswork. It adds a second path. |
+| Refresh names later from `sync`'s list? | No: spawn time only | `sync` would write names from a timer for a rare lag case. Spawn time matches `respawn` | Patch `row.name` in `sync` when the list differs |
+| Should an unnamed agent take the engine's name? | Yes: the row's `name` is the list's name whenever it has one | That name is what SendMessage addresses (T:177); `turn.step` adoption already does it (R:1123-1130) | Only override when `e.name` was given. That leaves `label` and the requested name unchanged, but the row disagrees with the engine |
+| Where is the requested name kept? | `brief.name` (already there) | No new `AgentRow` field or state change | A new `requestedName` field |
+| Requested-name lookup when several match | Resolve if exactly one match, or exactly one live; else answer "could mean …" and change nothing | Never arm or hand over the wrong agent; the person or parent picks by id | Pick the newest, as the registered-name rule does |
+| Brief line or queued message? | A queued message through the outbox, plus an activity-log line | The name is known only after the prompt is sent and is engine-chosen (F25). A direct send from the spawn hook would run a woken agent without `agent.spawn` tracking (F26) | Predicting the suffix and appending it to the brief. Also appending a generic "your name was taken, a message follows" line before `next` when the list shows the name held: possible, but it adds a second list read per spawn for little gain over unique names in the skill |
+| Notice wording | The brief's line, prefixed `[orchestrator mod] ` | Every mod message carries that prefix, and the skill tells agents what such notices mean | The bare line |
+| Notify a renamed replacement too? | Yes, through the same helper, deduplicated by the queued text | Its children would hit the same bug (F28) | Rely on `tellParent`'s `SendMessage name` alone, which tells the parent but not the replacement |
+| Skill's name scheme | `orch-<task-slug>` | The brief's own example, unique per run, and short | A random suffix, which is unreadable in rosters |
+
+---
+
 ### Task 4: version (content, exempt)
 
-`.claude-plugin/plugin.json` `version` goes from `0.3.4` to `0.3.5`, after Tasks 1-3 are green.
+`.claude-plugin/plugin.json` `version` goes from `0.3.4` to `0.3.5`, after Tasks 1-3, 5 and 6 are green.
 
 ## Manual checks (final reviewer)
 
@@ -488,3 +695,8 @@ on('ui.copy', ($, e) => {
   1. Press `⧉` on a row, a pinned activity card, an expanded transcript item, and a tool-detail section.
   2. Paste each one.
   3. Record whether the app answers `Copied` or `Not copied (no-clipboard)` (F15). The second is an app limitation to report; it is not a mod bug.
+- **M5/M6 (Tasks 5-6)**, terminal:
+  1. With an agent already named `orchestrator` alive, have main spawn another asking for `orchestrator`.
+  2. The pane and `/orch roster` show `orchestrator-2`.
+  3. `mcp__orchestrator__checkin { agent: "orchestrator-2" }` arms, and so does the id.
+  4. After main's turn ends, the new agent receives `[orchestrator mod] You are registered as \`orchestrator-2\` …`, and the activity log shows `"orchestrator" was taken…`.
