@@ -686,6 +686,23 @@ describe('desktop pane', () => {
     await ui.unmount()
   })
 
+  test('a queued main handover still starts, and stops saying queued, when the turn end fails beneath', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await running($, w)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    expect((await ui.find({ key: 'handover:main' }))!.props.label).toBe('Handover queued')
+    w.failMainEnd = true
+    await complete($, undefined).catch(() => undefined)
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(1)
+    expect(w.prompts[0]).toContain('main-1.md')
+    expect((await ui.find({ key: 'handover:main' }))?.props.label).not.toBe('Handover queued')
+    await ui.unmount()
+  })
+
   test('two quick presses of Hand over main start one handover', async ($, on) => {
     const w = world(on)
     await running($, w)
