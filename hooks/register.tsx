@@ -1,8 +1,8 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
-import { toolDetail } from './detail'
+import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
   HANDOVER_CLAUSE,
@@ -12,6 +12,7 @@ import {
   label,
   level,
   mainHandoverPrompt,
+  nameNotice,
   newRow,
   notePathFor,
   orderRows,
@@ -35,13 +36,14 @@ import {
   modelLabel,
   paneHeader,
   checkinDue,
-  childrenOf,
   collapseHidden,
   forwardTarget,
   hiddenCount,
-  isDoublePress,
+  canFold,
+  foldGlyph,
   latest,
   namesAgent,
+  resolveAgent,
   seriesColors,
   statusEmoji,
   statusStyle,
@@ -73,7 +75,7 @@ const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
 /** Messages timers queued for the next hook to deliver (a send from a timer wakes a run without hooks). */
 const outboxAtom = atom({ plugin: 'orchestrator', key: 'outbox' } as const, [] as Delivery[])
-/** Rows collapsed by a double-click, their finished descendants hidden; display only. */
+/** Rows the person collapsed with a row's fold glyph or the `c` hotkey, their finished descendants hidden; display only. */
 const collapsedAtom = atom({ plugin: 'orchestrator', key: 'collapsed' } as const, [] as string[])
 /** The tool call open in the detail dialog, read off the render by refreshTool. */
 const toolViewAtom = atom({ plugin: 'orchestrator', key: 'toolView' } as const, null as ToolView | null)
@@ -103,6 +105,37 @@ const canHandOver = (r: AgentRow) => r.id !== 'main' && isActive(r)
 /** The selection, or '' when it names no row (so a stale one fades no line). */
 export const liveSelection = (rows: readonly AgentRow[], selected: string) =>
   rows.some(r => r.id === selected) ? selected : ''
+
+/** A dispatch this plugin raised (`next.origin`, as plugin.json names it); anything malformed is not. */
+export const isOwnOrigin = (origin: unknown): boolean =>
+  typeof origin === 'object' && origin !== null && (origin as { plugin?: unknown }).plugin === 'orchestrator'
+
+/** One of the mod's sends in flight. */
+export type OwnSend = { agentId: string; text: string }
+
+/**
+ * Whether a SendMessage check is one of the mod's own sends: the exact text to a recipient one is in flight
+ * to; or, this plugin's origin and a send in flight to that recipient. The origin is never enough alone: it
+ * also covers the model inside an agent the mod spawned, so it counts only for a check from no loop (no `agentId`):
+ * the mod's own send runs in none. `to` names a recipient as `namesAgent` does.
+ */
+export const isOwnSend = (o: {
+  origin: unknown
+  /** The loop the check is decided in (`tool.check`'s `agentId`); absent for the main loop or none. */
+  agentId?: string
+  to: unknown
+  message: unknown
+  inFlight: readonly OwnSend[]
+  rows: readonly AgentRow[]
+}): boolean => {
+  const own = o.agentId === undefined && isOwnOrigin(o.origin)
+  const toward = (s: OwnSend) => {
+    if (typeof o.to === 'object' && o.to !== null) return (o.to as { agentId?: unknown }).agentId === s.agentId
+    return namesAgent(o.to, o.rows.find(a => a.id === s.agentId) ?? { id: s.agentId })
+  }
+  return o.inFlight.some(s => toward(s) && (own || (typeof o.message === 'string' && s.text === o.message)))
+}
+
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
@@ -139,10 +172,14 @@ const DRAIN_TIMEOUT_MS = 10_000
 let draining = false
 /** Main was prompted to run a hooked turn for the outbox, and nothing has drained since: no second prompt. */
 let nudgedSinceDrain = false
-/** The last row press, to tell a double-click (two presses within 400 ms) and undo its first click. */
-let lastPress: { key: string; t: number; prevSelected: string } | undefined
-/** Row presses, one at a time in the order they came. */
-let pressQueue: Promise<void> = Promise.resolve()
+/**
+ * The mod's sends in flight. Under auto mode the engine judges a plugin's `$.session.send` as a
+ * SendMessage call, and the classifier refuses it because no user request asked for it. tool.check
+ * allows exactly these sends, and only while they are in flight.
+ */
+const ownSends: OwnSend[] = []
+/** A SendMessage check went unmatched while the mod had a send in flight, and was logged: once per load. */
+let checkMissLogged = false
 /**
  * When the mod saw each transcript entry, per agent: a call's `tool_use_id` → ms, or a text's
  * `textKey` → each time it was seen, oldest first (a repeated text takes its own). Module-level,
@@ -155,6 +192,8 @@ const TEXT_STAMPS_MAX = 50
 const STAMPS_MAX = 500
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
+/** Agents already told their registered name: one notice each, however many paths learn the rename. */
+const noticed = new Set<string>()
 
 async function runDir($: $) {
   let id = await read($, runAtom)
@@ -238,32 +277,42 @@ async function toggleSelected($: $, id: string) {
   if ((await read($, selectedAtom)) === id) schedulePeek($, id)
 }
 
-/**
- * A press on an agent's row. A single press opens or closes its transcript at once. The second press
- * of a double-click restores the selection from before the first, then collapses or expands the
- * row's finished descendants (a row with no children: nothing), so a double-click nets to that alone.
- */
-function pressAgent($: $, id: string): Promise<void> {
-  // Queued synchronously, before any await: presses dispatched together are still seen in order.
-  const run = pressQueue.then(() => pressOnce($, id))
-  pressQueue = run.catch(() => undefined)
-  return run
+/** Copies to the pressing surface's clipboard and says so in a toast. Never throws. */
+async function copyText($: $, text: string, surface: RenderSurface) {
+  try {
+    const r = await $.ui.copy({ text, surface })
+    $.ui.toast(r.isCopied ? 'Copied' : `Not copied (${r.reason})`)
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: copy failed: ${String(err)}`)
+    } catch {
+      // The toast still says it.
+    }
+    try {
+      $.ui.toast('Not copied')
+    } catch {
+      // Nothing more to do.
+    }
+  }
 }
 
-async function pressOnce($: $, id: string) {
-  const now = await $.clock.now()
-  if (isDoublePress(lastPress, id, now)) {
-    const prev = lastPress!.prevSelected
-    lastPress = undefined
-    await update($, selectedAtom, () => prev)
-    if (childrenOf(await read($, agentsAtom), id).length > 0) {
-      await update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
+/** The one copy control: a small plain Button, keyed `copy:<id>`, desktop only (the terminal selects natively). */
+function copyButton($: $, ui: Ui, id: string, text: string) {
+  const { Button } = ui
+  return <Button key={`copy:${id}`} plain dimColor label="⧉" onPress={e => void copyText($, text, e.surface)} />
+}
+
+/** Collapses or expands a row's finished descendants. Never rejects: a failed write leaves the fold as it was. */
+async function toggleCollapsed($: $, id: string) {
+  try {
+    await update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: fold not saved: ${String(err)}`, { to: 'debug' })
+    } catch {
+      // nothing more to do
     }
-    return
   }
-  const prevSelected = await read($, selectedAtom)
-  lastPress = { key: id, t: now, prevSelected }
-  await toggleSelected($, id)
 }
 
 /** How long a transcript read may take before the pane calls it not readable. */
@@ -463,8 +512,11 @@ async function toolIfOpen($: $, agentId: string | undefined, toolUseId: string |
 
 type Ui = ReturnType<$['ui']['resolve']>
 
-/** A tool call's detail as elements: header, then each section labelled (D11). No `$`: it only draws. */
-function detailBody(ui: Ui, d: ToolDetail) {
+/**
+ * A tool call's detail as elements: header, then each section labelled (D11). With `copy`, each label has a
+ * copy control (`copy:sec:<toolUseId>:<i>`); `$` serves only that control's press.
+ */
+function detailBody($: $, ui: Ui, d: ToolDetail, copy?: { toolUseId: string }) {
   const { Box, Text, Code, Markdown } = ui
   return (
     <Box flexDirection="column" gap={1}>
@@ -475,9 +527,12 @@ function detailBody(ui: Ui, d: ToolDetail) {
       </Text>
       {d.sections.map((sec, i) => (
         <Box key={`s${i}`} flexDirection="column">
-          <Text dimColor bold>
-            {sec.label}
-          </Text>
+          <Box flexDirection="row" gap={1}>
+            <Text dimColor bold>
+              {sec.label}
+            </Text>
+            {copy && copyButton($, ui, `sec:${copy.toolUseId}:${i}`, bodyOf(sec))}
+          </Box>
           {sec.kind === 'code' ? (
             <Code
               source={sec.source}
@@ -497,11 +552,11 @@ function detailBody(ui: Ui, d: ToolDetail) {
   )
 }
 
-/** What the dialog shows for the open call: its detail, or one dim line. */
-function toolBody(ui: Ui, v: ToolView | null) {
+/** What the dialog shows for the open call: its detail (with copy controls when `copyable`), or one dim line. */
+function toolBody($: $, ui: Ui, v: ToolView | null, copyable: boolean) {
   const { Text } = ui
   if (!v) return <Text dimColor>No tool call selected.</Text>
-  if (v.detail) return detailBody(ui, v.detail)
+  if (v.detail) return detailBody($, ui, v.detail, copyable ? { toolUseId: v.toolUseId } : undefined)
   if (v.denied) return <Text dimColor>tool call not readable (teammate in another pane, or finished)</Text>
   return <Text dimColor>loading…</Text>
 }
@@ -546,7 +601,7 @@ async function deliverHandover($: $, id: string, why: string, text: string) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   // Rechecked at delivery: a tool result may have carried it since it was queued, or the agent been replaced.
   if (r?.status !== 'handing-over' || r.handoverVia !== undefined) return false
-  const sent = await $.session.send({ to: { agentId: id }, text })
+  const sent = await sendOwn($, id, text)
   if (sent.isDelivered) {
     const now = await $.clock.now()
     await update($, agentsAtom, l => patch(l, id, { handoverVia: 'message', handoverAt: now }))
@@ -559,11 +614,87 @@ async function deliverHandover($: $, id: string, why: string, text: string) {
   return sent.isDelivered
 }
 
+/** A value for a debug line: a string as it is, anything else as JSON (or String when that fails), cut at 80. */
+function debugValue(v: unknown) {
+  let s: string
+  try {
+    s = typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v))
+  } catch {
+    s = String(v)
+  }
+  return s.slice(0, 80)
+}
+
+/** The mod's only way to send: marks the send as its own for tool.check while it is in flight. */
+async function sendOwn($: $, agentId: string, text: string) {
+  const mark = { agentId, text }
+  const unmark = () => {
+    const i = ownSends.indexOf(mark)
+    if (i >= 0) ownSends.splice(i, 1)
+  }
+  ownSends.push(mark) // synchronously, before any await
+  // A send that never answers allows nothing past DRAIN_TIMEOUT_MS.
+  let timer: { cancel: () => void } | undefined
+  try {
+    timer = $.clock.after(DRAIN_TIMEOUT_MS, unmark)
+  } catch {
+    // no timer: the mark lasts as long as the send
+  }
+  try {
+    return await $.session.send({ to: { agentId }, text })
+  } finally {
+    timer?.cancel()
+    unmark()
+  }
+}
+
 async function tellParent($: $, parentId: string | undefined, text: string) {
   if (parentId === undefined || parentId === 'main') {
     await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
   } else {
-    await $.session.send({ to: { agentId: parentId }, text })
+    await sendOwn($, parentId, text)
+  }
+}
+
+/** When the engine registered an agent under another name than it asked for, queues it a notice (once) and logs it. Never throws. */
+async function noticeRename($: $, id: string, requested: string | undefined, name: string | undefined) {
+  try {
+    if (!requested || !name || name === requested) return
+    // Claimed before any await: the spawn hook's lookup and a respawn may both get here for one agent.
+    if (noticed.has(id)) return
+    noticed.add(id)
+    const text = nameNotice(name, requested)
+    if ((await read($, outboxAtom)).some(d => d.agentId === id && d.text === text)) return
+    await enqueue($, { agentId: id, text, what: `${name}: name notice not delivered`, liveOnly: true })
+    await log($, `"${requested}" registered as ${name} (${id}); told it so`)
+  } catch (err) {
+    $.ui.log(`orchestrator: name notice not queued: ${String(err)}`)
+  }
+}
+
+/**
+ * The engine suffixes a taken name (`orchestrator` → `orchestrator-2`): SendMessage, check-ins and reports go
+ * by the one it registered, which only its list says (F19). Read after the spawn returns, it renames the row
+ * (and adds a teammate's address) and queues the renamed agent its notice. An unlisted agent, or a list that
+ * fails, keeps the requested name. Never throws.
+ */
+async function registeredName($: $, id: string, requested: string | undefined) {
+  try {
+    const info = (await $.agent.list()).find(a => a.id === id)
+    if (!info) return
+    const r = (await read($, agentsAtom)).find(a => a.id === id)
+    if (!r) return
+    const name = info.name ?? requested
+    const teammateId = r.teammateId ?? info.teammateId
+    if (name !== r.name || teammateId !== r.teammateId) {
+      await update($, agentsAtom, l =>
+        patch(l, id, { name, ...(typeof teammateId === 'string' && { teammateId }) }),
+      )
+      await persist($)
+    }
+    await noticeRename($, id, requested, name)
+  } catch {
+    // the requested name stands
   }
 }
 
@@ -616,6 +747,7 @@ async function respawn($: $, old: AgentRow) {
     )
   })
   await log($, `${label(old)} replaced by ${newId}, resuming from ${old.notePath}`)
+  await noticeRename($, newId, brief.name, info?.name)
   await tellParent(
     $,
     old.parentId,
@@ -637,7 +769,7 @@ const argsOf = (e: object): Record<string, unknown> => {
 /**
  * Serves the `checkin` tool: the calling loop (`agentId`, else main) arms, re-arms or (minutes <= 0)
  * cancels a check-in on one of its own children (a child of a loop it replaced counts), named by id
- * or name. Every answer is one line of result text starting `checkin:`; an unknown child or a bad
+ * or name (`resolveAgent`: registered name, else an unambiguous requested name). Every answer is one line of result text starting `checkin:`; an unknown child or a bad
  * length stores nothing.
  */
 async function checkin($: $, agentId: string | undefined, args: Record<string, unknown>) {
@@ -651,9 +783,13 @@ async function checkin($: $, agentId: string | undefined, args: Record<string, u
     await restore($)
     const rows = await read($, agentsAtom)
     const kids = rows.filter(r => r.id !== 'main' && latest(rows, r.parentId ?? 'main') === parent)
-    const named = kids.filter(r => r.name === target)
-    const r = kids.find(k => k.id === target) ?? named.filter(k => LIVE.includes(k.status)).at(-1) ?? named.at(-1)
-    if (!r) return { result: `checkin: no agent "${target}" among the agents you spawned; nothing changed.` }
+    const hit = resolveAgent(kids, target)
+    if (!hit) return { result: `checkin: no agent "${target}" among the agents you spawned; nothing changed.` }
+    if ('ambiguous' in hit) {
+      const list = hit.ambiguous.map(k => `${label(k)} (id ${k.id})`).join(', ')
+      return { result: `checkin: "${target}" could mean ${list}; name one by id or registered name; nothing changed.` }
+    }
+    const r = hit.row
     if (minutes <= 0) {
       await update($, agentsAtom, l => patch(l, r.id, DISARMED))
       await persist($)
@@ -745,7 +881,14 @@ async function drain($: $) {
   delivered.splice(0, Math.max(0, delivered.length - DELIVERED_MAX))
   // A respawn or a HANDOVER changes rows: those are awaited (in a turn.complete, not a handover path).
   const changes: Promise<unknown>[] = []
+  // Read once, for live-only messages: one whose agent is no longer live is dropped (unread rows: dropped too).
+  let rows: AgentRow[] = []
+  if (taken.some(d => d.liveOnly)) rows = await read($, agentsAtom).catch(() => [])
   for (const d of taken) {
+    if (d.liveOnly && (d.kind ?? 'send') === 'send') {
+      const r = rows.find(a => a.id === d.agentId)
+      if (!r || !LIVE.includes(r.status)) continue
+    }
     if (d.kind === 'respawn') {
       changes.push(
         (d.row ? respawn($, d.row) : Promise.resolve()).catch(err => log($, `${d.what}: ${String(err)}`, 'warn')),
@@ -761,8 +904,7 @@ async function drain($: $) {
       continue
     }
     try {
-      void $.session
-        .send({ to: { agentId: d.agentId }, text: d.text })
+      void sendOwn($, d.agentId, d.text)
         .then(
           sent => (sent.isDelivered ? undefined : log($, `${d.what} (${sent.reason})`, 'warn')),
           err => log($, `${d.what}: ${String(err)}`, 'warn'),
@@ -1016,8 +1158,8 @@ export const register: Register = (on, options) => {
   stamps.clear()
   toolReads.busy.clear()
   toolReads.again.clear()
-  lastPress = undefined
-  pressQueue = Promise.resolve()
+  ownSends.length = 0
+  checkMissLogged = false
   draining = false
   nudgedSinceDrain = false
 
@@ -1062,17 +1204,21 @@ export const register: Register = (on, options) => {
     const id = res.agentId
     lastSpawned = id
     const type = e.subagentType ?? (e as typeof e & { subagent_type?: string }).subagent_type ?? 'agent'
+    const name = e.name
+    // A teammate's address (`<name>@<team>`), which its SendMessage checks may name it by.
+    const teammateId = res.teammateId
     const now = await $.clock.now()
     await update($, agentsAtom, l => [
       ...l.filter(a => a.id !== id),
       {
         ...newRow(id, now),
-        name: e.name,
+        name,
         description: e.description,
         type,
         parentId: e.parentAgentId ?? 'main',
         background: e.background,
         ...(e.isTeammate && { isTeammate: true }),
+        ...(typeof teammateId === 'string' && { teammateId }),
         brief: {
           prompt: e.prompt,
           subagentType: type,
@@ -1082,8 +1228,10 @@ export const register: Register = (on, options) => {
         },
       },
     ])
-    await log($, `spawned ${e.name ?? e.description} (${id})`)
+    await log($, `spawned ${name ?? e.description} (${id})`)
     await persist($)
+    // Off the spawn's path: the Agent result and the pane never wait on the engine's list.
+    void registeredName($, id, e.name)
     if (!paneOffered) {
       paneOffered = true
       void $.ui.open({ id: PANE, title: 'Orchestrator' })
@@ -1205,6 +1353,37 @@ export const register: Register = (on, options) => {
     return out
   })
 
+  // The mod's own sends (Hand over, a forwarded report, a check-in) are SendMessage calls to the engine;
+  // under auto mode the classifier refuses them, since no user request asked. Allow exactly those, while in flight.
+  on('tool.check', { tool: 'SendMessage' }, async ($, e, next) => {
+    try {
+      const input = (e.input ?? {}) as { to?: unknown; message?: unknown }
+      if (ownSends.length > 0) {
+        const rows = await read($, agentsAtom)
+        const mine = isOwnSend({
+          origin: next.origin,
+          agentId: e.agentId,
+          to: input.to,
+          message: input.message,
+          inFlight: ownSends,
+          rows,
+        })
+        if (mine) return { decision: 'allow', reason: 'orchestrator mod: its own message' }
+      }
+      if (ownSends.length > 0 && !checkMissLogged) {
+        checkMissLogged = true
+        // No message text: the debug log may be shared, and a message can carry anything.
+        const length = typeof input.message === 'string' ? `${input.message.length} chars` : typeof input.message
+        $.ui.log(`orchestrator: SendMessage check not matched: to=${debugValue(input.to)} message=${length}`, {
+          to: 'debug',
+        })
+      }
+    } catch {
+      // fall through to the engine's verdict
+    }
+    return next(e)
+  })
+
   // Raised for main's turns alone: a subagent's run raises no turn.start.
   on('turn.start', ($, e, next) => {
     mainBusy = true
@@ -1282,8 +1461,13 @@ export const register: Register = (on, options) => {
       if (verb === 'handover') {
         const rows = await read($, agentsAtom)
         const live = rows.filter(canHandOver)
-        const r = live.find(a => a.id === target) ?? live.filter(a => a.name === target).at(-1)
-        if (!r) return { text: `No live agent named or with id "${target}".` }
+        const hit = resolveAgent(live, target)
+        if (!hit) return { text: `No live agent named or with id "${target}".` }
+        if ('ambiguous' in hit) {
+          const list = hit.ambiguous.map(a => `${label(a)} (id ${a.id})`).join(', ')
+          return { text: `"${target}" could mean ${list}; name one by id.` }
+        }
+        const r = hit.row
         const ok = await startHandover($, r.id, 'by /orch')
         return { text: ok ? `HANDOVER sent to ${label(r)} (${r.id}).` : `Could not hand ${label(r)} over.` }
       }
@@ -1349,7 +1533,7 @@ export const register: Register = (on, options) => {
     const v = await read($, toolViewAtom)
     return (
       <Box flexDirection="column" gap={1}>
-        {toolBody(ui, v)}
+        {toolBody($, ui, v, e.surface !== 'terminal')}
         <Button key="close" role="dismiss" label="Close" onPress={() => closeTool($)} />
       </Box>
     )
@@ -1382,6 +1566,37 @@ export const register: Register = (on, options) => {
     }
     // The transcript the host has open beside the pane (read-only; absent on older hosts and kit mounts). Main is never marked.
     const viewed = liveSelection(visible, e.props.view?.agentId ?? '')
+    // A row folds when it is collapsed or collapsing it would hide something; read from every row, as `hidden` is.
+    const foldable = (id: string) => canFold(rows, id, collapsed)
+    /** The header's `c` hotkey: folds the selected row, else main; drawn only when that row can fold. */
+    const foldHotkey = (Button: ReturnType<typeof $.ui.resolve>['Button'], selected: string) => {
+      const target = liveSelection(visible, selected) || 'main'
+      const tRow = rows.find(r => r.id === target)
+      if (!tRow || !foldable(target)) return undefined
+      return (
+        <Button
+          key="fold-hotkey"
+          plain
+          hotkey="c"
+          label={`${collapsed.includes(target) ? 'expand' : 'collapse'} ${label(tRow)}`}
+          onPress={() => toggleCollapsed($, target)}
+        />
+      )
+    }
+    /**
+     * A row's fold cell: its disclosure glyph when it can fold, else a space of the glyph's width.
+     * The space sits in a keyed Box: a drawn Text keeps no key.
+     */
+    const foldCell = (ui: ReturnType<typeof $.ui.resolve>, id: string) =>
+      foldable(id) ? (
+        <ui.Button key={`fold:${id}`} plain onPress={() => toggleCollapsed($, id)}>
+          {foldGlyph(collapsed.includes(id))}
+        </ui.Button>
+      ) : (
+        <ui.Box key={`nofold:${id}`}>
+          <ui.Text> </ui.Text>
+        </ui.Box>
+      )
 
     if (e.surface !== 'terminal') {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
@@ -1427,7 +1642,7 @@ export const register: Register = (on, options) => {
             <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
               {button}
               <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
-                {toolBody(ui, tv)}
+                {toolBody($, ui, tv, true)}
               </Box>
             </Box>
           )
@@ -1452,6 +1667,7 @@ export const register: Register = (on, options) => {
             </Button>
             {pinned === pin && (
               <Box key={`full:${pin}`} borderStyle="round" flexDirection="column">
+                {copyButton($, ui, pin, it.full)}
                 <Text wrap="wrap">{it.full}</Text>
               </Box>
             )}
@@ -1470,6 +1686,7 @@ export const register: Register = (on, options) => {
                 onPress={() => startMainHandover($)}
               />
             )}
+            {foldHotkey(Button, selected)}
           </Box>
           {rows.length === 0 ? (
             <Text dimColor>No model requests yet.</Text>
@@ -1485,7 +1702,8 @@ export const register: Register = (on, options) => {
               const folded = doneMark(row.id)
               return [
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
-                  <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
+                  {foldCell(ui, row.id)}
+                  <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
                     <Text bold={hl === row.id}>{label(row)} </Text>
                     {row.resumedAt !== undefined && <Text dimColor>↻ </Text>}
@@ -1498,6 +1716,7 @@ export const register: Register = (on, options) => {
                     <Text dimColor>{shows}</Text>
                     {viewed === row.id && <Text dimColor> · in view</Text>}
                   </Button>
+                  {copyButton($, ui, `agent:${row.id}`, label(row) === row.id ? row.id : `${label(row)} (${row.id})`)}
                   {canHandOver(row) && (
                     <Button
                       key={`handover:${row.id}`}
@@ -1538,6 +1757,7 @@ export const register: Register = (on, options) => {
                   </Button>
                   {pinned === id && (
                     <Box key={`full:${id}`} borderStyle="round" flexDirection="column">
+                      {copyButton($, ui, id, l.text)}
                       <Text color={color} wrap="wrap">
                         {l.text}
                       </Text>
@@ -1555,6 +1775,8 @@ export const register: Register = (on, options) => {
     const NAME = Math.min(24, Math.max(12, Math.floor(cols * 0.25)))
     // The model cell: 16 columns padded, plus a space.
     const MODEL = 17
+    // The fold cell: the disclosure glyph (or a space) and a space.
+    const FOLD = 2
     const width = Math.max(8, cols - NAME - 7 - 14 - MODEL)
     const t0 = rows.reduce((m, r) => Math.min(m, r.startedAt), now)
     const ordered = orderRows(visible)
@@ -1594,7 +1816,7 @@ export const register: Register = (on, options) => {
           <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
             {button}
             <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
-              {toolBody(ui, tv)}
+              {toolBody($, ui, tv, false)}
             </Box>
           </Box>
         )
@@ -1652,6 +1874,7 @@ export const register: Register = (on, options) => {
               onPress={() => startMainHandover($)}
             />
           )}
+          {foldHotkey(Button, selected)}
         </Box>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
         {ordered.flatMap(({ row, depth }) => {
@@ -1659,15 +1882,16 @@ export const register: Register = (on, options) => {
           const live = LIVE.includes(row.status)
           const shows = displayStatus(row, rows)
           const style = statusStyle(shows)
-          // The glyph takes the status colour; the name keeps its own marks. Together they fill NAME columns.
-          const lead = `${'  '.repeat(depth)}${glyph[shows]} `.slice(0, NAME)
+          // Indent, fold cell, status glyph and name together fill NAME columns. Deep rows stop indenting
+          // rather than eat the name's minimum 4 columns.
+          const indentW = Math.min(depth * 2, Math.max(0, NAME - FOLD - 2 - 4))
           const glyphCell = (
             <Text color={style.color} dimColor={style.dimColor} bold={style.bold} wrap="truncate">
-              {lead}
+              {`${glyph[shows]} `}
             </Text>
           )
           // A resumed agent's dim ↻ and a collapsed row's `+N done` sit inside the name cell, which keeps its width.
-          const room = NAME - lead.length
+          const room = NAME - indentW - FOLD - 2
           const folded = doneMark(row.id)
           // The name keeps at least 4 columns (or its whole self); the marks shrink first: `+3 done` to `+3`, then the ↻ goes.
           const spare = room - Math.min(label(row).length, 4)
@@ -1688,8 +1912,11 @@ export const register: Register = (on, options) => {
           const model = modelLabel(row.model ?? row.brief?.model, row.effort)
           return [
             <Box key={row.id}>
-              {/* Main too is pressable, so a double-click can collapse it; a single press only bolds it. */}
-              <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
+              <Text>{' '.repeat(indentW)}</Text>
+              {foldCell(ui, row.id)}
+              <Text> </Text>
+              {/* Main too is pressable: a press selects it, so `c` acts on it; it opens no transcript. */}
+              <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                 {glyphCell}
                 {nameCell}
               </Button>

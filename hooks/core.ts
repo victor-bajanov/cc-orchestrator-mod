@@ -174,6 +174,10 @@ export const handoverMessage = (notePath: string, isRespawned: boolean): string 
 export const replacementPrompt = (brief: Brief, notePath: string): string =>
   `${brief.prompt}\n\n---\nYou replace an agent that reached its context limit. Start from the handover note at ${notePath}: read it first and continue from its next concrete step; do not redo finished work.`
 
+/** Tells an agent the engine registered it under a suffixed name, so its children report to the right one. */
+export const nameNotice = (name: string, requested: string): string =>
+  `[orchestrator mod] You are registered as \`${name}\` (you asked for \`${requested}\`); tell your children to SendMessage \`${name}\`.`
+
 export const mainHandoverPrompt = (notePath: string): string =>
   [
     `HANDOVER (orchestrator mod): this conversation is near its context ceiling and will be cleared and restarted from a note.`,

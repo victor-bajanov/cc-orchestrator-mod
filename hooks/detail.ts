@@ -194,7 +194,7 @@ const drafts = (use: ToolUseSummary): Draft[] => {
   }
 }
 
-const bodyOf = (s: DetailSection): string => (s.kind === 'code' ? s.source : s.text)
+export const bodyOf = (s: DetailSection): string => (s.kind === 'code' ? s.source : s.text)
 const withBody = (s: DetailSection, b: string): DetailSection => (s.kind === 'code' ? { ...s, source: b } : { ...s, text: b })
 
 /**

@@ -7,6 +7,7 @@ import {
   MAIN_COLOR,
   PALETTE,
   ceilingOf,
+  canFold,
   cleanBlock,
   chartWidthPx,
   contextChart,
@@ -15,12 +16,12 @@ import {
   collapseHidden,
   cut,
   displayStatus,
+  foldGlyph,
   forwardTarget,
   effortAbbrev,
   hashText,
   hhmm,
   hiddenCount,
-  isDoublePress,
   latest,
   logId,
   mainButtonShown,
@@ -28,6 +29,7 @@ import {
   modelName,
   namesAgent,
   paneHeader,
+  resolveAgent,
   runnerFor,
   sameReport,
   seriesColors,
@@ -810,6 +812,54 @@ describe('namesAgent', () => {
     expect(namesAgent('agent2 [3fa9c1]', r)).toBe(true)
     expect(namesAgent('impl-3 [3fa9c1]', r)).toBe(false)
   })
+
+  test("a teammate is named by its address too: its teammateId, or its name at the address's team", () => {
+    const t = { ...row({ id: 'agent2', name: 'impl-2' }), teammateId: 'impl-2@s' }
+    expect(namesAgent('impl-2@s', t)).toBe(true)
+    expect(namesAgent('impl-2@s [3fa9c1]', t)).toBe(true)
+    expect(namesAgent('impl-2', t)).toBe(true)
+    expect(namesAgent('impl-2@other', t)).toBe(false)
+    expect(namesAgent('impl-3@s', t)).toBe(false)
+    // a replacement registered under a new name keeps its team: its name at that team names it
+    const renamed = { ...row({ id: 'agent3', name: 'impl-2-2' }), teammateId: 'impl-2@s' }
+    expect(namesAgent('impl-2-2@s', renamed)).toBe(true)
+    // no teammateId: an address names nothing
+    expect(namesAgent('impl-2@s', row({ id: 'agent2', name: 'impl-2' }))).toBe(false)
+  })
+})
+
+describe('resolveAgent', () => {
+  test('an id, then a registered name, then the name it asked for', () => {
+    const a1 = row({ id: 'a1', name: 'orchestrator-2', brief: { prompt: 'P', subagentType: 'x', description: 'd', name: 'orchestrator' } })
+    for (const t of ['a1', 'orchestrator-2', 'orchestrator']) expect(resolveAgent([a1], t)).toEqual({ row: a1 })
+    expect(resolveAgent([a1], 'nope')).toBeUndefined()
+    expect(resolveAgent([a1], '')).toBeUndefined()
+  })
+
+  test("a registered name beats another agent's requested name", () => {
+    const a1 = row({ id: 'a1', name: 'orchestrator' })
+    const a2 = row({ id: 'a2', name: 'orchestrator-2', brief: { prompt: 'P', subagentType: 'x', description: 'd', name: 'orchestrator' } })
+    expect(resolveAgent([a1, a2], 'orchestrator')).toEqual({ row: a1 })
+    expect(resolveAgent([a2, a1], 'orchestrator')).toEqual({ row: a1 })
+  })
+
+  test('a requested name held by two is ambiguous, unless exactly one is live', () => {
+    const asked = (id: string, name: string, askedFor: string, over: Partial<AgentRow> = {}) =>
+      row({ id, name, brief: { prompt: 'P', subagentType: 'x', description: 'd', name: askedFor }, ...over })
+    const i2 = asked('a1', 'impl-2', 'impl')
+    const i3 = asked('a2', 'impl-3', 'impl')
+    expect(resolveAgent([i2, i3], 'impl')).toEqual({ ambiguous: [i2, i3] })
+    const done = { ...i2, status: 'done' as const }
+    expect(resolveAgent([done, i3], 'impl')).toEqual({ row: i3 })
+    const original = asked('a1', 'probe-x', 'probe', { status: 'replaced', replacedBy: 'a2' })
+    const replacement = asked('a2', 'probe-2', 'probe')
+    expect(resolveAgent([original, replacement], 'probe')).toEqual({ row: replacement })
+  })
+
+  test('a trailing [ref] is ignored', () => {
+    const a1 = row({ id: 'a1', name: 'orchestrator-2' })
+    expect(resolveAgent([a1], 'orchestrator-2 [a1]')).toEqual({ row: a1 })
+  })
 })
 
 describe('sameReport', () => {
@@ -954,12 +1004,24 @@ describe('collapse', () => {
     expect(hiddenCount(tree(), 'r1', hidden)).toBe(0)
   })
 
-  test('isDoublePress: the same key within 400 ms', () => {
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1399)).toBe(true)
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1000)).toBe(true)
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1401)).toBe(false)
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'b', 1100)).toBe(false)
-    expect(isDoublePress(undefined, 'a', 1100)).toBe(false)
+  test('canFold: a row with finished descendants, or collapsed; not a childless or all-live row', () => {
+    expect(canFold(tree(), 'o', [])).toBe(true)
+    const live = tree({ d1: { status: 'running' }, d2: { status: 'running' } })
+    expect(canFold(live, 'o', [])).toBe(false)
+    expect(canFold(live, 'o', ['o'])).toBe(true)
+    expect(canFold(tree(), 'd1', [])).toBe(false)
+    expect(canFold(tree(), 'main', [])).toBe(true)
+    const grand = [
+      ...tree({ d2: { status: 'running' } }),
+      row({ id: 'g1', parentId: 'd1', status: 'running' }),
+      row({ id: 'g2', parentId: 'd1', status: 'done' }),
+    ]
+    expect(canFold(grand, 'o', [])).toBe(true)
+  })
+
+  test('foldGlyph: ▸ collapsed, ▾ expanded', () => {
+    expect(foldGlyph(true)).toBe('▸')
+    expect(foldGlyph(false)).toBe('▾')
   })
 
   test('contextChart takes a given t0 for its left axis, else the rows', () => {

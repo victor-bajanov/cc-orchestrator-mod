@@ -45,6 +45,8 @@ export type AgentRow = {
   isOurs?: boolean
   /** A named teammate: the engine delivers its final reply to its parent, so the mod does not. */
   isTeammate?: boolean
+  /** A teammate's address in its team, `<name>@<team>`, as the spawn result or the engine's list gave it. */
+  teammateId?: string
   /** How many handovers this row has started; numbers its note paths. */
   handovers?: number
   /** A replacement that started too full for another handover to help: left to run. */
@@ -118,6 +120,8 @@ export type Delivery = {
   t: number
   /** For a respawn: the replaced row as it ended, check-in included, for the replacement to inherit. */
   row?: AgentRow
+  /** A message only worth sending while its agent is live: dropped unsent once it is not, so it wakes no finished agent. */
+  liveOnly?: true
 }
 
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
@@ -137,7 +141,7 @@ declare module 'claude-code' {
       transcripts: Record<string, Transcript>
       /** Messages queued by timers, delivered by the next hook to run. */
       outbox: Delivery[]
-      /** Rows collapsed by a double-click: their finished descendants are hidden from the pane (display only). */
+      /** Rows collapsed by the fold glyph or `c`: their finished descendants are hidden from the pane (display only). */
       collapsed: string[]
       /** The tool call open in the detail dialog, or null. */
       toolView: ToolView | null

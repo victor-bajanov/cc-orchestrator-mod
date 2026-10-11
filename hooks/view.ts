@@ -505,10 +505,41 @@ export const contextChart = (i: ChartInput): { source: string; alt: string; widt
  * Whether a `SendMessage` `to` names this row: its id or name, or `main` for the main thread. A
  * trailing ` [ref]` (as ListAgents prints a row) is ignored.
  */
-export const namesAgent = (to: unknown, row: Pick<AgentRow, 'id' | 'name'>): boolean => {
+export const namesAgent = (to: unknown, row: Pick<AgentRow, 'id' | 'name' | 'teammateId'>): boolean => {
   if (typeof to !== 'string') return false
   const name = to.replace(/\s*\[[^\]]*\]$/, '').trim()
-  return name !== '' && (row.id === 'main' ? name === 'main' : name === row.id || name === row.name)
+  if (name === '') return false
+  if (row.id === 'main') return name === 'main'
+  if (name === row.id || name === row.name) return true
+  // A teammate by its address: its teammateId, or its registered name at that address's team.
+  const tid = row.teammateId
+  if (typeof tid !== 'string' || !tid.includes('@')) return false
+  return name === tid || (row.name !== undefined && name === `${row.name}@${tid.slice(tid.lastIndexOf('@') + 1)}`)
+}
+
+/**
+ * The agent `target` means among `rows`: its id; else its registered name (the name SendMessage uses),
+ * a live holder first, else the newest; else the name it asked for at spawn (`brief.name`), when that
+ * picks one agent (or one live agent). A trailing ` [ref]` is ignored. `ambiguous` lists the candidates.
+ */
+export const resolveAgent = (
+  rows: readonly AgentRow[],
+  target: string,
+): { row: AgentRow } | { ambiguous: AgentRow[] } | undefined => {
+  const t = target.replace(/\s*\[[^\]]*\]$/, '').trim()
+  if (t === '') return undefined
+  const byId = rows.find(r => r.id === t)
+  if (byId) return { row: byId }
+  const isLive = (r: AgentRow) => LIVE.includes(r.status)
+  const named = rows.filter(r => r.name === t)
+  const holder = named.filter(isLive).at(-1) ?? named.at(-1)
+  if (holder) return { row: holder }
+  const asked = rows.filter(r => r.brief?.name === t)
+  if (asked.length === 0) return undefined
+  if (asked.length === 1) return { row: asked[0]! }
+  const live = asked.filter(isLive)
+  if (live.length === 1) return { row: live[0]! }
+  return { ambiguous: live.length ? live : asked }
 }
 
 /** The newest agent in an id's `replacedBy` chain: whoever now carries its work (the id itself when never replaced). */
@@ -608,6 +639,9 @@ export const collapseHidden = (rows: readonly AgentRow[], collapsed: readonly st
 export const hiddenCount = (rows: readonly AgentRow[], id: string, hidden: ReadonlySet<string>): number =>
   descendants(rows, id).filter(d => hidden.has(d.id)).length
 
-/** Whether a press is the second of a double: the same key as the last press, within `ms`. */
-export const isDoublePress = (last: { key: string; t: number } | undefined, key: string, now: number, ms = 400): boolean =>
-  last !== undefined && last.key === key && now - last.t >= 0 && now - last.t <= ms
+/** Whether a row offers to fold: it is collapsed (so it can expand), or collapsing it would hide something. */
+export const canFold = (rows: readonly AgentRow[], id: string, collapsed: readonly string[]): boolean =>
+  collapsed.includes(id) || collapseHidden(rows, [id]).size > 0
+
+/** The disclosure glyph: `▸` when collapsed, `▾` when not. */
+export const foldGlyph = (isCollapsed: boolean): string => (isCollapsed ? '▸' : '▾')
