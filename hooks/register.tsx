@@ -133,6 +133,8 @@ const delivered: string[] = []
 const DELIVERED_MAX = 200
 /** Numbers queued messages within this module's life. */
 let deliverySeq = 0
+/** How long a drain waits for its respawns and HANDOVERs before letting the turn end go on. */
+const DRAIN_TIMEOUT_MS = 10_000
 /** A drain is under way: another hook does not start a second. */
 let draining = false
 /** Main was prompted to run a hooked turn for the outbox, and nothing has drained since: no second prompt. */
@@ -531,7 +533,8 @@ async function sendHandover($: $, id: string, why: string, queue = false) {
   if (!r?.notePath) return false
   const text = handoverMessage(r.notePath, cfg.autoRespawn)
   if (queue) {
-    await update($, agentsAtom, l => patch(l, id, { handoverAt: undefined }))
+    // Unset, so a tool result that carries it before delivery marks it, and the queued send is skipped.
+    await update($, agentsAtom, l => patch(l, id, { handoverAt: undefined, handoverVia: undefined }))
     await enqueue($, { kind: 'handover', agentId: id, text, what: `${label(r)} ${why}: HANDOVER not delivered` })
     return true
   }
@@ -541,7 +544,8 @@ async function sendHandover($: $, id: string, why: string, queue = false) {
 /** Sends a HANDOVER now and starts its stall clock; one that cannot be delivered marks the agent stalled. */
 async function deliverHandover($: $, id: string, why: string, text: string) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
-  if (!r) return false
+  // Rechecked at delivery: a tool result may have carried it since it was queued, or the agent been replaced.
+  if (r?.status !== 'handing-over' || r.handoverVia !== undefined) return false
   const sent = await $.session.send({ to: { agentId: id }, text })
   if (sent.isDelivered) {
     const now = await $.clock.now()
@@ -769,7 +773,18 @@ async function drain($: $) {
     }
   }
   if (changes.length > 0) {
-    await Promise.all(changes).catch(() => undefined)
+    // Bounded: a spawn or send that never answers holds this turn's end no longer than DRAIN_TIMEOUT_MS.
+    let timer: { cancel: () => void } | undefined
+    const late = new Promise<'late'>(resolve => {
+      timer = $.clock.after(DRAIN_TIMEOUT_MS, () => resolve('late'))
+    })
+    const settled = await Promise.race([Promise.all(changes).then(() => 'done' as const), late]).catch(() => 'done' as const)
+    timer?.cancel()
+    if (settled === 'late') {
+      await log($, `outbox: a respawn or HANDOVER still running after ${DRAIN_TIMEOUT_MS / 1000} s; not waiting`, 'warn').catch(
+        () => undefined,
+      )
+    }
     await persist($).catch(() => undefined)
   } else {
     // The emptied queue reaches state.json too, off the hook's path.

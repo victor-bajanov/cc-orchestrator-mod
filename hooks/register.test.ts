@@ -46,6 +46,8 @@ const world = (on: On) => {
     sendFails: '' as '' | 'throw' | 'undelivered',
     /** The next `session.send` is recorded, then never answers. */
     hangNext: false,
+    /** The next `agent.spawn` is recorded, then never answers. */
+    hangSpawn: false,
     /** Set while a test moves the clock: a send seen then came from a timer callback. */
     inTimer: false,
     /** Sends made while `inTimer`. */
@@ -91,6 +93,10 @@ const world = (on: On) => {
   on('agent.spawn', ($, e) => {
     const raw = e as typeof e & { subagent_type?: string }
     w.spawns.push({ ...e, subagentType: e.subagentType ?? raw.subagent_type ?? '' })
+    if (w.hangSpawn) {
+      w.hangSpawn = false
+      return new Promise(() => {}) as never
+    }
     return { model: 'opus', agentId: `agent${w.spawns.length}` }
   })
   on('fs.write', ($, e) => {
@@ -2897,6 +2903,31 @@ describe('delivery from timers: hardening', () => {
     await w.clock.settle()
     expect((JSON.parse(w.files.get(STATE)!) as { outbox?: unknown[] }).outbox ?? []).toHaveLength(0)
   })
+
+  for (const [what, change, sends] of [
+    ['is sent while the row still waits for it', {}, 1],
+    ['is not sent once a tool result carried it', { handoverVia: 'tool' }, 0],
+    ['is not sent once the agent was replaced', { status: 'replaced' }, 0],
+  ] as const) {
+    test(`a queued HANDOVER ${what}`, async ($, on) => {
+      const w = world(on)
+      const wipe = wipeable(on)
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1' })
+      w.tokens.set('agent1', 460_000)
+      await step($, 'agent1')
+      const saved = JSON.parse(w.files.get(STATE)!) as { agents: AgentRow[]; outbox?: unknown[] }
+      expect(saved.agents.find(a => a.id === 'agent1')).toEqual(expect.objectContaining({ status: 'handing-over' }))
+      saved.agents = saved.agents.map(a => (a.id === 'agent1' ? { ...a, ...change } : a))
+      saved.outbox = [{ kind: 'handover', agentId: 'agent1', text: 'HANDOVER queued', what: 'impl-1: HANDOVER not delivered', t: 1, id: 'q-1' }]
+      w.files.set(STATE, JSON.stringify(saved))
+      wipe()
+      await step($) // restores from state.json
+      await complete($, undefined)
+      await w.clock.settle()
+      expect(w.sent.filter(m => m.text === 'HANDOVER queued')).toHaveLength(sends)
+    })
+  }
 })
 
 describe('delivery waits for the engine', () => {
@@ -2959,6 +2990,45 @@ describe('deliveries from a turn end go through the outbox', () => {
     expect(queued(w).some(d => d.kind === 'respawn' && d.agentId === 'agent1')).toBe(true)
     expect(w.spawns).toHaveLength(2)
     expect(row(w, 'agent2')!.replaces).toBe('agent1')
+  })
+
+  test('a respawn from the drain carries the check-in over and tells the parent', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    await w.clock.settle()
+    expect(queued(w).some(d => d.kind === 'respawn' && d.agentId === 'agent2')).toBe(true)
+    expect(row(w, 'agent3')).toEqual(expect.objectContaining({ replaces: 'agent2', checkinBy: 'agent1', checkinMins: 30 }))
+    expect(row(w, 'agent3')!.checkinAt).toBeDefined()
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('agent3') && m.text.includes('handed over'))).toBe(true)
+  })
+
+  test('a respawn that never answers does not hold the turn end past the timeout', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    w.hangSpawn = true
+    let done = false
+    const end = complete($, 'agent1', 'HANDED OVER').then(() => {
+      done = true
+    })
+    await w.clock.advance(9_000)
+    expect(done).toBe(false)
+    await w.clock.advance(2_000)
+    await end
+    expect(done).toBe(true)
+    expect(w.spawns).toHaveLength(2)
+    expect(w.toasts.some(t => t.includes('outbox') && t.includes('still running'))).toBe(true)
   })
 
   test('a HANDOVER sent after the run ended is queued, and its stall clock starts at delivery', async ($, on) => {
