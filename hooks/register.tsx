@@ -36,6 +36,8 @@ const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent whose chart line the desktop pane highlights ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
+/** Mirrors `mainHandoverQueued` for drawing: the buttons say a handover waits on this turn. */
+const queuedAtom = atom({ plugin: 'orchestrator', key: 'mainQueued' } as const, false)
 
 const patch = (rows: AgentRow[], id: string, change: Partial<AgentRow>) =>
   rows.map(r => (r.id === id ? { ...r, ...change } : r))
@@ -299,6 +301,7 @@ async function startMainHandover($: $) {
     // A prompt submitted now would queue behind the running turn, whose end would then look for the note too early.
     if (mainHandoverQueued) return
     mainHandoverQueued = true
+    await update($, queuedAtom, () => true)
     await log($, 'main thread hands over when this turn ends')
     return
   }
@@ -380,6 +383,8 @@ export const register: Register = (on, options) => {
     })
     await runDir($)
     await excludeFromGit($).catch(() => undefined)
+    // A (re)load starts with no handover queued: the state must not say otherwise.
+    await update($, queuedAtom, () => false)
     $.clock.every(SYNC_MS, () => void sync($))
     return next(e)
   })
@@ -490,6 +495,7 @@ export const register: Register = (on, options) => {
       else {
         const queued = mainHandoverQueued
         mainHandoverQueued = false
+        if (queued) await update($, queuedAtom, () => false)
         const phase = await read($, phaseAtom)
         if (queued && phase !== 'writing' && phase !== 'clearing') {
           // Asked for mid-turn: started now, before the `writing` check, so this turn's end never looks for a note.
@@ -539,13 +545,19 @@ export const register: Register = (on, options) => {
     const phase = await read($, phaseAtom)
     if (phase !== 'offered' || cfg.mainMode !== 'ask') return next(e)
     const main = (await read($, agentsAtom)).find(a => a.id === 'main')
+    const queued = await read($, queuedAtom)
     const { Box, Button, Text } = $.ui.resolve(e)
     return (
       <Box>
         <Text color="warning">
           Main context {fmtTokens(main?.tokens ?? 0)} ≥ {fmtTokens(cfg.mainThreshold)}.{' '}
         </Text>
-        <Button key="handover" variant="primary" label="Hand over & restart" onPress={() => startMainHandover($)} />
+        <Button
+          key="handover"
+          variant="primary"
+          label={queued ? 'Handover queued' : 'Hand over & restart'}
+          onPress={() => startMainHandover($)}
+        />
         <Text> </Text>
         <Button key="dismiss" label="Not now" onPress={() => setPhase($, 'cooldown')} />
       </Box>
@@ -571,6 +583,8 @@ export const register: Register = (on, options) => {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
       const { Box, Button, Text, Svg } = $.ui.resolve(e)
       const selected = liveSelection(rows, await read($, selectedAtom))
+      // A press while queued does nothing: startMainHandover returns on the queued flag.
+      const queued = await read($, queuedAtom)
       const colors = seriesColors(rows)
       const chart = contextChart({
         rows,
@@ -592,7 +606,7 @@ export const register: Register = (on, options) => {
               <Button
                 key="handover:main"
                 variant="secondary"
-                label="Hand over main"
+                label={queued ? 'Handover queued' : 'Hand over main'}
                 onPress={() => startMainHandover($)}
               />
             )}

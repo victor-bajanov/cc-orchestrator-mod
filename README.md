@@ -23,7 +23,7 @@ If the agent ends again without writing its note, it is marked `done` and not re
 2. The mod runs `/clear`.
 3. The mod submits a fresh prompt containing the note, the live agents (name, id, type, status, context) and the roster path.
 
-Running agents survive `/clear`. This prompt is how the new context learns about them. With `mainHandover: ask` (the default) the mod offers a **Hand over & restart** button above the prompt. With `auto` it acts on its own. With `off` it never acts. After a restart, the mod doesn't offer again until the main context has read below the threshold once.
+Running agents survive `/clear`. This prompt is how the new context learns about them. With `mainHandover: ask` (the default) the mod offers a **Hand over & restart** button above the prompt. With `auto` it acts on its own. With `off` it never acts. If you ask for a handover mid-turn (with that button, the desktop pane's `Hand over main` or `/orch handover`), it waits and starts when the turn ends, even a stopped one; meanwhile the buttons read "Handover queued". After a restart, the mod doesn't offer again until the main context has read below the threshold once.
 
 **Visual.** The **Orchestrator** pane opens on the first spawn, or with `/orch`. In the desktop app it also opens on the first spawn, but `/orch` may not be listed in the desktop prompt.
 
@@ -58,7 +58,7 @@ On both the terminal and the desktop app, the status line shows live agents, the
 | `/orch handover` | hand the main thread over now |
 | `/orch handover <name or id>` | hand that agent over now |
 
-In the desktop app, the pane's `Hand over` and `Hand over main` buttons do what `/orch handover` does, so you don't need `/orch handover` there.
+In the desktop app, the pane's `Hand over` and `Hand over main` buttons do what `/orch handover` does, so you don't need `/orch handover` there. A main handover asked for mid-turn starts when the turn ends.
 
 ## Settings
 
