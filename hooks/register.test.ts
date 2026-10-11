@@ -38,6 +38,12 @@ const world = (on: On) => {
     answer: '',
     /** Whether the surfaces place the tool-detail dialog (false: an older desktop). */
     placesTool: true,
+    /** Each tool the plugin registered. */
+    tools: [] as { name: string; isDeferred?: unknown; inputSchema?: unknown }[],
+    /** Answers a tool call beneath the plugin; undefined gives `{ result: 'ok' }`. */
+    toolAnswer: undefined as ((e: Record<string, unknown>) => unknown) | undefined,
+    /** How `session.send` fails: not at all, by throwing, or undelivered. */
+    sendFails: '' as '' | 'throw' | 'undelivered',
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -48,8 +54,14 @@ const world = (on: On) => {
   on('agent.list', () => ({ value: w.agents as never }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.send', ($, e) => {
+    if (w.sendFails === 'throw') throw new Error('send broke')
+    if (w.sendFails === 'undelivered') return { isDelivered: false, reason: 'gone' } as never
     w.sent.push({ to: e.to, text: e.text })
     return { isDelivered: true }
+  })
+  on('tool.register', ($, e) => {
+    w.tools.push(e as never)
+    return { value: { tool: `mcp__orchestrator__${e.name}` } }
   })
   on('prompt.submit', ($, e) => {
     w.prompts.push(e.text)
@@ -118,7 +130,7 @@ const world = (on: On) => {
     }
     return { text: e.answer }
   })
-  on('tool.call', () => ({ result: 'ok' }) as never)
+  on('tool.call', ($, e) => (w.toolAnswer?.(e as never) ?? { result: 'ok' }) as never)
   return Object.assign(w, { session })
 }
 
@@ -126,7 +138,10 @@ import type { Engine } from 'claude-code/testing'
 
 const start = ($: Engine) => $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
 
-const spawn = ($: Engine, o: { prompt: string; name?: string; parentAgentId?: string; model?: string }) =>
+const spawn = (
+  $: Engine,
+  o: { prompt: string; name?: string; parentAgentId?: string; model?: string; background?: boolean; isTeammate?: boolean },
+) =>
   $.agent.spawn({
     tool_use_id: 'tu1',
     prompt: o.prompt,
@@ -137,7 +152,8 @@ const spawn = ($: Engine, o: { prompt: string; name?: string; parentAgentId?: st
     name: o.name,
     model: o.model,
     parentAgentId: o.parentAgentId,
-    background: true,
+    background: o.background ?? true,
+    ...(o.isTeammate && { isTeammate: true }),
     fork: false,
   } as never)
 
@@ -1981,6 +1997,357 @@ describe('stalled handovers and resumed agents', () => {
         expect(textOf(button)).toMatch(/impl-1\s*↻/)
       }
       await ui.unmount()
+    })
+  }
+})
+
+/** A tool call from an agent's loop with the tool's own arguments beside the envelope, as the engine raises it. */
+const call = ($: Engine, agentId: string | undefined, tool: string, args: Record<string, unknown>) =>
+  $.tool.call({ tool, tool_use_id: `tu-${tool}-${Math.random()}`, ...(agentId && { agentId }), ...args } as never) as Promise<{
+    result?: unknown
+    deny?: string
+  }>
+
+/** agent1 (impl-1) under main, with agent2 (impl-2) its background child; both listed by the engine. */
+const family = async ($: Engine, w: World) => {
+  await running($, w)
+  await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+  await step($, 'agent2')
+  w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+}
+
+describe('check-in', () => {
+  const MIN = 60_000
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  const checkins = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes('check-in'))
+
+  test('session.start registers the checkin tool, not deferred', async ($, on) => {
+    const w = world(on)
+    await start($)
+    const t = w.tools.find(t => t.name === 'checkin')
+    expect(t).toBeDefined()
+    expect(t!.isDeferred).toBe(false)
+    expect(JSON.stringify(t!.inputSchema)).toContain('minutes')
+  })
+
+  test('a parent arms a check-in on its child: stored, and fired once after the deadline', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    const now = w.clock.now()
+    const res = await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    expect(String(res.result)).toContain('impl-2')
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ checkinAt: now + 30 * MIN, checkinMins: 30, checkinBy: 'agent1' }))
+    await w.clock.advance(29 * MIN)
+    expect(checkins(w)).toHaveLength(0)
+    await w.clock.advance(MIN + 30_000)
+    expect(checkins(w)).toHaveLength(1)
+    expect(checkins(w)[0]!.text).toContain('impl-2')
+    expect(checkins(w)[0]!.text).toContain('30 min')
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    await w.clock.advance(30_000)
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  for (const to of ['agent1', 'impl-1']) {
+    test(`the child's SendMessage to its parent (${to}) disarms it and records the report`, async ($, on) => {
+      const w = world(on)
+      await family($, w)
+      await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+      await call($, 'agent2', 'SendMessage', { to, message: 'done: all green' })
+      expect(row(w, 'agent2')!.report).toEqual(expect.objectContaining({ text: 'done: all green', ok: true, final: true }))
+      await w.clock.advance(31 * MIN)
+      expect(checkins(w)).toHaveLength(0)
+    })
+  }
+
+  test("a SendMessage to someone else leaves it armed", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+    await call($, 'agent2', 'SendMessage', { to: 'impl-9', message: 'hi' })
+    expect(row(w, 'agent2')!.report).toBeUndefined()
+    await w.clock.advance(31 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  test("the child's turn ending disarms it", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+    await complete($, 'agent2', 'R')
+    await w.clock.advance(31 * MIN)
+    expect(checkins(w)).toHaveLength(0)
+  })
+
+  test('calling again re-arms; minutes 0 cancels; an unknown agent is refused and changes nothing', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 10 })
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 40 })
+    await w.clock.advance(11 * MIN)
+    expect(checkins(w)).toHaveLength(0)
+    await w.clock.advance(30 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    const cancel = await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 0 })
+    expect(String(cancel.result)).toContain('cancel')
+    await w.clock.advance(6 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+    const before = w.files.get(STATE)
+    const bad = await call($, 'agent1', CHECKIN, { agent: 'nobody', minutes: 5 })
+    expect(bad.deny).toBeUndefined()
+    expect(String(bad.result)).toMatch(/^checkin: .*nobody/)
+    expect(w.files.get(STATE)).toBe(before)
+  })
+
+  test("only the child's own parent can arm it", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    const res = await call($, undefined, CHECKIN, { agent: 'impl-2', minutes: 5 })
+    expect(res.deny).toBeUndefined()
+    expect(String(res.result)).toMatch(/^checkin: no agent/)
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    const bad = await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 'soon' })
+    expect(bad.deny).toBeUndefined()
+    expect(String(bad.result)).toMatch(/^checkin: minutes/)
+  })
+
+  test('a check-in armed by main appends a message and toasts instead of sending', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, undefined, CHECKIN, { agent: 'impl-1', minutes: 5 })
+    expect(row(w, 'agent1')!.checkinBy).toBe('main')
+    await w.clock.advance(6 * MIN)
+    expect(w.sent.filter(m => m.text.includes('check-in'))).toHaveLength(0)
+    expect(JSON.stringify(w.session.appended())).toContain('check-in')
+    expect(w.toasts.some(t => t.includes('check-in'))).toBe(true)
+  })
+
+  test('a replacement inherits its predecessor check-in, and it still fires', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent3')).toEqual(expect.objectContaining({ replaces: 'agent2', checkinBy: 'agent1', checkinMins: 30 }))
+    w.agents.push({ id: 'agent3', name: 'impl-2' })
+    await w.clock.advance(31 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+    expect(checkins(w)[0]!.text).toContain('agent3')
+  })
+
+  test('a replacement orchestrator can check in on its predecessor children, and the check-in reaches it', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    w.agents.push({ id: 'agent3', name: 'impl-1' })
+    const res = await call($, 'agent3', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    expect(String(res.result)).toContain('armed')
+    expect(row(w, 'agent2')!.checkinBy).toBe('agent3')
+    await w.clock.advance(6 * MIN)
+    expect(checkins(w, 'agent3')).toHaveLength(1)
+  })
+
+  test('a check-in armed by an orchestrator that was then replaced goes to its replacement', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    w.agents.push({ id: 'agent3', name: 'impl-1' })
+    await w.clock.advance(31 * MIN)
+    expect(checkins(w, 'agent1')).toHaveLength(0)
+    expect(checkins(w, 'agent3')).toHaveLength(1)
+  })
+
+  test('the check-in tool never touches a handover under way', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await $.command.run({ command: 'orch', args: 'handover impl-2' } as never)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    expect((await tool($, 'agent2')).context?.[0]).toContain('HANDOVER')
+  })
+})
+
+describe('auto-forward', () => {
+  const end = ($: Engine, agentId: string, answer: string, reason: 'answer' | 'aborted' | 'error' = 'answer') =>
+    $.turn.complete({ answer, durationMs: 5, isAborted: reason === 'aborted', turnId: 'T', agentId, reason })
+  const forwards = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes('auto-forwarded'))
+  /** agent1 (impl-1) under main, with agent2 (impl-2) its child, spawned as asked. */
+  const kin = async ($: Engine, w: World, o: { background?: boolean; isTeammate?: boolean } = {}) => {
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1', ...o })
+    await step($, 'agent2')
+  }
+
+  test("a child's final answer goes to its parent agent", async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await end($, 'agent2', 'R: all green')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('R: all green')
+    expect(forwards(w)[0]!.text).toContain('impl-2')
+    expect(forwards(w)[0]!.text).not.toContain('may duplicate')
+  })
+
+  test('a delivered SendMessage to the parent as the run last act is not forwarded again', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'Report: done' })
+    await end($, 'agent2', 'Sent my report.')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('a SendMessage early, then a different final answer, is still forwarded, flagged', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'starting now' })
+    await tool($, 'agent2')
+    await end($, 'agent2', 'FINAL: tests pass')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('FINAL: tests pass')
+    expect(forwards(w)[0]!.text).toContain('may duplicate a message it sent you')
+  })
+
+  test('an early SendMessage saying the same as the final answer is enough', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'FINAL: tests pass' })
+    await tool($, 'agent2')
+    await end($, 'agent2', 'FINAL:  tests pass')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('a SendMessage that failed does not count as a report', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SendMessage' ? { result: { success: false }, isError: true } : undefined)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'Report' })
+    await end($, 'agent2', 'Report')
+    expect(forwards(w)).toHaveLength(1)
+  })
+
+  test('a delivered SubagentHandback is not forwarded again', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    await kin($, w)
+    await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
+    await end($, 'agent2', 'Report')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('each run is judged on its own: a resumed child that does not report is forwarded', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'first report' })
+    await end($, 'agent2', 'first report')
+    expect(forwards(w)).toHaveLength(0)
+    await call($, 'agent1', 'SendMessage', { to: 'impl-2', message: 'one more thing' })
+    await step($, 'agent2')
+    await end($, 'agent2', 'second answer')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('second answer')
+  })
+
+  test('nothing is forwarded to main, nor for a teammate or a foreground child', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const prompts = w.prompts.length
+    await end($, 'agent1', 'R')
+    expect(w.sent).toHaveLength(0)
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(prompts)
+    await spawn($, { prompt: 'T', name: 'mate', parentAgentId: 'agent1', isTeammate: true })
+    await end($, 'agent2', 'R')
+    await spawn($, { prompt: 'F', name: 'fg', parentAgentId: 'agent1', background: false })
+    await end($, 'agent3', 'R')
+    expect(forwards(w)).toHaveLength(0)
+    expect(row(w, 'agent2')!.isTeammate).toBe(true)
+    expect(row(w, 'agent3')!.background).toBe(false)
+  })
+
+  test('an empty, aborted or failed end is not forwarded', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await end($, 'agent2', '   ')
+    await step($, 'agent2')
+    await end($, 'agent2', 'partial', 'aborted')
+    await step($, 'agent2')
+    await end($, 'agent2', 'partial', 'error')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('a child handing over is not forwarded; the handover goes on as before', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await $.command.run({ command: 'orch', args: 'handover impl-2' } as never)
+    await end($, 'agent2', 'ended early')
+    expect(forwards(w)).toHaveLength(0)
+    expect(w.sent.some(m => m.to.includes('agent2') && m.text.includes('HANDOVER'))).toBe(true)
+  })
+
+  test('a replacement under a subagent is forwarded exactly once', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await end($, 'agent2', 'HANDED OVER: note at x')
+    expect(forwards(w)).toHaveLength(0)
+    w.tokens.set('agent3', 1000)
+    await step($, 'agent3')
+    await end($, 'agent3', 'REPLACEMENT DONE')
+    expect(w.sent.filter(m => m.to.includes('agent1') && m.text.includes('REPLACEMENT DONE'))).toHaveLength(1)
+  })
+
+  test("a child's final answer goes to its parent's replacement, not the handed-over parent", async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await end($, 'agent1', 'HANDED OVER')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    await end($, 'agent2', 'R: all green')
+    expect(forwards(w, 'agent1')).toHaveLength(0)
+    expect(forwards(w, 'agent3')).toHaveLength(1)
+  })
+
+  test('a report followed by a refused call is no longer the last act', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'Bash' ? { deny: 'not allowed' } : undefined)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'early' })
+    await call($, 'agent2', 'Bash', { command: 'rm -rf x' })
+    expect(row(w, 'agent2')!.report?.final).toBe(false)
+    await end($, 'agent2', 'FINAL different')
+    expect(forwards(w)).toHaveLength(1)
+  })
+
+  test('a report followed by a checkin call is no longer the last act', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'early' })
+    await call($, 'agent2', 'mcp__orchestrator__checkin', { agent: 'nobody', minutes: 5 })
+    expect(row(w, 'agent2')!.report?.final).toBe(false)
+  })
+
+  for (const fails of ['throw', 'undelivered'] as const) {
+    test(`a forward that fails (${fails}) is warned, never thrown`, async ($, on) => {
+      const w = world(on)
+      await kin($, w)
+      w.sendFails = fails
+      await end($, 'agent2', 'R')
+      expect(w.toasts.some(t => t.includes('not forwarded'))).toBe(true)
+      expect(row(w, 'agent2')!.status).toBe('idle')
     })
   }
 })

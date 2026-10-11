@@ -34,6 +34,10 @@ import {
   mainButtonShown,
   modelLabel,
   paneHeader,
+  checkinDue,
+  forwardTarget,
+  latest,
+  namesAgent,
   seriesColors,
   statusEmoji,
   statusStyle,
@@ -49,6 +53,10 @@ const PANE = 'orchestrator'
 /** The tool-call detail dialog: a second pane, one at a time. */
 const TOOL_PANE = 'orchestrator-tool'
 const SYNC_MS = 30_000
+/** The check-in tool as the model calls it. */
+const CHECKIN_TOOL = 'mcp__orchestrator__checkin'
+/** A check-in cleared: no deadline, no length, no one who armed it. */
+const DISARMED = { checkinAt: undefined, checkinMins: undefined, checkinBy: undefined } as const
 const STALL_MS = 20 * 60_000
 
 const agentsAtom = atom({ plugin: 'orchestrator', key: 'agents' } as const, [] as AgentRow[])
@@ -479,6 +487,10 @@ async function respawn($: $, old: AgentRow) {
               parentId: old.parentId,
               isOurs: true,
               isTeammate,
+              background: old.background,
+              checkinAt: old.checkinAt,
+              checkinMins: old.checkinMins,
+              checkinBy: old.checkinBy,
             }
           : a,
     )
@@ -493,9 +505,125 @@ async function respawn($: $, old: AgentRow) {
   )
 }
 
-async function onAgentEnd($: $, id: string, answer: string) {
+// ---- check-in and reports ---------------------------------------------
+
+/** A tool call's own arguments: beside the envelope keys on `e`, or under `e.input` on an engine that nests them. */
+const argsOf = (e: object): Record<string, unknown> => {
+  const raw = e as Record<string, unknown>
+  const nested = raw.input && typeof raw.input === 'object' ? (raw.input as Record<string, unknown>) : {}
+  return { ...nested, ...raw }
+}
+
+/**
+ * Serves the `checkin` tool: the calling loop (`agentId`, else main) arms, re-arms or (minutes <= 0)
+ * cancels a check-in on one of its own children (a child of a loop it replaced counts), named by id
+ * or name. Every answer is one line of result text starting `checkin:`; an unknown child or a bad
+ * length stores nothing.
+ */
+async function checkin($: $, agentId: string | undefined, args: Record<string, unknown>) {
+  const parent = agentId ?? 'main'
+  const target = String(args.agent ?? '').trim()
+  const minutes = Number(args.minutes)
+  if (args.minutes === undefined || args.minutes === null || args.minutes === '' || !Number.isFinite(minutes)) {
+    return { result: 'checkin: minutes must be a number (0 cancels); nothing changed.' }
+  }
+  try {
+    await restore($)
+    const rows = await read($, agentsAtom)
+    const kids = rows.filter(r => r.id !== 'main' && latest(rows, r.parentId ?? 'main') === parent)
+    const named = kids.filter(r => r.name === target)
+    const r = kids.find(k => k.id === target) ?? named.filter(k => LIVE.includes(k.status)).at(-1) ?? named.at(-1)
+    if (!r) return { result: `checkin: no agent "${target}" among the agents you spawned; nothing changed.` }
+    if (minutes <= 0) {
+      await update($, agentsAtom, l => patch(l, r.id, DISARMED))
+      await persist($)
+      return { result: `checkin: check-in for ${label(r)} (id ${r.id}) cancelled.` }
+    }
+    const at = (await $.clock.now()) + minutes * 60_000
+    await update($, agentsAtom, l => patch(l, r.id, { checkinAt: at, checkinMins: minutes, checkinBy: parent }))
+    await persist($)
+    return {
+      result: `checkin: armed; if ${label(r)} (id ${r.id}) has not reported to you by ${hhmm(at)} UTC (${minutes} min), you will get a message.`,
+    }
+  } catch (err) {
+    return { result: `checkin: failed (${String(err)}); nothing changed.` }
+  }
+}
+
+/**
+ * After a subagent's tool call: a `SendMessage` naming its parent, or a `SubagentHandback`, is this
+ * run's report (kept with whether it succeeded) and disarms its check-in; any later call means the
+ * report was not its last act. Called inside a `try`, after the HANDOVER is attached.
+ */
+async function noteReport($: $, id: string, tool: string, args: Record<string, unknown>, res: object) {
+  const rows = await read($, agentsAtom)
+  const c = rows.find(r => r.id === id)
+  if (!c) return
+  const parentId = c.parentId ?? 'main'
+  // Its parent as spawned, or the replacement now carrying that parent's work.
+  const parents = [parentId, latest(rows, parentId)].map(p => rows.find(r => r.id === p) ?? { id: p })
+  const isReport = (tool === 'SendMessage' && parents.some(p => namesAgent(args.to, p))) || tool === 'SubagentHandback'
+  if (isReport) {
+    const out = res as { deny?: unknown; isError?: unknown; result?: unknown }
+    const result = out.result && typeof out.result === 'object' ? (out.result as { success?: unknown }) : {}
+    const ok = out.deny === undefined && !out.isError && result.success !== false
+    const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok, final: true }
+    await update($, agentsAtom, l => patch(l, id, { report, ...DISARMED }))
+    await persist($)
+  } else if (c.report?.final) {
+    await update($, agentsAtom, l => patch(l, id, { report: { ...c.report!, final: false } }))
+    await persist($)
+  }
+}
+
+/** Sends each due check-in to whoever armed it, once: the deadline is cleared before the message goes. */
+async function fireCheckins($: $, now: number) {
+  for (const r of checkinDue(await read($, agentsAtom), now)) {
+    await update($, agentsAtom, l => patch(l, r.id, DISARMED))
+    await persist($)
+    const shows = displayStatus(r, await read($, agentsAtom))
+    const text =
+      `[orchestrator mod] check-in: ${label(r)} (id ${r.id}) has not reported after ${r.checkinMins ?? '?'} min; ` +
+      `status ${shows}, last active ${hhmm(r.lastActive)}. Check on it, or call checkin again to re-arm.`
+    try {
+      // An orchestrator that handed over since arming it is carried on by its replacement.
+      const by = latest(await read($, agentsAtom), r.checkinBy ?? 'main')
+      if (by === 'main') {
+        await tellParent($, 'main', text)
+        $.ui.toast(`orchestrator: check-in: ${label(r)} has not reported after ${r.checkinMins ?? '?'} min`)
+      } else {
+        const sent = await $.session.send({ to: { agentId: by }, text })
+        if (!sent.isDelivered) await log($, `check-in for ${label(r)} not delivered (${sent.reason})`, 'warn')
+      }
+    } catch (err) {
+      await log($, `check-in for ${label(r)} not delivered: ${String(err)}`, 'warn')
+    }
+  }
+}
+
+/**
+ * Forwards a child's final answer to its parent agent when `forwardTarget` says so, which wakes or
+ * resumes that parent. A failure is warned, never thrown.
+ */
+async function forwardAnswer($: $, r: AgentRow, answer: string, reason: string) {
+  const to = forwardTarget(r, answer, reason, await read($, agentsAtom))
+  if (to === 'skip') return
+  const text =
+    `[orchestrator mod] final report of ${label(r)} (id ${r.id}${r.replaces ? `, replacement for ${r.replaces}` : ''})` +
+    `${to.mayDuplicate ? ' (may duplicate a message it sent you)' : ''}, auto-forwarded:\n\n${answer}`
+  try {
+    const sent = await $.session.send({ to: { agentId: to.agentId }, text })
+    if (!sent.isDelivered) await log($, `${label(r)}: final report not forwarded to ${to.agentId} (${sent.reason})`, 'warn')
+  } catch (err) {
+    await log($, `${label(r)}: final report not forwarded to ${to.agentId}: ${String(err)}`, 'warn')
+  }
+}
+
+async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   if (!r) return
+  // Its run is over: its check-in is spent (a replacement inherits it) and its next run reports afresh.
+  await update($, agentsAtom, l => patch(l, id, { ...DISARMED, report: undefined }))
   // A stalled handover is settled by its end like any other: by the note, if it wrote one late.
   if (r.status === 'handing-over' || r.status === 'stalled') {
     if (r.notePath && (await $.fs.exists(r.notePath))) {
@@ -512,11 +640,11 @@ async function onAgentEnd($: $, id: string, answer: string) {
     }
   } else if (isActive(r)) {
     await update($, agentsAtom, l => patch(l, id, { status: 'idle' }))
-    if (r.isOurs && !r.isTeammate && r.parentId !== undefined) {
+    if (r.isOurs && !r.isTeammate && r.parentId === 'main') {
+      // The engine does not tell main of an agent the mod spawned: its replacement's report is submitted.
       const text = `[orchestrator mod] ${label(r)} (id ${id}, replacement for ${r.replaces}) reports:\n\n${answer}`
-      if (r.parentId === 'main') $.clock.after(0, () => void $.prompt.submit({ text }))
-      else await $.session.send({ to: { agentId: r.parentId }, text })
-    }
+      $.clock.after(0, () => void $.prompt.submit({ text }))
+    } else await forwardAnswer($, r, answer, reason)
   }
   await persist($)
 }
@@ -547,6 +675,11 @@ async function sync($: $) {
     }
   }
   if (changed) await persist($)
+  try {
+    await fireCheckins($, now)
+  } catch (err) {
+    $.ui.log(`orchestrator: check-ins not fired: ${String(err)}`)
+  }
   // The open transcript is read again now and then, so one left loading (a reload, a lost read) settles.
   const selected = liveSelection(await read($, agentsAtom), await read($, selectedAtom))
   if (selected) schedulePeek($, selected)
@@ -652,6 +785,25 @@ export const register: Register = (on, options) => {
     })
     await runDir($)
     await excludeFromGit($).catch(() => undefined)
+    try {
+      await $.tool.register({
+        name: 'checkin',
+        description:
+          'Arm a one-shot check-in on an agent you spawned: if it has not reported to you (SendMessage) within `minutes`, ' +
+          'the orchestrator mod messages you, which wakes you. Calling again re-arms; minutes 0 cancels.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            agent: { type: 'string', description: 'The agent you spawned: its name or id' },
+            minutes: { type: 'number', description: 'Minutes from now; 0 cancels' },
+          },
+          required: ['agent', 'minutes'],
+        },
+        isDeferred: false,
+      })
+    } catch (err) {
+      $.ui.log(`orchestrator: checkin tool not registered: ${String(err)}`)
+    }
     // A (re)load starts with no handover queued: the state must not say otherwise.
     await update($, queuedAtom, () => false)
     $.clock.every(SYNC_MS, () => void sync($))
@@ -673,6 +825,8 @@ export const register: Register = (on, options) => {
         description: e.description,
         type,
         parentId: e.parentAgentId ?? 'main',
+        background: e.background,
+        ...(e.isTeammate && { isTeammate: true }),
         brief: {
           prompt: e.prompt,
           subagentType: type,
@@ -701,6 +855,8 @@ export const register: Register = (on, options) => {
       if (id !== 'main' && !(await read($, agentsAtom)).some(a => a.id === id)) {
         const info = (await $.agent.list()).find(a => a.id === id)
         if (!info) return res // an engine fork (compaction, memory): not an agent of the run
+        // Adopted from the engine's list, which says nothing of background: `background` stays absent, and
+        // `forwardTarget` treats absent as background on purpose (only a known foreground child is skipped).
         await update($, agentsAtom, l => [
           ...l,
           { ...newRow(id, now), name: info.name, description: info.description, type: info.type, parentId: info.parentId ?? 'main' },
@@ -744,6 +900,13 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    // The mod's own tool: answered here, never passed on (a call no hook answers fails).
+    if (e.tool === CHECKIN_TOOL) {
+      const answer = await checkin($, e.agentId, argsOf(e))
+      // Still an action of the caller's run: a report before it was not its last.
+      if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, {}, answer).catch(() => undefined)
+      return answer as never
+    }
     if (e.agentId !== undefined) {
       // Stamped as the call starts, when the mod saw it, for the transcript. The call never waits on the clock,
       // and a lost stamp only leaves the item's time `--:--`: the call and its HANDOVER go ahead.
@@ -765,7 +928,12 @@ export const register: Register = (on, options) => {
       }
     }
     const res = await next(e)
-    if (e.agentId === undefined || res.deny !== undefined) return res
+    if (e.agentId === undefined) return res
+    if (res.deny !== undefined) {
+      // A refused call is still an action: a report before it was not the run's last (a refused report is not ok).
+      await noteReport($, e.agentId, e.tool, argsOf(e), res).catch(() => undefined)
+      return res
+    }
     let out = res
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
@@ -777,6 +945,12 @@ export const register: Register = (on, options) => {
       }
     } catch (err) {
       $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
+    }
+    try {
+      // After the HANDOVER is attached, and it never alters `out`: a report to the parent disarms the check-in.
+      await noteReport($, e.agentId, e.tool, argsOf(e), res)
+    } catch (err) {
+      $.ui.log(`orchestrator: report not noted: ${String(err)}`)
     }
     // Last, after the HANDOVER is attached: the peek and the open detail's reread can cost it nothing.
     await peekIfSelected($, e.agentId)
@@ -809,7 +983,7 @@ export const register: Register = (on, options) => {
       throw err
     }
     try {
-      if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer)
+      if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer, e.reason)
       else {
         if (queued) await update($, queuedAtom, () => false)
         const phase = await read($, phaseAtom)

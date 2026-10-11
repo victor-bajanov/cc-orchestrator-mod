@@ -472,3 +472,67 @@ export const contextChart = (i: ChartInput): { source: string; alt: string; widt
   })
   return { source: [...head, ...body, tail].join(''), alt, width: W, height: H }
 }
+
+/**
+ * Whether a `SendMessage` `to` names this row: its id or name, or `main` for the main thread. A
+ * trailing ` [ref]` (as ListAgents prints a row) is ignored.
+ */
+export const namesAgent = (to: unknown, row: Pick<AgentRow, 'id' | 'name'>): boolean => {
+  if (typeof to !== 'string') return false
+  const name = to.replace(/\s*\[[^\]]*\]$/, '').trim()
+  return name !== '' && (row.id === 'main' ? name === 'main' : name === row.id || name === row.name)
+}
+
+/** The newest agent in an id's `replacedBy` chain: whoever now carries its work (the id itself when never replaced). */
+export const latest = (rows: readonly AgentRow[], id: string): string => {
+  const seen = new Set<string>()
+  let cur = id
+  while (!seen.has(cur)) {
+    seen.add(cur)
+    const next = rows.find(r => r.id === cur)?.replacedBy
+    if (next === undefined) break
+    cur = next
+  }
+  return cur
+}
+
+/**
+ * Whether two reports say the same: equal once whitespace is collapsed, or one holding the
+ * other and at least 80% of its length.
+ */
+export const sameReport = (a: string, b: string): boolean => {
+  const x = oneLine(a)
+  const y = oneLine(b)
+  if (x === '' || y === '') return false
+  if (x === y) return true
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x]
+  return long.includes(short) && short.length >= long.length * 0.8
+}
+
+/** Rows whose check-in deadline has come. */
+export const checkinDue = (rows: readonly AgentRow[], now: number): AgentRow[] =>
+  rows.filter(r => r.checkinAt !== undefined && r.checkinAt <= now)
+
+/**
+ * Whether a child's final answer goes to its parent agent, and whether it may repeat what the child
+ * already sent. Skipped: a parent that is main or unknown (the engine tells main), a teammate or a
+ * foreground child (its answer is delivered), a handover, an empty or unfinished answer, and a run
+ * whose delivered report to the parent was its last act or says the same as the answer. A lost
+ * report costs more than a duplicate, so anything else is forwarded, to the parent's `latest`.
+ */
+export const forwardTarget = (
+  row: AgentRow,
+  answer: string,
+  reason: string,
+  rows: readonly AgentRow[] = [],
+): 'skip' | { agentId: string; mayDuplicate: boolean } => {
+  const parent = row.parentId
+  if (parent === undefined || parent === 'main') return 'skip'
+  if (row.isTeammate || row.background === false) return 'skip'
+  if (row.status === 'handing-over' || row.status === 'stalled') return 'skip'
+  if (reason !== 'answer' || answer.trim() === '') return 'skip'
+  const r = row.report
+  if (r?.ok && (r.final || sameReport(r.text, answer))) return 'skip'
+  // A parent that handed over is carried on by its replacement: the answer goes there.
+  return { agentId: latest(rows, parent), mayDuplicate: r !== undefined }
+}

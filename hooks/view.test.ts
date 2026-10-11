@@ -10,17 +10,22 @@ import {
   cleanBlock,
   chartWidthPx,
   contextChart,
+  checkinDue,
   cut,
   displayStatus,
+  forwardTarget,
   effortAbbrev,
   hashText,
   hhmm,
+  latest,
   logId,
   mainButtonShown,
   modelLabel,
   modelName,
+  namesAgent,
   paneHeader,
   runnerFor,
+  sameReport,
   seriesColors,
   statusEmoji,
   statusStyle,
@@ -760,5 +765,103 @@ describe('cleanBlock', () => {
   test('strips the one-byte CSI form and OSC sequences whole', () => {
     expect(cleanBlock('\x9b31mred\x9b0m')).toBe('red')
     expect(cleanBlock('\x1b]8;;http://x\x07link\x1b]8;;\x1b\\')).toBe('link')
+  })
+})
+
+describe('namesAgent', () => {
+  test('a SendMessage `to` names a row by id or name; main by "main"', () => {
+    const r = row({ id: 'agent2', name: 'impl-2' })
+    expect(namesAgent('agent2', r)).toBe(true)
+    expect(namesAgent('impl-2', r)).toBe(true)
+    expect(namesAgent('impl-3', r)).toBe(false)
+    expect(namesAgent(undefined, r)).toBe(false)
+    expect(namesAgent({ agentId: 'agent2' }, r)).toBe(false)
+    expect(namesAgent('main', main())).toBe(true)
+    expect(namesAgent('main', r)).toBe(false)
+    // ListAgents rows carry a ` [ref]` after the name
+    expect(namesAgent('impl-2 [3fa9c1]', r)).toBe(true)
+    expect(namesAgent('agent2 [3fa9c1]', r)).toBe(true)
+    expect(namesAgent('impl-3 [3fa9c1]', r)).toBe(false)
+  })
+})
+
+describe('sameReport', () => {
+  test('matches the same text however it is spaced, or one nearly containing the other', () => {
+    expect(sameReport('Done: all 3 tests\n pass.', 'Done: all 3 tests pass.')).toBe(true)
+    expect(sameReport('Report: tests pass, gates green.', 'Report: tests pass, gates green')).toBe(true)
+    expect(sameReport('started', 'Report: tests pass, gates green, all done here.')).toBe(false)
+    expect(sameReport('Report A', 'Totally different report B')).toBe(false)
+    expect(sameReport('', '')).toBe(false)
+  })
+})
+
+describe('checkinDue', () => {
+  test('is every row whose check-in deadline has come', () => {
+    const rows = [row({ id: 'a', checkinAt: 100 }), row({ id: 'b', checkinAt: 101 }), row({ id: 'c' })]
+    expect(checkinDue(rows, 100).map(r => r.id)).toEqual(['a'])
+    expect(checkinDue(rows, 200).map(r => r.id)).toEqual(['a', 'b'])
+  })
+})
+
+describe('forwardTarget', () => {
+  const child = (over: Partial<AgentRow> = {}) => row({ id: 'agent2', name: 'impl-2', parentId: 'agent1', background: true, ...over })
+
+  test('forwards a background child of a subagent its final answer', () => {
+    expect(forwardTarget(child(), 'R', 'answer')).toEqual({ agentId: 'agent1', mayDuplicate: false })
+  })
+
+  test('skips main and absent parents, teammates, foreground children, handovers, empty or unfinished answers', () => {
+    expect(forwardTarget(child({ parentId: 'main' }), 'R', 'answer')).toBe('skip')
+    expect(forwardTarget(child({ parentId: undefined }), 'R', 'answer')).toBe('skip')
+    expect(forwardTarget(child({ isTeammate: true }), 'R', 'answer')).toBe('skip')
+    expect(forwardTarget(child({ background: false }), 'R', 'answer')).toBe('skip')
+    expect(forwardTarget(child({ status: 'handing-over' }), 'R', 'answer')).toBe('skip')
+    expect(forwardTarget(child({ status: 'stalled' }), 'R', 'answer')).toBe('skip')
+    expect(forwardTarget(child(), '  \n', 'answer')).toBe('skip')
+    expect(forwardTarget(child(), 'R', 'aborted')).toBe('skip')
+    expect(forwardTarget(child(), 'R', 'error')).toBe('skip')
+  })
+
+  test('skips a run whose delivered report to the parent was its last act, or matches the answer', () => {
+    expect(forwardTarget(child({ report: { t: 1, text: 'early', ok: true, final: true } }), 'R', 'answer')).toBe('skip')
+    expect(forwardTarget(child({ report: { t: 1, text: 'All done: R', ok: true, final: false } }), 'All done: R', 'answer')).toBe('skip')
+  })
+
+  test('forwards anyway, flagged, when the report failed, was not last and differs', () => {
+    expect(forwardTarget(child({ report: { t: 1, text: 'early', ok: true, final: false } }), 'Final R', 'answer')).toEqual({
+      agentId: 'agent1',
+      mayDuplicate: true,
+    })
+    expect(forwardTarget(child({ report: { t: 1, text: 'R', ok: false, final: true } }), 'R', 'answer')).toEqual({
+      agentId: 'agent1',
+      mayDuplicate: true,
+    })
+  })
+})
+
+describe('latest', () => {
+  test('follows the replacedBy chain to the newest agent; an unknown or unreplaced id is itself', () => {
+    const rows = [
+      row({ id: 'a1', replacedBy: 'a2' }),
+      row({ id: 'a2', replacedBy: 'a3' }),
+      row({ id: 'a3' }),
+      row({ id: 'b1', replacedBy: 'ghost' }),
+    ]
+    expect(latest(rows, 'a1')).toBe('a3')
+    expect(latest(rows, 'a3')).toBe('a3')
+    expect(latest(rows, 'main')).toBe('main')
+    expect(latest(rows, 'zz')).toBe('zz')
+    expect(latest(rows, 'b1')).toBe('ghost')
+  })
+
+  test('a cycle ends instead of looping', () => {
+    const rows = [row({ id: 'x', replacedBy: 'y' }), row({ id: 'y', replacedBy: 'x' })]
+    expect(['x', 'y']).toContain(latest(rows, 'x'))
+  })
+
+  test('forwardTarget sends to the parent latest replacement', () => {
+    const rows = [row({ id: 'p1', replacedBy: 'p2' }), row({ id: 'p2' })]
+    const c = row({ id: 'c', parentId: 'p1', background: true })
+    expect(forwardTarget(c, 'R', 'answer', rows)).toEqual({ agentId: 'p2', mayDuplicate: false })
   })
 })

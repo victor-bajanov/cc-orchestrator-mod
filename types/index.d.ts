@@ -49,6 +49,18 @@ export type AgentRow = {
   handovers?: number
   /** A replacement that started too full for another handover to help: left to run. */
   noHandover?: boolean
+  /** Spawned in the background (false: its answer is its parent's tool result). Absent when unknown. */
+  background?: boolean
+  /**
+   * This run's report to its parent, as last seen: a `SendMessage` naming the parent, or a
+   * `SubagentHandback`. `ok` when it succeeded; `final` while it is still the run's last tool call.
+   * Cleared when the run ends, so each run is judged on its own.
+   */
+  report?: { t: number; text: string; ok: boolean; final: boolean }
+  /** A check-in deadline its parent armed through the `checkin` tool, its length, and who armed it. */
+  checkinAt?: number
+  checkinMins?: number
+  checkinBy?: string
   /** The model its last step ran on (the answering id, else the requested one). */
   model?: string
   /** Its last step's effort, as a string (`'medium'`, or a token budget such as `'32000'`). */
