@@ -30,19 +30,20 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 *Terminal.* The pane has:
 - a `Hand over main` button in the header (with `mainHandover: ask`; hidden while main is handing over)
 - a tree of agents (main, then each agent under its parent); the agent you opened from `/tasks` is shown inverted
+- click a subagent's name to show its last five messages in a box beneath it (role, any tools it called, the text cut to the pane); click again to close it. The box takes its rows from the activity log
 - each agent's context drawn on one shared time axis, so you can see when each agent was active and how close it is to its limit (green, then amber from 60%, red at the threshold)
 - an activity log; a line too long for the pane ends in `…`, and hovering it shows the full text in a card (a click pins it open)
 
 *Desktop app.* The pane has:
 - a chart of each agent's context over time, one coloured line per agent, with the limits as dashed red lines; hover a line for the agent's name, context and status
-- a tree of agents, each with its colour, context and status; click one to highlight its line in the chart, click again to clear (the agent in view stays highlighted)
+- a tree of agents, each with its colour, context and status; click one to highlight its line in the chart and show its last eight messages beneath it (role, any tools it called, the text cut to the pane), click again to clear both (the agent in view stays highlighted)
 - the agent open in the main view is marked *in view* and its line highlighted, unless you clicked another
 - a `Hand over` button beside each live subagent, and a `Hand over main` button in the header (hidden unless `mainHandover` is `ask`, and while main is handing over)
 - an activity log; a line too long for the pane ends in `…`, and clicking it expands the full text beneath it
 
 VS Code and the mobile app get the desktop pane.
 
-Clicking an agent only highlights it in the pane. The host gives mods no way to switch the main view to an agent, so open it with `/tasks` (terminal) or the app's agent panel (desktop).
+Clicking a subagent shows its transcript inside the pane, read through the host's own transcript API. Main has none there, since it is the main view already. A teammate running in another pane's process, or a finished agent whose transcript was not saved, can't be read; the box says "transcript not readable (teammate in another pane, or finished)". The host gives mods no way to switch the main view to an agent, so to read a whole transcript open it with `/tasks` (terminal) or the app's agent panel (desktop).
 
 On both the terminal and the desktop app, the status line shows live agents, the largest context and main's context; toasts show; and in ask mode the **Hand over & restart** band shows above the prompt past the threshold. The desktop app has no notifications; the stall toast still shows there.
 

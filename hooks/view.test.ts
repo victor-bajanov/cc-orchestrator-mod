@@ -13,8 +13,10 @@ import {
   logId,
   mainButtonShown,
   paneHeader,
+  peekLines,
   seriesColors,
 } from './view'
+import type { SessionMessage } from 'claude-code'
 import type { AgentRow } from '../types'
 
 const row = (over: Partial<AgentRow>): AgentRow => ({
@@ -246,6 +248,43 @@ describe('mainButtonShown', () => {
     expect(mainButtonShown('auto', 'idle')).toBe(false)
     expect(mainButtonShown('auto', 'offered')).toBe(false)
     expect(mainButtonShown('off', 'idle')).toBe(false)
+  })
+})
+
+describe('peekLines', () => {
+  const msg = (role: 'user' | 'assistant', text: string, tools: string[] = []): SessionMessage => ({
+    role,
+    text,
+    toolUses: tools.map((tool, i) => ({ tool_use_id: `t${i}`, tool, input: {} })),
+  })
+
+  test('an empty transcript gives no lines; a tool-result-only user row is dropped', () => {
+    expect(peekLines([], 80, 5)).toEqual([])
+    const results: SessionMessage = { ...msg('user', ''), toolResults: [{ tool_use_id: 't0', text: 'ok' } as never] }
+    expect(peekLines([results], 80, 5)).toEqual([])
+  })
+
+  test('keeps the last n drawable messages, oldest first', () => {
+    const all = [msg('user', 'one'), msg('assistant', 'two'), msg('user', ''), msg('assistant', 'three')]
+    expect(peekLines(all, 80, 2)).toEqual(['assistant: two', 'assistant: three'])
+  })
+
+  test('prefixes the role and collapses whitespace', () => {
+    expect(peekLines([msg('assistant', 'a\n  b\tc ')], 80, 5)).toEqual(['assistant: a b c'])
+    expect(peekLines([msg('user', 'go')], 80, 5)).toEqual(['user: go'])
+  })
+
+  test('summarises tool uses before the text, counting repeats in first-use order', () => {
+    expect(peekLines([msg('assistant', 'text', ['Bash', 'Read', 'Bash'])], 80, 5)).toEqual(['assistant: ⚙ Bash×2, Read · text'])
+    expect(peekLines([msg('assistant', '', ['Bash', 'Read', 'Bash'])], 80, 5)).toEqual(['assistant: ⚙ Bash×2, Read'])
+  })
+
+  test('cuts a long line to exactly the width, ending in an ellipsis', () => {
+    const [line] = peekLines([msg('assistant', 'x'.repeat(200), ['Edit'])], 40, 5)
+    expect(line).toHaveLength(40)
+    expect(line!.endsWith('…')).toBe(true)
+    expect(line!.startsWith('assistant: ⚙ Edit · x')).toBe(true)
+    expect(peekLines([msg('user', 'short')], 40, 5)).toEqual(['user: short'])
   })
 })
 
