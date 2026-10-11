@@ -100,6 +100,22 @@ Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.4*
 - **F17. Engine agent statuses** include `waiting`: "on background work it owns, … in a background subagent, on an Agent call alone" (`AgentStatus` T:537-545). The mod's own `AgentStatus` (types/index.d.ts:13) has no `waiting`. The parent link is `AgentRow.parentId`: `'main'`, an agent id, or undefined for main itself.
 - **F18. Reports are not delivered automatically.** The caller reports that in this build a background subagent's final text is not delivered to its parent, and the spawn result says "ended without delivering a report through SubagentHandback". Only `SendMessage` reached the orchestrator.
 
+### Check-in and auto-forward (amendment, decided D20 + D21)
+
+- **F19. A mod tool can be registered and served.**
+  - **Registering:** `$.tool.register({ name, description, inputSchema?, isDeferred? })` declares `mcp__<plugin>__<name>` "from the next prompt on". It "rejects until the session binds, at `session.start`" (T:3049-3058; `ToolSpec` T:13125-13150).
+  - **Deferral:** left out, `isDeferred` places the tool behind ToolSearch. `false` puts it in the prompt's tool list.
+  - **Serving:** a `tool.call` hook on `{ tool: 'mcp__orchestrator__checkin' }` returns the result; "a call no hook answers fails". That hook's `e.agentId` is the calling loop, or absent on main.
+  - **Versions:** the op `"tool.register"` is present in both B295 and B296 (8 occurrences each), as are `"session.send"` and `"session.append"`.
+  - **Subagent access is unverified:** that a subagent's tool list includes plugin tools is not stated in T. An agent with no restricted `tools` gets "every tool the parent has" (`AgentSpec.tools` T:461-465). See Escalations.
+- **F20. How an agent's end exposes its final answer.** `turn.complete` fires once per run of a subagent's loop. `e.agentId` identifies the subagent and is absent on main. `e.answer` is "the assistant's final visible text … For a subagent's run that handed its report back to its spawner, the report delivered". `e.reason` is `'answer'`, `'aborted'`, `'refusal'` or `'error'`. Sources: `TurnCompleteFields` T:13284-13320, and the event doc at T:4462-4471. The mod already routes this through `onAgentEnd($, id, answer)`.
+- **F21. Parent, main and teammates.**
+  - **Parent:** the mod stores `AgentRow.parentId = e.parentAgentId ?? 'main'` at `agent.spawn` (R, the `agent.spawn` hook). `parentAgentId` is "the id of the loop the spawn happens in …; absent from main" (T:313-321). So `parentId === 'main'` means the main thread is the parent.
+  - **Teammate:** `AgentSpawnInput.isTeammate?: true` is "present, and true, when the call starts a teammate" (T:336-342). `AgentInfo.teammateId` is set only for teammates (T:132-139). Today the mod sets `isTeammate` only on respawn (R `respawn`), so the `agent.spawn` hook must also record `e.isTeammate`.
+  - **Foreground versus background:** `AgentSpawnInput.background: boolean` (T:323-331). A foreground child's answer is the parent's Agent tool result, so it is delivered already.
+  - **SubagentHandback:** a report handed back through it is delivered to the spawner. The internal `handback: 'send'|'flagged'|'withheld'` on the Agent result is marked `@internal` (T:16814-16822), so the mod treats an observed `SubagentHandback` `tool.call` from the child with a successful result as reported.
+- **F22. A message reaches its addressee by name or id.** The `SendMessage` input is `{ to, message, summary? }`, where `to` is "a name from ListAgents, a teammate name, "main", or a background agent's agentId" (T:16625-16628). The mod sees a child's `SendMessage` as a `tool.call` with `e.tool === 'SendMessage'` and `e.agentId` set to the child.
+
 ## Decisions
 
 | # | Decision |
@@ -122,8 +138,9 @@ Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.4*
 | D16 | **Desktop status emoji** come from pure `statusEmoji(status, id)`. The emoji is placed before the dim status word in the row Button.<br>• `running`: `runnerFor(id)`, which is `🏃‍♂️` when `djb2(id)` is even and `🏃‍♀️` when it is odd. The choice is stable per agent and the same on every redraw and reload.<br>• `idle` 😴, `done` ✅, `stalled` 🛑, `handing-over` 📝 (writing its note), `replaced` ♻️.<br>The terminal keeps its single-width glyphs, because emoji widths break cell layout. |
 | D17 | **Pure code goes to `view.ts` and the new `detail.ts`. Wiring goes to `register.tsx`**, in three sequential tasks. `core.ts` is untouched. |
 | D18 | **`waiting` is a display status only.** Pure `displayStatus(row, rows)` returns `'waiting'` when `row.status === 'idle'` and some row with `parentId === row.id` has status `running`, `idle` or `handing-over`, applied recursively. A child that itself displays `waiting` is idle, so it already counts. Otherwise it returns `row.status`.<br>The type is `DisplayStatus = AgentStatus \| 'waiting'`, and it is **never stored**. Every handover, stall, sync and `canHandOver` check keeps reading `row.status`, so a waiting orchestrator is still `idle` for HANDOVER-as-message.<br>**Terminal:** glyph `◐`, `color 'planMode'` (teal, distinct from idle's faint orange and handing-over's blue), not dim.<br>**Desktop:** ⏳.<br>`statusStyle` and `statusEmoji` take `DisplayStatus`. The status word shows `waiting`. |
-| D19 | **Skill brief (item 5).** Orchestrators keep using background agents. Each spawn prompt must end with a persuasive, explicit report-back clause: *"Your final message is NOT delivered to me. Before you end, you MUST call SendMessage to `<orchestrator name>` with your full report; if you skip this, I never learn you finished and the run stalls."* The orchestrator names itself, so it must be spawned with a `name`.<br>For each spawn, the orchestrator estimates the task's duration and adds a buffer (max(10 min, 50%)), then arms a **single-shot check-in**. When the check-in fires and no report has arrived, the orchestrator checks the agent (`/orch roster`, the pane, or a SendMessage nudge). When the report arrives first, the check-in is ignored.<br>**Mechanism per F13 to F16:**<br>• A **main-session** orchestrator uses `CronCreate` with `recurring: false` and a pinned minute, and `CronDelete`s it on the report.<br>• A **subagent** orchestrator has no tool that wakes it. It relies on the mod check-in (D20) when Task 7 is approved. Until then the skill tells it so plainly: set no cron, and keep the report-back clause; the main session's cron is the backstop. |
-| D20 | **Mod check-in (optional Task 7; needs the user's design call).**<br>The mod registers a tool `mcp__orchestrator__checkin` `{ agent: name\|id, minutes: number }` in `session.start`, served by a `tool.call` hook. It records `checkinAt = now + minutes` on the child's row, and the parent is the calling loop's `e.agentId ?? 'main'`. Calling it again re-arms; `minutes: 0` cancels.<br>**Disarming:** the check-in is disarmed when the mod sees the child's `SendMessage` whose `to` names the parent (a `tool.call` on `SendMessage` from the child's loop), or when the parent's own report arrives some other way.<br>**Firing:** the existing 30 s `sync` fires a due check-in once.<br>• For a **subagent parent:** `$.session.send({ to: { agentId: parent }, text: '[orchestrator mod] check-in: <label> (id) has not reported after N min; status <displayStatus>, last active <hh:mm>.' })`. This wakes or resumes the parent (F16).<br>• For **main:** a toast plus `$.session.append` (the `tellParent` path).<br>The deadline lives in state (`AgentRow.checkinAt?`, `checkinBy?`), so it survives a reload.<br>**Alternative for the user to weigh:** the mod could forward a child's final answer to its parent automatically, as `onAgentEnd` already does for replacements. That removes the need for the report-back clause but duplicates any report the child did send. |
+| D19 | **Skill brief (item 5).** Orchestrators keep using background agents. Each spawn prompt must end with a persuasive, explicit report-back clause: *"Your final message is NOT delivered to me. Before you end, you MUST call SendMessage to `<orchestrator name>` with your full report; if you skip this, I never learn you finished and the run stalls."* The orchestrator names itself, so it must be spawned with a `name`.<br>For each spawn, the orchestrator estimates the task's duration and adds a buffer (max(10 min, 50%)), then arms a **single-shot check-in**. When the check-in fires and no report has arrived, the orchestrator checks the agent (`/orch roster`, the pane, or a SendMessage nudge). When the report arrives first, the check-in is ignored.<br>**Mechanism per F13 to F16:**<br>• A **main-session** orchestrator uses `CronCreate` with `recurring: false` and a pinned minute, and `CronDelete`s it on the report.<br>• A **subagent** orchestrator has no tool that wakes it. It relies on the mod: the `checkin` tool (D20, Task 7a) and auto-forward (D21, Task 7b). Amended per the user's decision; see Task 6. |
+| D20 | **Mod check-in: DECIDED, built in Task 7a.** The details below stand. Cancellation happens on an observed child→parent `SendMessage` (F22), on a delivered `SubagentHandback`, or when the child's turn ends. One deadline is kept per child, and calling again re-arms it. The ending "Alternative" is superseded by D21, which is also built.<br>(original text:) **Mod check-in.**<br>The mod registers a tool `mcp__orchestrator__checkin` `{ agent: name\|id, minutes: number }` in `session.start`, served by a `tool.call` hook. It records `checkinAt = now + minutes` on the child's row, and the parent is the calling loop's `e.agentId ?? 'main'`. Calling it again re-arms; `minutes: 0` cancels.<br>**Disarming:** the check-in is disarmed when the mod sees the child's `SendMessage` whose `to` names the parent (a `tool.call` on `SendMessage` from the child's loop), or when the parent's own report arrives some other way.<br>**Firing:** the existing 30 s `sync` fires a due check-in once.<br>• For a **subagent parent:** `$.session.send({ to: { agentId: parent }, text: '[orchestrator mod] check-in: <label> (id) has not reported after N min; status <displayStatus>, last active <hh:mm>.' })`. This wakes or resumes the parent (F16).<br>• For **main:** a toast plus `$.session.append` (the `tellParent` path).<br>The deadline lives in state (`AgentRow.checkinAt?`, `checkinBy?`), so it survives a reload.<br>**Alternative for the user to weigh:** the mod could forward a child's final answer to its parent automatically, as `onAgentEnd` already does for replacements. That removes the need for the report-back clause but duplicates any report the child did send. |
+| D21 | **Auto-forward (built in Task 7b).** When a child's run ends, `forwardTarget(row, rows)` decides whether the mod forwards `e.answer` to the child's **parent agent**. It skips when:<br>• the parent is `main` or undefined: the engine already notifies main of its background agents, and a mod-spawned replacement under main keeps today's `prompt.submit` path;<br>• the child is a teammate (`isTeammate`): the engine delivers its reply;<br>• the child is foreground (`background === false`): the answer is the parent's tool result;<br>• `reportedSince(row)`: the child sent `SendMessage` to its parent, or handed back successfully, after its spawn or after the parent's latest message to it;<br>• `e.reason !== 'answer'`, or the answer is empty after trimming;<br>• the row is `handing-over`: that branch of `onAgentEnd` never forwards.<br>Otherwise it forwards with `$.session.send({ to: { agentId: parentId } })`, which wakes or resumes the parent (F16), and stamps `reportedAt`. A failure is logged as a warning and never thrown.<br>The current replacement forward to a subagent parent is folded into this rule, so a replacement is forwarded once. |
 
 ## File scopes and ordering
 
@@ -135,10 +152,12 @@ Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.4*
 | 3 | `hooks/register.tsx`, `hooks/register.test.ts` | after 1b |
 | 4 | `hooks/register.tsx`, `hooks/register.test.ts`, `hooks/view.ts`, `hooks/view.test.ts` (legacy removal only), `types/index.d.ts` | after 3 |
 | 5 | `hooks/register.tsx`, `hooks/register.test.ts`, `types/index.d.ts` | after 4 and 2 |
-| 6 | `README.md`, `skills/orchestrated-run/SKILL.md` (D19 brief and the D18 status included), then `.claude-plugin/plugin.json` version **0.3.4** | docs in parallel at any time; the version bump is last, after 5 (and 7, if approved) is green |
-| 7 (optional, escalated) | `hooks/register.tsx`, `hooks/register.test.ts`, `types/index.d.ts`, plus a D19 wording tweak in SKILL.md and README | after 5, and only on the user's go-ahead (D20) |
+| 6 | `README.md`, `skills/orchestrated-run/SKILL.md` (D19 brief and the D18 status included), then `.claude-plugin/plugin.json` version **0.3.4** | docs in parallel at any time; the version bump is last, after 8 is green |
+| 7a | `hooks/register.tsx`, `hooks/register.test.ts`, `hooks/view.ts`, `hooks/view.test.ts` (the 7a/7b helpers only), `types/index.d.ts` | after 5 |
+| 7b | the same files | after 7a |
+| 8 | `hooks/view.ts`, `hooks/view.test.ts` (the collapse helpers), `hooks/register.tsx`, `hooks/register.test.ts`, `types/index.d.ts` | after 7b |
 
-**TDD is mandatory for Tasks 1, 1b, 2, 3, 4, 5 and 7.** For every behaviour: write the failing test first, run `claude plugin test .` and watch it fail for the expected reason, then implement until it passes. Pass this rule on to any sub-agent. Task 6 is content and exempt.
+**TDD is mandatory for Tasks 1, 1b, 2, 3, 4, 5, 7a, 7b and 8 (and 8F if triggered).** For every behaviour: write the failing test first, run `claude plugin test .` and watch it fail for the expected reason, then implement until it passes. Pass this rule on to any sub-agent. Task 6 is content and exempt.
 
 **Gates after every task:** `claude plugin test .` (count = previous + new, 0 fail), `claude plugin validate .`, and `npx -p typescript@5.6.3 tsc -p .`.
 
@@ -333,37 +352,176 @@ Leave `peekLines`, `peekView` and `Peek` in place; Task 4 removes them.
   - the terminal colours and the desktop emoji are listed.
 - **README "Develop":** mention `hooks/detail.ts`.
 - **SKILL.md §3 "Tools":** one clause saying that clicking a tool call in a transcript opens its detail. Also add the `waiting` status (idle with live children).
-- **SKILL.md, orchestrator brief (§2 checklist) and spawn guidance, per D19:**
-  - background agents stay;
-  - every spawn names the agent and ends with the persuasive SendMessage report-back clause (give the exact wording);
-  - the orchestrator itself must be spawned with a `name`;
-  - the single-shot check-in, with the estimate-plus-buffer rule;
-  - the mechanism per F13 to F16: main uses `CronCreate` with `recurring: false`; a subagent orchestrator cannot schedule its own wake-up, so it relies on the report-back clause and the main session's backstop, or on `checkin` once Task 7 ships;
-  - the check-in is ignored or cancelled (`CronDelete`) once the report arrives.
-- **README, "The orchestrated-run skill":** the same points in two or three sentences.
-- **Last, after Task 5 is green:** `.claude-plugin/plugin.json` `"version": "0.3.4"`. Rerun all gates.
+- **SKILL.md, orchestrator brief (§2 checklist) and spawn guidance, per D19 as amended:**
+  - Background agents stay.
+  - Every spawn names the agent. The orchestrator itself is spawned with a `name`.
+  - Each spawn prompt ends with the persuasive SendMessage report-back clause, kept as belt-and-braces. Give the exact wording, and have it say "message the orchestrator by name or id".
+  - After each spawn the orchestrator calls the mod's check-in tool, `mcp__orchestrator__checkin { agent, minutes }`. The minutes are its estimate of the task's duration plus a buffer of max(10 min, 50%). Calling it again re-arms the check-in. When the check-in message arrives, the orchestrator checks the agent.
+  - Note that the mod auto-forwards a background child's final answer to its parent when the child did not message the parent itself (D21), so no report is lost.
+  - A main-session orchestrator may also set a one-shot `CronCreate` with `recurring: false`, and `CronDelete` it on the report.
+- **README, "The orchestrated-run skill" and "What it does":** the same points in a few sentences: the check-in tool, auto-forwarding to the parent, and that reports no longer land in main.
+- **README "Visual" and SKILL.md §3:** double-click a row with children to collapse its finished descendants into `+N done`; live agents always stay visible.
+- **Last, after Task 8 is green:** `.claude-plugin/plugin.json` `"version": "0.3.4"`. Rerun all gates.
 
-### Task 7 (optional, escalated): mod check-in for subagent orchestrators (D20)
+### Tasks 7a and 7b: check-in and auto-forward (register.tsx; after Task 5, sequential, 7a then 7b)
 
-Run this task only on the user's go-ahead. TDD is mandatory.
+**Shared record (7a introduces it, 7b reuses it).** `AgentRow` gains these fields:
+- `background?: boolean`, from `agent.spawn`'s `e.background`;
+- `isTeammate` is now also set at spawn, from `e.isTeammate` (today it is set only on a respawn);
+- `instructedAt?: number`: the time of the spawn, or of the latest message from the parent to this child (an observed parent `SendMessage` whose `to` names the child, or the mod's own `$.session.send` to it);
+- `reportedAt?: number`: the time of the child's latest observed `SendMessage` to its parent, or of a delivered `SubagentHandback`;
+- `checkinAt?: number`, `checkinMins?: number` and `checkinBy?: string`.
 
-**Scope:**
-- `hooks/register.tsx` and `hooks/register.test.ts`;
-- `types/index.d.ts`: `AgentRow.checkinAt?: number` and `checkinBy?: string`;
-- a pure `checkinDue(rows, now)` and the message text in `view.ts` and `view.test.ts`.
+**Pure helpers (`view.ts`):**
+- `namesAgent(to: unknown, row): boolean` is true when `to` equals the row's id, its name or its `teammateId`, or is `'main'` for main;
+- `reportedSince(row) = (row.reportedAt ?? -1) >= (row.instructedAt ?? 0)`;
+- `checkinDue(rows, now)`;
+- `forwardTarget(row, rows)`, which returns `'skip'` or `{ agentId }` (D21).
 
-**Failing tests first:**
-1. Calling `mcp__orchestrator__checkin` from agent1's loop (`agentId: 'agent1'`, `{ agent: 'impl-2', minutes: 30 }`) stores `checkinAt` on agent2 and `checkinBy: 'agent1'`.
-2. Advancing 30 minutes and 30 s, the sync sends one `w.sent` entry to agent1 naming impl-2. Further syncs send nothing more.
-3. If agent2's `SendMessage` (a `tool.call` from agent2's loop with `to: 'agent1'`, or agent1's name) comes before the deadline, the check-in is disarmed and nothing is sent.
-4. With `checkinBy` set to main, the check-in toasts and appends instead of sending.
-5. `minutes: 0` cancels. An unknown agent answers an error text, and nothing is stored.
-6. A reload (re-register) keeps the deadline, and it still fires.
-7. The tool never blocks or alters the HANDOVER path: the existing `tool.call` HANDOVER tests stay green.
+### Task 7a: the check-in tool (D20, firm)
+
+**Implementation:**
+- In `session.start`: `await $.tool.register({ name: 'checkin', description, inputSchema: { agent: string, minutes: number }, isDeferred: false })`.
+- Serve it in a `tool.call` hook on `{ tool: 'mcp__orchestrator__checkin' }`. The hook returns its own result and never calls `next` (F19).
+- The caller is the parent: `e.agentId ?? 'main'`.
+- It resolves `agent` among that parent's children (by id, then by the latest live row with that name). It sets `checkinAt = now + minutes*60_000`, `checkinMins` and `checkinBy`. With `minutes <= 0` it clears them.
+- It answers in one line. An unknown agent answers an error, and nothing is stored.
+
+**Cancel:**
+- In the existing `tool.call` hook, after `next`, for `e.tool === 'SendMessage'` from a child's loop where `namesAgent(input.to, parentRow)`: set `reportedAt = now` and clear the check-in.
+- When the parent's loop sends `SendMessage` to a child, set the child's `instructedAt = now`.
+- When the child's turn ends (`onAgentEnd`), clear its check-in.
+- All of this runs inside a `try`, after HANDOVER attachment, and never alters `out`.
+
+**Fire:** in `sync`, for each `checkinDue` row, clear the check-in first, then:
+- if the parent is a subagent: `$.session.send({ to: { agentId: parent }, text })`;
+- if the parent is main: `tellParent`, which appends, plus a toast.
+
+The text is `[orchestrator mod] check-in: <label> (id <id>) has not reported after <N> min; status <displayStatus>, last active <hh:mm>. Check on it, or call checkin again to re-arm.`
+
+**Failing tests first** (`describe('check-in')`; stub `tool.register` in `world`):
+1. `session.start` registers `checkin` (the stub records it).
+2. A `$.tool.call` of `mcp__orchestrator__checkin` with `agentId: 'agent1'` and `{ agent: 'impl-2', minutes: 30 }`, where agent2 is a child of agent1, stores `checkinAt`, `checkinMins: 30` and `checkinBy: 'agent1'` in `state.json`. The result text names impl-2.
+3. After `clock.advance(30 min + SYNC_MS)`, `w.sent` gains exactly one entry to agent1 containing `check-in` and `impl-2`. Another sync adds none.
+4. agent2's `SendMessage` (`tool.call` from `agentId: 'agent2'` with `{ to: 'agent1' }`, and again with the parent's name) before the deadline means nothing is sent and `reportedAt` is set.
+5. agent2's `turn.complete` before the deadline means nothing is sent.
+6. Calling it again re-arms, so only the later deadline fires. `minutes: 0` cancels. An unknown agent gives an error result and no state change.
+7. A check-in set by main (no `agentId`) appends a session message and toasts instead of sending.
+8. A reload (a new `register`) keeps the deadline, and it still fires.
+9. The `tool.call` HANDOVER tests and the "never touches the handover path" tests stay green unmodified.
+
+### Task 7b: auto-forward a child's final answer to its parent (D21)
+
+**Implementation:** in `onAgentEnd`'s active branch, replace the replacement-only forward with `forwardTarget`. When it is not `'skip'`, send `[orchestrator mod] <label> (id <id>) finished; its final answer (auto-forwarded):\n\n<answer>` with `$.session.send({ to: { agentId: parentId } })`, then set `instructedAt = reportedAt = now`, so a resumed child's next answer is judged afresh.
+- The existing replacement path is the precedent (R `onAgentEnd`: `isOurs && !isTeammate && parentId !== undefined`). A replacement whose parent is **main** keeps today's `prompt.submit` forward, because the engine does not deliver a mod-spawned agent's answer to main. Its tests stay unchanged.
+- The handing-over branch is unchanged: a HANDOVER-ending answer is never forwarded.
+
+**Failing tests first** (`describe('auto-forward')`; spawn a child with `parentAgentId: 'agent1'` and `background: true`):
+1. A child ends with answer `R`, with no SendMessage seen: `w.sent` gains one entry to agent1 containing `R` and `auto-forwarded`.
+2. A child that sent `SendMessage` to agent1 after its spawn: nothing is forwarded.
+3. Then agent1 messages the child again (a `tool.call` SendMessage from agent1 naming the child), and the child ends again without reporting: it **is** forwarded.
+4. A child whose parent is main: nothing is sent (`w.sent` and `w.prompts` unchanged).
+5. A teammate child (spawn with `isTeammate: true`): nothing is forwarded.
+6. A foreground child (`background: false`): nothing is forwarded.
+7. A child with status `handing-over`: nothing is forwarded, and today's handover handling is unchanged.
+8. An empty answer, or `reason` other than `answer` (aborted or error): nothing is forwarded.
+9. A delivered `SubagentHandback` (a `tool.call` from the child with a result whose `success` is true): nothing is forwarded.
+10. A replacement whose parent is main still gets today's `prompt.submit` forward. A replacement under agent1 is forwarded exactly once (no double send from the old and new paths).
+11. A forward that fails (a `session.send` stub that throws or answers undelivered) is logged as a warning and does not throw out of `turn.complete`.
+
+### Task 8: collapse finished descendants on a double-click (after 7b)
+
+**Facts:**
+- **F23. There is no double-press API.**
+  - `Button.onPress` is `(e: UiPressArgument) => void` (T:1157-1167).
+  - `UiPressArgument` is `{ plugin, element, component, requestId, surface, link? }` (T:14210-14250). It has no click count, no detail and no timestamp.
+  - A grep of T for `double`, `clickCount` and `detail:` finds only one double-click mention. It is for Markdown links: "a press is a plain single click where the surface reports clicks (the fullscreen terminal): it … lands once no double-click followed" (T:5728-5730).
+  - That proves the engine knows about double-clicks on the terminal, but it says nothing about whether a Button's double-click arrives as two presses.
+  - **Consequence:** detect a double press in the mod, as two presses on the same key within 400 ms of `$.clock.now()`.
+- **F24. Main's children are rows with `parentId === 'main'`.** `orderRows` draws them as roots at depth 0, beside main (core.ts `orderRows`). The terminal draws main's name as plain `Text`, not a Button (agent-focus P5). The desktop draws it as `Button agent:main`.
+
+**Decisions:**
+- **D22. Collapse rule** (pure, `view.ts`):
+  - `childrenOf(rows, id)` returns the rows whose `parentId === id`. For main it also includes non-main rows with `parentId` undefined.
+  - `collapseHidden(rows, collapsed: readonly string[]): Set<string>`. For each collapsed id that names a present row, hide every descendant whose stored status is `done` or `replaced`, unless that descendant has a visible descendant. A finished agent with a live child stays, so the tree never orphans a live row.
+  - Nothing live (running, idle, waiting, handing-over, stalled) is ever hidden.
+  - A collapsed row inside a hidden subtree has no effect of its own.
+  - `hiddenCount(rows, id, hidden)` counts that row's hidden descendants.
+  - The `collapsed` state key lists row ids.
+  - Display only: `paneHeader`, sync, the roster, persistence and handover logic all read the full rows.
+- **D23. Drawing.**
+  - The tree and the chart use `visible = rows.filter(r => !hidden.has(r.id))`.
+  - `contextChart` gets `rows: visible`, but `colors: seriesColors(rows)` over all rows, so colours stay stable. The chart's time axis `t0` comes from all rows, so collapsing does not rescale it. `contextChart`'s `t0` reads `i.rows`, so add an optional `t0?: number` to `ChartInput` (a pure change with a `view.test.ts` test).
+  - The terminal timeline's `t0` is unchanged (all rows).
+  - A collapsed row with N > 0 hidden appends `+N done`. It is dim, inside the row Button on the desktop and after the name on the terminal.
+  - A selection or in-view id that names a hidden row draws nothing: `liveSelection(visible, …)`.
+- **D24. The trigger is a double-click, detected by the mod.**
+  - Pure `isDoublePress(last: { key, t } | undefined, key, now, ms = 400)`.
+  - Module-level `lastPress = { key, t, prevSelected }`. A reload resets it, which is harmless.
+  - The row Button's press runs top-level `pressAgent($, id)`:
+    1. `now = await $.clock.now()`.
+    2. **Double:** if `isDoublePress(lastPress, id, now)`, restore `selectedAgent` to `lastPress.prevSelected`, undoing the first click's toggle. If `childrenOf(rows, id)` is non-empty, toggle `id` in `collapsed`. Clear `lastPress`.
+    3. **Single:** otherwise remember `{ key: id, t: now, prevSelected: <selected before> }`, then run today's `toggleSelected($, id)`.
+  - So a single click still opens or closes the transcript at once. A double-click briefly opens it and the second click undoes it, so it nets to collapse only.
+  - A double-click on a row with no children nets to nothing.
+  - Two Enter presses within 400 ms count as a double. That is accepted.
+  - The **terminal main row becomes a `plain` Button** `agent:main`, holding the same cell, so main can be collapsed. A single click on main selects it, which only bolds it; no transcript opens for main, as today (P5).
+- **D25. Fallback, if the manual check shows a surface delivers no second press** (for example, the terminal swallows a double-click):
+  - On that surface only, a chevron `Button plain key="collapse:<id>"` labelled `▸` (collapsed) or `▾` (expanded) is drawn before every row that has children. It toggles `collapsed` directly.
+  - This is a follow-up commit with its own tests, listed below as 8F, and flagged in the PR.
+
+**Pure tests first** (`view.test.ts`, `describe('collapse')`):
+1. `childrenOf`: main's children are the `parentId: 'main'` rows. An orchestrator's are its own.
+2. `collapseHidden`:
+   - an orchestrator with two done children and one running child, collapsed, hides exactly the two done ones;
+   - not collapsed, it hides none;
+   - replaced children are hidden too.
+3. A done child with a running grandchild stays visible, and its own done children are hidden.
+4. A fully finished orchestrator (all descendants done or replaced), collapsed, hides all of them, leaving one row.
+5. Main collapsed hides done top-level agents, and keeps running and stalled ones.
+6. A stale collapsed id, or an id with no children, hides nothing. `hiddenCount` matches the hidden set.
+7. `isDoublePress`:
+   - the same key at 399 ms is true;
+   - the same key at 401 ms is false;
+   - a different key is false;
+   - `undefined` is false.
+8. `contextChart` with `t0` given uses it for the left axis label. Without it, it behaves as today.
+
+**Wiring tests first** (`register.test.ts`, `describe('collapse')`, both surfaces). Setup: agent1 (orchestrator, `parentId: 'main'`) with children agent2 done, agent3 done, and agent4 running (spawned with `parentAgentId: 'agent1'`). Presses go through `ui.press({ key: 'agent:agent1' })`, with `w.clock.advance` controlling the gap.
+1. Two presses with no clock advance:
+   - `agent2` and `agent3` rows are gone (`find({ key: 'agent:agent2' })` is undefined on the desktop, and the row Box is absent on the terminal), and `agent4` remains;
+   - agent1's row text contains `+2 done`;
+   - on the desktop, the Svg `source` has no path in agent2's or agent3's colour, and agent4's colour is unchanged;
+   - `selectedAgent` is back to `''`, and no `peek:agent1` is drawn.
+2. Two more presses with no advance expand it again: all rows are back and `+2 done` is gone.
+3. Two presses 500 ms apart act as two single clicks: the transcript opens, then closes, and nothing collapses.
+4. With a transcript already open on agent4, a double-click on agent1 collapses it and leaves agent4's transcript open: the selection is restored to its previous value.
+5. A double-click on childless agent4: no change in the rows, and the selection is unchanged.
+6. Main:
+   - on the terminal, `agent:main` exists;
+   - a double-click on main with all top-level agents done (the agent1 subtree finished) collapses the pane to the main row plus `+N done`;
+   - a running top-level agent stays visible.
+7. Finishing: once agent4 completes and sync marks it done, a collapsed agent1 shows `+3 done` and draws a single row.
+8. Display only:
+   - with agent1 collapsed, `paneHeader` counts are unchanged;
+   - `roster.md` and `state.json` still list agent2 and agent3;
+   - `handover:agent4` is still drawn and pressable.
+9. `collapsed` persists across a remount. `claude plugin validate .` lists `orchestrator.collapsed`.
+10. Existing tests stay green: the in-view, transcript, handover and chart-bounds tests.
+
+**8F (only if D25 triggers), failing tests first:**
+- on the affected surface, `collapse:agent1` exists only for rows with children;
+- its label is `▾`, and `▸` once pressed;
+- one press collapses;
+- the `agent:` press is single-click only there.
 
 ## Escalations and degradations
 
-- **Item 5 timer (design call needed).** No agent-callable tool wakes a **subagent** orchestrator. `CronCreate` fires into the main REPL only (F13); `ScheduleWakeup` is `/loop`-only and not available to subagents (F14); `RemoteTrigger` and `Monitor` don't fit (F15). The only working wake-up is mod-side `$.session.send` to the agent id (F16). The choice is between Task 7 (D20, the `checkin` tool) and auto-forwarding a child's final answer to its parent (the alternative in D20). Until the user decides, the skill tells subagent orchestrators to rely on the report-back clause.
+- **Double-click delivery is unverified (F23).** No API reports a double press, so the mod times two presses itself (D24). Whether the fullscreen terminal and the desktop's native buttons deliver both presses of a double-click is only known by hand. The manual check must try a double-click on both surfaces. If one fails, ship 8F (the chevron) for that surface and flag it.
+
+- **Item 5 timer: decided.** No agent-callable tool wakes a **subagent** orchestrator: `CronCreate` fires into the main REPL only (F13), `ScheduleWakeup` is `/loop`-only (F14), and `RemoteTrigger` and `Monitor` don't fit (F15). So the mod does it: Task 7a's `checkin` tool and Task 7b's auto-forward, both through `$.session.send` (F16).
+- **Plugin tools inside subagents are unverified (F19).** If a subagent orchestrator's tool list lacks `mcp__orchestrator__checkin` (for example, when its agent definition restricts `tools`), the auto-forward still covers reports, but there is no check-in. The manual check records whether a background orchestrator can call it. The skill says to add the tool to restricted `tools` lists.
+- **Main still gets the engine's own notifications** for its background agents (D21 skips them). "Reports stop landing in main" therefore holds for grandchildren: they now go to their orchestrator.
 
 - **No message timestamps in the API (F1).**
   - Times are what the mod observed: tool calls while loaded, step answers, and the brief.
