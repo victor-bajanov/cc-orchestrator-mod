@@ -52,8 +52,8 @@ export type AgentRow = {
   /** Spawned in the background (false: its answer is its parent's tool result). Absent when unknown. */
   background?: boolean
   /**
-   * This run's report to its parent, as last seen: a `SendMessage` naming the parent, or a
-   * `SubagentHandback`. `ok` when it succeeded; `final` while it is still the run's last tool call.
+   * This run's report to its parent, as last seen: a `SendMessage` naming the parent (a handback goes
+   * to main, so it is none). `ok` when it succeeded; `final` while it is still the run's last tool call.
    * Cleared when the run ends, so each run is judged on its own.
    */
   report?: { t: number; text: string; ok: boolean; final: boolean }

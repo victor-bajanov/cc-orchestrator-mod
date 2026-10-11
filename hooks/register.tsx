@@ -626,7 +626,7 @@ async function checkin($: $, agentId: string | undefined, args: Record<string, u
 }
 
 /**
- * After a subagent's tool call: a `SendMessage` naming its parent, or a `SubagentHandback`, is this
+ * After a subagent's tool call: a `SendMessage` naming its parent (or the parent's replacement) is this
  * run's report (kept with whether it succeeded) and disarms its check-in; any later call means the
  * report was not its last act. Called inside a `try`, after the HANDOVER is attached.
  */
@@ -637,7 +637,8 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
   const parentId = c.parentId ?? 'main'
   // Its parent as spawned, or the replacement now carrying that parent's work.
   const parents = [parentId, latest(rows, parentId)].map(p => rows.find(r => r.id === p) ?? { id: p })
-  const isReport = (tool === 'SendMessage' && parents.some(p => namesAgent(args.to, p))) || tool === 'SubagentHandback'
+  // A SubagentHandback is delivered to the main session, not the parent agent: it is no report to the parent.
+  const isReport = tool === 'SendMessage' && parents.some(p => namesAgent(args.to, p))
   if (isReport) {
     const out = res as { deny?: unknown; isError?: unknown; result?: unknown }
     const result = out.result && typeof out.result === 'object' ? (out.result as { success?: unknown }) : {}

@@ -2103,6 +2103,17 @@ describe('check-in', () => {
     })
   }
 
+  test('a handback alone does not disarm it', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+    await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
+    expect(row(w, 'agent2')!.checkinAt).toBeDefined()
+    await w.clock.advance(31 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+  })
+
   test("a SendMessage to someone else leaves it armed", async ($, on) => {
     const w = world(on)
     await family($, w)
@@ -2308,13 +2319,15 @@ describe('auto-forward', () => {
     expect(forwards(w)).toHaveLength(1)
   })
 
-  test('a delivered SubagentHandback is not forwarded again', async ($, on) => {
+  // A handback goes to the main session, not to the parent agent: it is no report to the parent.
+  test('a child that hands back, then ends with an answer, is still forwarded to its parent', async ($, on) => {
     const w = world(on)
     w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
     await kin($, w)
     await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
     await end($, 'agent2', 'Report')
-    expect(forwards(w)).toHaveLength(0)
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('Report')
   })
 
   test('each run is judged on its own: a resumed child that does not report is forwarded', async ($, on) => {
