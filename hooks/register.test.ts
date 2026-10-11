@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
+import { liveSelection } from './register'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
 const STATE = `${RUN_DIR}/state.json`
@@ -25,6 +26,8 @@ const world = (on: On) => {
     closed: [] as string[],
     /** The status line as last set. */
     status: undefined as string | undefined,
+    /** Makes the next main turn end fail beneath the plugin, once. */
+    failMainEnd: false,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -96,7 +99,13 @@ const world = (on: On) => {
       },
     }
   })
-  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('turn.complete', ($, e) => {
+    if (w.failMainEnd && e.agentId === undefined) {
+      w.failMainEnd = false
+      throw new Error('engine failed')
+    }
+    return { text: e.answer }
+  })
   on('tool.call', () => ({ result: 'ok' }) as never)
   return Object.assign(w, { session })
 }
@@ -424,22 +433,24 @@ describe('main thread', () => {
     expect(phase(w)).toBe('idle')
   })
 
-  test('in ask mode offers a button above the prompt instead of acting', { options: { mainThreshold: 100_000 } }, async ($, on) => {
-    const w = world(on)
-    await start($)
-    w.tokens.set('main', 150_000)
-    await step($)
-    await complete($, undefined)
-    await w.clock.advance(10)
-    expect(w.prompts).toHaveLength(0)
-    expect(phase(w)).toBe('offered')
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`in ask mode offers a button above the prompt instead of acting (${surface})`, { options: { mainThreshold: 100_000 } }, async ($, on) => {
+      const w = world(on)
+      await start($)
+      w.tokens.set('main', 150_000)
+      await step($)
+      await complete($, undefined)
+      await w.clock.advance(10)
+      expect(w.prompts).toHaveLength(0)
+      expect(phase(w)).toBe('offered')
 
-    const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'AbovePrompt', props: {} as never })
-    await ui.press({ key: 'handover' })
-    await w.clock.advance(10)
-    expect(w.prompts).toHaveLength(1)
-    expect(w.prompts[0]).toContain('main-1.md')
-  })
+      const ui = await $.ui.mount({ plugin: 'orchestrator', surface, component: 'AbovePrompt', props: {} as never })
+      await ui.press({ key: 'handover' })
+      await w.clock.advance(10)
+      expect(w.prompts).toHaveLength(1)
+      expect(w.prompts[0]).toContain('main-1.md')
+    })
+  }
 
   test('off mode never offers', { options: { mainHandover: 'off', mainThreshold: 100_000 } }, async ($, on) => {
     const w = world(on)
@@ -544,4 +555,226 @@ describe('pane', () => {
     expect(w.sent[0]!.text).toContain('HANDOVER')
     expect(row(w, 'agent1')!.status).toBe('handing-over')
   })
+})
+
+describe('desktop pane', () => {
+  const mountPane = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile', bodyColumns = 100) =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns } as never })
+
+  const running = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 300_000)
+    await step($, 'agent1')
+  }
+
+  test('the desktop draws an interactive chart; the terminal draws none', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const desk = await mountPane($, 'desktop')
+    const svg = await desk.find({ type: 'Svg' })
+    expect(svg).toBeDefined()
+    expect(String(svg!.props.alt)).toContain('impl-1')
+    expect(String(svg!.props.alt)).toContain('300k')
+    expect(svg!.props.isInteractive).toBe(true)
+    await desk.unmount()
+    const term = await mountPane($, 'terminal')
+    expect(await term.findAll({ type: 'Svg' })).toHaveLength(0)
+    expect(await term.findAll({ key: 'handover:agent1' })).toHaveLength(0)
+    await term.unmount()
+  })
+
+  test('pressing an agent selects its line; pressing again clears it', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    expect(String((await ui.find({ type: 'Svg' }))!.props.source)).toContain('stroke-width="3"')
+    await ui.press({ key: 'agent:agent1' })
+    expect(String((await ui.find({ type: 'Svg' }))!.props.source)).not.toContain('stroke-width="3"')
+    await ui.unmount()
+  })
+
+  // The kit cannot plant a stale selection (plugin state never crosses its hooks), so the guard is checked directly.
+  test('a selection naming an agent no longer listed selects nothing', async () => {
+    const rows = [{ id: 'agent1' }, { id: 'main' }] as AgentRow[]
+    expect(liveSelection(rows, 'ghost')).toBe('')
+    expect(liveSelection(rows, '')).toBe('')
+    expect(liveSelection(rows, 'agent1')).toBe('agent1')
+  })
+
+  test('Hand over main is hidden while the main handover is under way', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    expect(await ui.find({ key: 'handover:main' })).toBeUndefined()
+    await w.clock.advance(10)
+    await ui.unmount()
+  })
+
+  test('Hand over main pressed mid-turn waits for that turn to end', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await running($, w)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(0)
+    await complete($, undefined)
+    await w.clock.advance(10)
+    expect(w.toasts.some(t => t.includes('did not write'))).toBe(false)
+    expect(w.prompts).toHaveLength(1)
+    expect(w.prompts[0]).toContain('main-1.md')
+    expect(phase(w)).toBe('writing')
+    await ui.unmount()
+  })
+
+  test('a queued main handover shows on the desktop button, which then does nothing', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await running($, w)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    const ui = await mountPane($, 'desktop')
+    expect((await ui.find({ key: 'handover:main' }))!.props.label).toBe('Hand over main')
+    await ui.press({ key: 'handover:main' })
+    expect((await ui.find({ key: 'handover:main' }))!.props.label).toBe('Handover queued')
+    await ui.press({ key: 'handover:main' })
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(0)
+    await complete($, undefined)
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(1)
+    expect(row(w, 'main')!.handovers).toBe(1)
+    await ui.unmount()
+  })
+
+  test('the terminal band queues a handover pressed mid-turn and says so', { options: { mainThreshold: 100_000 } }, async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await start($)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    w.tokens.set('main', 150_000)
+    await step($)
+    expect(phase(w)).toBe('offered')
+    const band = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'AbovePrompt', props: {} as never })
+    expect((await band.find({ key: 'handover' }))!.props.label).toBe('Hand over & restart')
+    await band.press({ key: 'handover' })
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(0)
+    expect((await band.find({ key: 'handover' }))!.props.label).toBe('Handover queued')
+    await complete($, undefined)
+    await w.clock.advance(10)
+    expect(w.toasts.some(t => t.includes('did not write'))).toBe(false)
+    expect(w.prompts).toHaveLength(1)
+    expect(w.prompts[0]).toContain('main-1.md')
+    await band.unmount()
+  })
+
+  test('a main turn end that fails beneath still leaves main free to hand over', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await running($, w)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    w.failMainEnd = true
+    await complete($, undefined).catch(() => undefined)
+    expect(w.failMainEnd).toBe(false)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    expect(w.prompts).toHaveLength(1)
+    await ui.unmount()
+  })
+
+  test('a queued main handover still starts, and stops saying queued, when the turn end fails beneath', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await running($, w)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    expect((await ui.find({ key: 'handover:main' }))!.props.label).toBe('Handover queued')
+    w.failMainEnd = true
+    await complete($, undefined).catch(() => undefined)
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(1)
+    expect(w.prompts[0]).toContain('main-1.md')
+    expect((await ui.find({ key: 'handover:main' }))?.props.label).not.toBe('Handover queued')
+    await ui.unmount()
+  })
+
+  test('two quick presses of Hand over main start one handover', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await Promise.all([ui.press({ key: 'handover:main' }), ui.press({ key: 'handover:main' })])
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(1)
+    expect(row(w, 'main')!.handovers).toBe(1)
+    await ui.unmount()
+  })
+
+  test('a live agent has a Hand over button that hands it over; a done one has none', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    expect(await ui.find({ key: 'handover:agent1' })).toBeDefined()
+    await ui.press({ key: 'handover:agent1' })
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+    await complete($, 'agent1')
+    await complete($, 'agent1')
+    expect(row(w, 'agent1')!.status).toBe('done')
+    expect(await ui.find({ key: 'handover:agent1' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('Hand over main starts the main handover', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    await w.clock.advance(10)
+    expect(w.prompts[0]).toContain('main-1.md')
+    await ui.unmount()
+  })
+
+  test('no Hand over main when main handover is off', { options: { mainHandover: 'off' } }, async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    expect(await ui.find({ key: 'handover:main' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a long activity line expands in flow when pressed', async ($, on) => {
+    world(on)
+    await start($)
+    const name = 'a-rather-long-agent-name-that-will-not-fit-in-a-narrow-pane'
+    await spawn($, { prompt: 'P', name })
+    const ui = await mountPane($, 'desktop', 40)
+    const line = (await ui.findAll({ type: 'Button' })).find(b => b.text.includes('spawned'))!
+    expect(line).toBeDefined()
+    expect(line.text).toContain('…')
+    expect(await ui.find({ key: `full:${line.key}` })).toBeUndefined()
+    await ui.press({ key: line.key! })
+    expect((await ui.find({ key: `full:${line.key}` }))!.text).toContain(name)
+    await ui.press({ key: line.key! })
+    expect(await ui.find({ key: `full:${line.key}` })).toBeUndefined()
+
+    type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+    const walk = (n: unknown): Drawn[] =>
+      n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+    expect(walk(await ui.drawn()).some(b => b.type === 'Box' && b.props?.position === 'absolute')).toBe(false)
+    await ui.unmount()
+  })
+
+  for (const surface of ['vscode', 'mobile'] as const) {
+    test(`the pane draws on ${surface} with a chart`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      const ui = await mountPane($, surface)
+      expect(await ui.find({ type: 'Svg' })).toBeDefined()
+      await ui.unmount()
+    })
+  }
 })
