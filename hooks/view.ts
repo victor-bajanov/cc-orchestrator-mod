@@ -220,26 +220,39 @@ export const toolBrief = (tool: string, input: Record<string, unknown>): string 
  */
 export const transcriptItems = (
   messages: readonly SessionMessage[],
-  stampOf: (key: string) => number | undefined,
+  stampOf: (key: string) => number | readonly number[] | undefined,
   o: { n: number; chars: number; startedAt: number },
 ): TranscriptItem[] => {
   const groups: TranscriptItem[][] = []
   let count = 0
-  let nth: number[] | undefined
+  let occ: Occurrences | undefined
+  /** A single stamp, or the newest of a list. */
+  const one = (key: string): number | undefined => {
+    const s = stampOf(key)
+    return typeof s === 'number' ? s : s?.[s.length - 1]
+  }
+  /** Occurrence `n` of `total` of a text: a single stamp serves all; a list is aligned from the end. */
+  const nthStamp = (key: string, n: number, total: number): number | undefined => {
+    const s = stampOf(key)
+    if (s === undefined || typeof s === 'number') return s
+    return s[n - (total - s.length)]
+  }
   for (let i = messages.length - 1; i >= 0 && count < o.n; i--) {
     const m = messages[i]!
     const uses: readonly ToolUseSummary[] = m.toolUses
     const fallback = i === 0 && messages.length < MESSAGES_CAP ? o.startedAt : undefined
     const group: TranscriptItem[] = []
     if (oneLine(m.text) !== '') {
-      const key = textKey(m.role, m.text)
-      const t = stampOf(key) ?? (uses[0] ? stampOf(uses[0].tool_use_id) : undefined) ?? fallback
+      occ ??= occurrences(messages)
+      const key = occ.keyOf(i)
+      const n = occ.nth[i]!
+      const t = nthStamp(key, n, occ.total.get(key) ?? n + 1) ?? (uses[0] ? one(uses[0].tool_use_id) : undefined) ?? fallback
       const text = cleanBlock(m.text).trim()
       const capped = text.length > o.chars ? cut(text, o.chars) : text
-      group.push({ kind: 'text', key: `${key}#${(nth ??= occurrences(messages))[i]}`, ...(t !== undefined && { t }), role: m.role, text: capped })
+      group.push({ kind: 'text', key: `${key}#${n}`, ...(t !== undefined && { t }), role: m.role, text: capped })
     }
     for (const u of uses) {
-      const t = stampOf(u.tool_use_id) ?? fallback
+      const t = one(u.tool_use_id) ?? fallback
       group.push({
         kind: 'tool',
         key: `tool:${u.tool_use_id}`,
@@ -257,19 +270,28 @@ export const transcriptItems = (
   return groups.reverse().flat().slice(-o.n)
 }
 
+type Occurrences = { nth: number[]; total: Map<string, number>; keyOf: (i: number) => string }
+
 /**
- * Per message, how many earlier messages carry the same text key, counted over the
- * whole list in one pass, so a repeat's key stays put as the window slides.
+ * Per message, how many earlier messages carry the same text key, counted over the whole list in
+ * one pass so a repeat's key stays put as the window slides, and each key's total. A text's key is
+ * hashed once per distinct raw text, not once per message.
  */
-const occurrences = (messages: readonly SessionMessage[]): number[] => {
+const occurrences = (messages: readonly SessionMessage[]): Occurrences => {
+  const byRaw = new Map<string, string>()
   const seen = new Map<string, number>()
-  return messages.map(m => {
+  const keys: string[] = []
+  const nth = messages.map((m, i) => {
     if (m.text === '') return 0
-    const key = textKey(m.role, m.text)
+    const raw = `${m.role}\u0000${m.text}`
+    let key = byRaw.get(raw)
+    if (key === undefined) byRaw.set(raw, (key = textKey(m.role, m.text)))
+    keys[i] = key
     const k = seen.get(key) ?? 0
     seen.set(key, k + 1)
     return k
   })
+  return { nth, total: seen, keyOf: i => keys[i] ?? textKey(messages[i]!.role, messages[i]!.text) }
 }
 
 export type TranscriptLine = {
@@ -305,7 +327,11 @@ export const transcriptView = (
       const content = it.kind === 'text' ? it.text : `⚙ ${it.tool}${it.brief ? ` ${it.brief}` : ''}`
       const line = it.kind === 'text' ? oneLine(content) : content
       // Room for the markers drawn around a tool item: `✗ ` before it, ` (running)` after.
-      const room = it.kind === 'tool' ? Math.max(1, fits - (it.isError ? 2 : 0) - (it.isPending ? 10 : 0)) : fits
+      // A user text's `» ` takes two more.
+      const room =
+        it.kind === 'tool'
+          ? Math.max(1, fits - (it.isError ? 2 : 0) - (it.isPending ? 10 : 0))
+          : Math.max(1, fits - (it.role === 'user' ? 2 : 0))
       const isCut = line.length > room
       return {
         id: `step-${it.key}`,
@@ -530,7 +556,8 @@ export const forwardTarget = (
 ): 'skip' | { agentId: string; mayDuplicate: boolean } => {
   const parent = row.parentId
   if (parent === undefined || parent === 'main') return 'skip'
-  if (row.isTeammate || row.background === false) return 'skip'
+  // A replacement's own spawn was the mod's, so its answer reaches no one unless forwarded, foreground or not.
+  if (row.isTeammate || (row.background === false && row.replaces === undefined)) return 'skip'
   if (row.status === 'handing-over' || row.status === 'stalled') return 'skip'
   if (reason !== 'answer' || answer.trim() === '') return 'skip'
   const r = row.report

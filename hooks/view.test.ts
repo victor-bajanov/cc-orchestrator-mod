@@ -654,6 +654,20 @@ describe('transcriptItems stamps', () => {
     expect('t' in items[1]!).toBe(false)
   })
 
+  test('a repeated text takes its own stamp of several, aligned from the end', () => {
+    const key = textKey('assistant', 'same')
+    const msgs = [tmsg('user', 'brief'), tmsg('assistant', 'same'), tmsg('assistant', 'x'), tmsg('assistant', 'same')]
+    const both = transcriptItems(msgs, k => (k === key ? [100, 200] : undefined), opts0)
+    expect([both[1]!.t, both[3]!.t]).toEqual([100, 200])
+    // one stamp for two occurrences: the newest has it; the older was never seen
+    const one = transcriptItems(msgs, k => (k === key ? [200] : undefined), opts0)
+    expect(one[3]!.t).toBe(200)
+    expect('t' in one[1]!).toBe(false)
+    // a single number still stamps every occurrence
+    const all = transcriptItems(msgs, k => (k === key ? 300 : undefined), opts0)
+    expect([all[1]!.t, all[3]!.t]).toEqual([300, 300])
+  })
+
   test('a repeated identical text gets distinct keys', () => {
     const items = transcriptItems([tmsg('user', 'brief'), tmsg('assistant', 'same'), tmsg('assistant', 'same')], noStamps, opts0)
     const base = textKey('assistant', 'same')
@@ -670,6 +684,15 @@ describe('transcriptView', () => {
     role: 'assistant',
     text: 'hello',
     ...over,
+  })
+
+  test("a user text leaves room for its '» ' marker", () => {
+    const fits = 40 - 6
+    const user = transcriptView({ items: [text({ role: 'user', text: 'u'.repeat(fits) })] }, 40, 5) as { items: { short: string }[] }
+    expect(user.items[0]!.short.length).toBe(fits - 2)
+    expect(user.items[0]!.short.endsWith('…')).toBe(true)
+    const said = transcriptView({ items: [text({ text: 'a'.repeat(fits) })] }, 40, 5) as { items: { short: string }[] }
+    expect(said.items[0]!.short).toBe('a'.repeat(fits))
   })
 
   test('nothing read yet is loading; denied is the not-readable line; no items is nothing yet', () => {
@@ -829,6 +852,11 @@ describe('forwardTarget', () => {
   test('skips a run whose delivered report to the parent was its last act, or matches the answer', () => {
     expect(forwardTarget(child({ report: { t: 1, text: 'early', ok: true, final: true } }), 'R', 'answer')).toBe('skip')
     expect(forwardTarget(child({ report: { t: 1, text: 'All done: R', ok: true, final: false } }), 'All done: R', 'answer')).toBe('skip')
+  })
+
+  test('a replacement is forwarded even when it inherited foreground', () => {
+    expect(forwardTarget(child({ background: false, replaces: 'agent9' }), 'R', 'answer')).toEqual({ agentId: 'agent1', mayDuplicate: false })
+    expect(forwardTarget(child({ background: false, replaces: 'agent9', isTeammate: true }), 'R', 'answer')).toBe('skip')
   })
 
   test('forwards anyway, flagged, when the report failed, was not last and differs', () => {

@@ -1857,6 +1857,41 @@ describe('tool detail', () => {
     await ui.unmount()
   })
 
+  for (const how of ['step', 'sync'] as const) {
+    test(`an open call in flight is read again on each ${how} until it settles`, async ($, on) => {
+      const w = world(on)
+      let done = false
+      on('session.messages', () => said(done ? uses.b : { ...uses.b, text: undefined }))
+      const ui = await opened($, w, 'desktop')
+      await ui.press({ key: 'tool:agent1:b' })
+      await w.clock.settle()
+      done = true
+      if (how === 'step') await step($, 'agent1')
+      else {
+        w.agents = [{ id: 'agent1', name: 'impl-1' }]
+        await w.clock.advance(30_000)
+      }
+      await w.clock.settle()
+      const tool = await mountTool($)
+      expect((await codes(tool)).some(c => String(c.source).includes('PASS 3 tests'))).toBe(true)
+      await tool.unmount()
+      await ui.unmount()
+    })
+  }
+
+  test('terminal: a session that places no dialog gets the detail inline beneath the call', async ($, on) => {
+    const w = world(on)
+    w.placesTool = false
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'terminal')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    const inline = (await ui.find({ key: 'tooldetail:b' }))!
+    expect(inline).toBeDefined()
+    expect(inline.text).toContain('npm test')
+    await ui.unmount()
+  })
+
   test('desktop: a surface that places no dialog gets the detail inline beneath the call', async ($, on) => {
     const w = world(on)
     w.placesTool = false
@@ -2120,15 +2155,45 @@ describe('check-in', () => {
     expect(String(bad.result)).toMatch(/^checkin: minutes/)
   })
 
-  test('a check-in armed by main appends a message and toasts instead of sending', async ($, on) => {
+  test('a check-in armed by main is submitted as a prompt, which wakes main, and toasts', async ($, on) => {
     const w = world(on)
     await family($, w)
     await call($, undefined, CHECKIN, { agent: 'impl-1', minutes: 5 })
     expect(row(w, 'agent1')!.checkinBy).toBe('main')
     await w.clock.advance(6 * MIN)
     expect(w.sent.filter(m => m.text.includes('check-in'))).toHaveLength(0)
-    expect(JSON.stringify(w.session.appended())).toContain('check-in')
+    expect(w.prompts.filter(p => p.includes('check-in') && p.includes('impl-1'))).toHaveLength(1)
     expect(w.toasts.some(t => t.includes('check-in'))).toBe(true)
+  })
+
+  test('with autoRespawn off, a child that hands over is not checked in on', { options: { autoRespawn: false } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent2')!.status).toBe('replaced')
+    expect(w.spawns).toHaveLength(2)
+    await w.clock.advance(31 * 60_000)
+    expect(w.sent.filter(m => m.text.includes('check-in'))).toHaveLength(0)
+  })
+
+  test('a check-in survives a handover that needed a second end to write its note', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    // It ends before any tool result carried the HANDOVER: the message wakes it to write the note.
+    await complete($, 'agent2', 'stopped')
+    expect(w.sent.some(m => m.to.includes('agent2') && m.text.includes('HANDOVER'))).toBe(true)
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent3')).toEqual(expect.objectContaining({ replaces: 'agent2', checkinBy: 'agent1', checkinMins: 30 }))
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
   })
 
   test('a replacement inherits its predecessor check-in, and it still fires', async ($, on) => {
@@ -2329,6 +2394,21 @@ describe('auto-forward', () => {
     expect(forwards(w, 'agent3')).toHaveLength(1)
   })
 
+  test("a foreground child's replacement has its answer forwarded to the parent agent", async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1', background: false })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await end($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent3')!.replaces).toBe('agent2')
+    w.tokens.set('agent3', 1000)
+    await step($, 'agent3')
+    await end($, 'agent3', 'REAL RESULT')
+    expect(w.sent.filter(m => m.to.includes('agent1') && m.text.includes('REAL RESULT'))).toHaveLength(1)
+  })
+
   test('a report followed by a refused call is no longer the last act', async ($, on) => {
     const w = world(on)
     w.toolAnswer = e => (e.tool === 'Bash' ? { deny: 'not allowed' } : undefined)
@@ -2512,6 +2592,17 @@ describe('collapse', () => {
     await ui.unmount()
   })
 
+  test('two presses dispatched together still count as a double-click', async ($, on) => {
+    const w = world(on)
+    await crew($, w)
+    const ui = await mountPane($, 'desktop')
+    await Promise.all([ui.press({ key: 'agent:agent1' }), ui.press({ key: 'agent:agent1' })])
+    await w.clock.settle()
+    expect(await ui.find({ key: 'agent:agent2' })).toBeUndefined()
+    expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+    await ui.unmount()
+  })
+
   test('collapse is display only and persists across a remount', async ($, on) => {
     const w = world(on)
     await crew($, w)
@@ -2527,6 +2618,29 @@ describe('collapse', () => {
     expect(await ui.find({ key: 'agent:agent2' })).toBeUndefined()
     await ui.press({ key: 'handover:agent4' })
     expect(row(w, 'agent4')!.status).toBe('handing-over')
+    await ui.unmount()
+  })
+})
+
+describe('repeated answers', () => {
+  test('two identical answers show the times each was seen', async ($, on) => {
+    const w = world(on)
+    const said = { role: 'assistant', text: 'Still working', toolUses: [] }
+    on('session.messages', () => ({ value: [{ role: 'user', text: 'go', toolUses: [] }, said, said] as never }))
+    await running($, w)
+    w.answer = 'Still working'
+    await w.clock.advance(5 * 60_000)
+    const t1 = w.clock.now()
+    await step($, 'agent1')
+    await w.clock.advance(5 * 60_000)
+    const t2 = w.clock.now()
+    await step($, 'agent1')
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    const text = (await ui.find({ key: 'transcript:agent1' }))!.text
+    expect(text).toContain(`${hhmm(t1)} Still working`)
+    expect(text).toContain(`${hhmm(t2)} Still working`)
     await ui.unmount()
   })
 })
