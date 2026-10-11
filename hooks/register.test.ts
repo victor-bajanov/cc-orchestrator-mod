@@ -840,3 +840,81 @@ describe('desktop pane', () => {
     })
   }
 })
+
+describe('agent in view', () => {
+  /** The pane as the host draws it with `view` set beside it: the agent opened from the tasks list, or main. */
+  const mountViewed = ($: Engine, surface: 'terminal' | 'desktop', view?: { agentId?: string }) =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns: 100, view } as never })
+  const source = async (ui: Awaited<ReturnType<typeof mountViewed>>) => String((await ui.find({ type: 'Svg' }))!.props.source)
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  /** Each terminal row's name cell (a Text keeps no key, so it is found as the first child of the row's Box). */
+  const names = async (ui: Awaited<ReturnType<typeof mountViewed>>) =>
+    new Map(
+      walk(await ui.drawn())
+        .filter(b => b.type === 'Box' && typeof b.props?.key === 'string' && /^(main|agent\d+)$/.test(b.props.key as string))
+        .map(b => [b.props!.key as string, (b.children![0] as Drawn).props ?? {}]),
+    )
+
+  test('desktop: the agent in view is marked and its line highlighted', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountViewed($, 'desktop', { agentId: 'agent1' })
+    expect(await source(ui)).toContain('stroke-width="3"')
+    expect(await ui.find({ text: /in view/ })).toBeDefined()
+    expect((await ui.find({ key: 'agent:agent1' }))!.text).toContain('in view')
+    await ui.unmount()
+  })
+
+  test('desktop: a click selection wins the highlight; the in-view mark stays put', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2' })
+    await step($, 'agent2')
+    const ui = await mountViewed($, 'desktop', { agentId: 'agent1' })
+    await ui.press({ key: 'agent:agent2' })
+    const src = await source(ui)
+    expect(src.match(/stroke-width="3"/g)).toHaveLength(1)
+    expect(src).toContain('stroke="#E69F00" stroke-width="3"')
+    expect(src).toContain('stroke="#0072B2" stroke-width="1.5" opacity="0.3"')
+    expect((await ui.find({ key: 'agent:agent1' }))!.text).toContain('in view')
+    expect((await ui.find({ key: 'agent:agent2' }))!.text).not.toContain('in view')
+    await ui.unmount()
+  })
+
+  test('terminal: the agent in view has its name inverted; main does not', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await step($)
+    const ui = await mountViewed($, 'terminal', { agentId: 'agent1' })
+    const cells = await names(ui)
+    expect(cells.get('agent1')!.inverse).toBe(true)
+    expect(cells.get('main')!.inverse).toBeFalsy()
+    await ui.unmount()
+  })
+
+  const unmarked: [string, { agentId?: string } | undefined][] = [
+    ['no view', undefined],
+    ['a view naming an unknown agent', { agentId: 'ghost' }],
+    ['the main conversation in view', {}],
+  ]
+  for (const [what, view] of unmarked) {
+    for (const surface of ['terminal', 'desktop'] as const) {
+      test(`${what} marks nothing (${surface})`, async ($, on) => {
+        const w = world(on)
+        await running($, w)
+        await step($)
+        const ui = await mountViewed($, surface, view)
+        expect(await ui.find({ text: /in view/ })).toBeUndefined()
+        if (surface === 'desktop') expect(await source(ui)).not.toContain('stroke-width="3"')
+        else {
+          const cells = [...(await names(ui)).values()]
+          expect(cells).toHaveLength(2)
+          expect(cells.some(c => c.inverse)).toBe(false)
+        }
+        await ui.unmount()
+      })
+    }
+  }
+})
