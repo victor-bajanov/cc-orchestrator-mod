@@ -144,6 +144,14 @@ let lastPress: { key: string; t: number; prevSelected: string } | undefined
 /** Row presses, one at a time in the order they came. */
 let pressQueue: Promise<void> = Promise.resolve()
 /**
+ * The mod's sends in flight. Under auto mode the engine judges a plugin's `$.session.send` as a
+ * SendMessage call, and the classifier refuses it because no user request asked for it. tool.check
+ * allows exactly these sends, and only while they are in flight.
+ */
+const ownSends: { agentId: string; text: string }[] = []
+/** A SendMessage check went unmatched while the mod had a send in flight, and was logged: once per load. */
+let checkMissLogged = false
+/**
  * When the mod saw each transcript entry, per agent: a call's `tool_use_id` → ms, or a text's
  * `textKey` → each time it was seen, oldest first (a repeated text takes its own). Module-level,
  * so lost on reload; an entry it never saw draws `--:--`.
@@ -546,7 +554,7 @@ async function deliverHandover($: $, id: string, why: string, text: string) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   // Rechecked at delivery: a tool result may have carried it since it was queued, or the agent been replaced.
   if (r?.status !== 'handing-over' || r.handoverVia !== undefined) return false
-  const sent = await $.session.send({ to: { agentId: id }, text })
+  const sent = await sendOwn($, id, text)
   if (sent.isDelivered) {
     const now = await $.clock.now()
     await update($, agentsAtom, l => patch(l, id, { handoverVia: 'message', handoverAt: now }))
@@ -559,11 +567,34 @@ async function deliverHandover($: $, id: string, why: string, text: string) {
   return sent.isDelivered
 }
 
+/** A value for a debug line: a string as it is, anything else as JSON (or String when that fails), cut at 80. */
+function debugValue(v: unknown) {
+  let s: string
+  try {
+    s = typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v))
+  } catch {
+    s = String(v)
+  }
+  return s.slice(0, 80)
+}
+
+/** The mod's only way to send: marks the send as its own for tool.check while it is in flight. */
+async function sendOwn($: $, agentId: string, text: string) {
+  const mark = { agentId, text }
+  ownSends.push(mark) // synchronously, before any await
+  try {
+    return await $.session.send({ to: { agentId }, text })
+  } finally {
+    const i = ownSends.indexOf(mark)
+    if (i >= 0) ownSends.splice(i, 1)
+  }
+}
+
 async function tellParent($: $, parentId: string | undefined, text: string) {
   if (parentId === undefined || parentId === 'main') {
     await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
   } else {
-    await $.session.send({ to: { agentId: parentId }, text })
+    await sendOwn($, parentId, text)
   }
 }
 
@@ -761,8 +792,7 @@ async function drain($: $) {
       continue
     }
     try {
-      void $.session
-        .send({ to: { agentId: d.agentId }, text: d.text })
+      void sendOwn($, d.agentId, d.text)
         .then(
           sent => (sent.isDelivered ? undefined : log($, `${d.what} (${sent.reason})`, 'warn')),
           err => log($, `${d.what}: ${String(err)}`, 'warn'),
@@ -1018,6 +1048,8 @@ export const register: Register = (on, options) => {
   toolReads.again.clear()
   lastPress = undefined
   pressQueue = Promise.resolve()
+  ownSends.length = 0
+  checkMissLogged = false
   draining = false
   nudgedSinceDrain = false
 
@@ -1203,6 +1235,34 @@ export const register: Register = (on, options) => {
     await peekIfSelected($, e.agentId)
     await toolIfOpen($, e.agentId, e.tool_use_id)
     return out
+  })
+
+  // The mod's own sends (Hand over, a forwarded report, a check-in) are SendMessage calls to the engine;
+  // under auto mode the classifier refuses them, since no user request asked. Allow exactly those, while in flight.
+  on('tool.check', { tool: 'SendMessage' }, async ($, e, next) => {
+    try {
+      const input = (e.input ?? {}) as { to?: unknown; message?: unknown }
+      if (typeof input.message === 'string' && ownSends.length > 0) {
+        const rows = await read($, agentsAtom)
+        const to = input.to
+        const mine = ownSends.some(s => {
+          if (s.text !== input.message) return false
+          if (typeof to === 'object' && to !== null) return (to as { agentId?: unknown }).agentId === s.agentId
+          const r = rows.find(a => a.id === s.agentId) ?? { id: s.agentId }
+          return namesAgent(to, r)
+        })
+        if (mine) return { decision: 'allow', reason: 'orchestrator mod: its own message' }
+      }
+      if (ownSends.length > 0 && !checkMissLogged) {
+        checkMissLogged = true
+        $.ui.log(
+          `orchestrator: SendMessage check not matched: to=${debugValue(input.to)} message=${debugValue(input.message)}`,
+        )
+      }
+    } catch {
+      // fall through to the engine's verdict
+    }
+    return next(e)
   })
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.

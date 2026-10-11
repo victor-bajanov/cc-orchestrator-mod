@@ -56,6 +56,18 @@ const world = (on: On) => {
     writes: [] as string[],
     /** While set, the engine's turn.step and tool.call beneath the plugin wait on it. */
     holdNext: undefined as Promise<void> | undefined,
+    /** Auto mode: each session.send first asks tool.check for SendMessage, and a verdict other than allow refuses it. */
+    /** Each `$.ui.log` line. */
+    logs: [] as string[],
+    checkSends: false,
+    /** The test's own engine, for checks from inside a hook: a hook's `$` may call only what the plugin's module calls. */
+    engine: undefined as Engine | undefined,
+    /** The verdict each checked send got, in order. */
+    checks: [] as string[],
+    /** Runs inside each session.send, after its own check: `check` asks tool.check about any SendMessage. */
+    duringSend: undefined as
+      | ((check: (input: { to: unknown; message: unknown }) => Promise<string>, e: { to: string; text: string }) => Promise<unknown>)
+      | undefined,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -65,7 +77,16 @@ const world = (on: On) => {
   on('session.root', () => ({ value: '/repo' }))
   on('agent.list', () => ({ value: w.agents as never }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  on('session.send', ($, e) => {
+  on('session.send', async ($, e) => {
+    if (w.checkSends) {
+      const check = async (input: { to: unknown; message: unknown }) =>
+        (await w.engine!.tool.check({ tool: 'SendMessage', input } as never)).decision
+      const verdict = await check({ to: e.to, message: e.text })
+      w.checks.push(verdict)
+      await w.duringSend?.(check, { to: e.to, text: e.text })
+      if (verdict !== 'allow')
+        return { isDelivered: false, reason: 'The server-side auto mode classifier gave no verdict for SendMessage' } as never
+    }
     if (w.inTimer) w.timerSends.push(e.text)
     if (w.hangNext) {
       w.hangNext = false
@@ -109,6 +130,10 @@ const world = (on: On) => {
     const text = w.files.get(e.path)
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: text }
+  })
+  on('ui.log', ($, e) => {
+    w.logs.push(e.text)
+    return { value: undefined }
   })
   on('ui.toast', ($, e) => {
     w.toasts.push(e.text)
@@ -198,6 +223,13 @@ const complete = ($: Engine, agentId: string | undefined, answer = 'done') =>
   $.turn.complete({ answer, durationMs: 5, isAborted: false, turnId: 'T', agentId, reason: 'answer' })
 
 type World = ReturnType<typeof world>
+
+/** Auto mode: the engine's own verdict for a SendMessage is `ask` (the classifier), beneath the plugin. */
+const autoMode = ($: Engine, on: On, w: World) => {
+  w.checkSends = true
+  w.engine = $
+  on('tool.check', () => ({ decision: 'ask' }))
+}
 const snapshot = (w: World): { agents: AgentRow[]; mainPhase: string } =>
   JSON.parse(w.files.get(STATE) ?? '{"agents":[],"mainPhase":"idle"}')
 const row = (w: World, id: string) => snapshot(w).agents.find(r => r.id === id)
@@ -3047,5 +3079,185 @@ describe('deliveries from a turn end go through the outbox', () => {
     expect((JSON.parse(write!) as { agents: AgentRow[] }).agents.find(a => a.id === 'agent1')!.handoverAt).toBeUndefined()
     expect(w.sent.filter(m => m.to.includes('agent1') && m.text.includes('HANDOVER'))).toHaveLength(1)
     expect(row(w, 'agent1')).toEqual(expect.objectContaining({ handoverVia: 'message', handoverAt: ended }))
+  })
+})
+
+describe("auto mode: the mod's own sends", () => {
+  /** agent1 (impl-1) idle, so a Hand over sends its HANDOVER as a message. */
+  const idle = async ($: Engine, w: World) => {
+    await running($, w)
+    await complete($, 'agent1')
+  }
+  const undelivered = (w: World) =>
+    w.toasts.some(t => t.includes('could not be delivered')) || (w.files.get(STATE) ?? '').includes('could not be delivered')
+
+  test('Hand over on an idle agent is allowed and delivered (desktop)', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await idle($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:agent1' })
+    expect(w.checks).toEqual(['allow'])
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('HANDOVER'))).toBe(true)
+    expect(row(w, 'agent1')).toEqual(expect.objectContaining({ status: 'handing-over', handoverVia: 'message' }))
+    expect(undelivered(w)).toBe(false)
+    await ui.unmount()
+  })
+
+  test('the same message checked outside a send is ask', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await idle($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:agent1' })
+    expect(w.checks).toEqual(['allow'])
+    const after = await $.tool.check({ tool: 'SendMessage', input: { to: 'agent1', message: w.sent.at(-1)!.text } } as never)
+    expect(after.decision).toBe('ask')
+    await ui.unmount()
+  })
+
+  test('a different recipient during the mod\'s send is ask', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2' })
+    await step($, 'agent2')
+    await complete($, 'agent1')
+    const probes: string[] = []
+    w.duringSend = async (check, e) => probes.push(await check({ to: 'agent2', message: e.text }))
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:agent1' })
+    expect(probes).toEqual(['ask'])
+    expect(w.checks).toEqual(['allow'])
+    await ui.unmount()
+  })
+
+  test("the agent's name and a different text", async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await idle($, w)
+    const probes: string[] = []
+    w.duringSend = async (check, e) => {
+      probes.push(await check({ to: 'impl-1', message: e.text }))
+      probes.push(await check({ to: 'agent1', message: `${e.text} ` }))
+      probes.push(await check({ to: 'agent1', message: { type: 'shutdown_request' } }))
+      probes.push(await check({ to: { agentId: 'agent1' }, message: e.text }))
+    }
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:agent1' })
+    expect(probes).toEqual(['allow', 'ask', 'ask', 'allow'])
+    await ui.unmount()
+  })
+
+  test('a forwarded report and a queued check-in are allowed too', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await step($, 'agent2')
+    await complete($, 'agent2', 'R: green')
+    await w.clock.settle()
+    expect(w.sent.filter(m => m.text.includes('R: green'))).toHaveLength(1)
+    expect(w.checks.length).toBeGreaterThan(0)
+    expect(w.checks.every(c => c === 'allow')).toBe(true)
+  })
+
+  test('a respawn tells the parent through an allowed send', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await family($, w)
+    await call($, 'agent1', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    await w.clock.settle()
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('agent3') && m.text.includes('handed over'))).toBe(true)
+    expect(w.checks.length).toBeGreaterThan(0)
+    expect(w.checks.every(c => c === 'allow')).toBe(true)
+  })
+
+  test('a send that throws still clears its mark', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await idle($, w)
+    w.sendFails = 'throw'
+    let text = ''
+    w.duringSend = async (_check, e) => {
+      text = e.text
+    }
+    await $.command.run({ command: 'orch', args: 'handover impl-1' } as never).catch(() => undefined)
+    expect(w.checks).toEqual(['allow'])
+    expect(text).toContain('HANDOVER')
+    const after = await $.tool.check({ tool: 'SendMessage', input: { to: 'agent1', message: text } } as never)
+    expect(after.decision).toBe('ask')
+  })
+
+  test('the check hook never throws', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await idle($, w)
+    expect((await $.tool.check({ tool: 'SendMessage', input: null } as never)).decision).toBe('ask')
+    expect((await $.tool.check({ tool: 'SendMessage', input: { to: 42 } } as never)).decision).toBe('ask')
+  })
+})
+
+describe("auto mode: the mod's own sends, review fixes", () => {
+  test('an unmatched check with an object `to` logs the object, not [object Object]', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await running($, w)
+    await complete($, 'agent1')
+    const probes: string[] = []
+    w.duringSend = async (check, e) => probes.push(await check({ to: { agentId: 'x' }, message: e.text }))
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:agent1' })
+    expect(probes).toEqual(['ask'])
+    const line = w.logs.find(l => l.includes('SendMessage check not matched'))
+    expect(line).toBeDefined()
+    expect(line).toContain('"x"')
+    expect(line).not.toContain('[object Object]')
+    await ui.unmount()
+  })
+
+  test('two identical concurrent sends: after one settles, a check during the other is still allow', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await family($, w)
+    // two identical check-ins queued for agent1: armed, fired, re-armed, fired again with nothing changed
+    await call($, 'agent1', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * 60_000)
+    await call($, 'agent1', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * 60_000)
+    let release!: () => void
+    const gate = new Promise<void>(r => {
+      release = r
+    })
+    let calls = 0
+    let firstSettled!: Promise<unknown>
+    const late: string[] = []
+    w.duringSend = async (check, e) => {
+      calls += 1
+      if (calls !== 1) return
+      // the first send waits until the second has settled, then checks again
+      await gate
+      await firstSettled
+      late.push(await check({ to: 'agent1', message: e.text }))
+    }
+    const drained = $.command.run({ command: 'orch', args: 'roster' } as never)
+    firstSettled = (async () => {
+      while (calls < 2) await w.clock.advance(1)
+      await w.clock.settle()
+    })()
+    await firstSettled
+    release()
+    await drained
+    await w.clock.settle()
+    const checkins = w.sent.filter(m => m.to.includes('agent1') && m.text.includes('check-in'))
+    expect(checkins).toHaveLength(2)
+    expect(checkins[0]!.text).toBe(checkins[1]!.text)
+    expect(late).toEqual(['allow'])
+    expect(w.checks).toEqual(['allow', 'allow'])
   })
 })
