@@ -279,6 +279,22 @@ describe('peekLines', () => {
     expect(peekLines([msg('assistant', '', ['Bash', 'Read', 'Bash'])], 80, 5)).toEqual(['assistant: ⚙ Bash×2, Read'])
   })
 
+  test('reads backwards and stops once n lines are drawable, keeping them in order', () => {
+    const boom = (): SessionMessage =>
+      Object.defineProperty({ role: 'assistant', toolUses: [] }, 'text', {
+        get() {
+          throw new Error('older messages must not be read')
+        },
+      }) as unknown as SessionMessage
+    const all = [boom(), boom(), boom(), msg('user', 'four'), msg('assistant', 'five')]
+    expect(peekLines(all, 80, 2)).toEqual(['user: four', 'assistant: five'])
+  })
+
+  test('strips ANSI escapes and control characters from the text and the tool names', () => {
+    expect(peekLines([msg('assistant', '\x1b[31mred\x1b[0m done\x07')], 80, 5)).toEqual(['assistant: red done'])
+    expect(peekLines([msg('assistant', 'ok', ['\x1b[1mBash\x1b[0m\x07'])], 80, 5)).toEqual(['assistant: ⚙ Bash · ok'])
+  })
+
   test('cuts a long line to exactly the width, ending in an ellipsis', () => {
     const [line] = peekLines([msg('assistant', 'x'.repeat(200), ['Edit'])], 40, 5)
     expect(line).toHaveLength(40)
