@@ -20,13 +20,13 @@ import {
   timeline,
   wrapFill,
 } from './core'
+import { LIVE, chartWidthPx, contextChart, logId, paneHeader, seriesColors } from './view'
 
 type $ = EngineInterface
 
 const PANE = 'orchestrator'
 const SYNC_MS = 30_000
 const STALL_MS = 20 * 60_000
-const LIVE: readonly AgentStatus[] = ['running', 'idle', 'handing-over']
 
 const agentsAtom = atom({ plugin: 'orchestrator', key: 'agents' } as const, [] as AgentRow[])
 const logAtom = atom({ plugin: 'orchestrator', key: 'log' } as const, [] as LogEntry[])
@@ -34,6 +34,8 @@ const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'i
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 /** The activity line whose full-text card a click pinned open ('' for none). */
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
+/** The agent whose chart line the desktop pane highlights ('' for none). */
+const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
 
 const patch = (rows: AgentRow[], id: string, change: Partial<AgentRow>) =>
   rows.map(r => (r.id === id ? { ...r, ...change } : r))
@@ -46,6 +48,19 @@ const cfg = {
   injectClause: true,
   runRoot: '',
 }
+
+/** The context limit a row is held to: main's or the subagents'. */
+const ceilingOf = (r: AgentRow) => (r.id === 'main' ? cfg.mainThreshold : cfg.agentThreshold)
+
+/** A subagent that can be handed over now: running or idle. */
+const canHandOver = (r: AgentRow) => r.id !== 'main' && (r.status === 'running' || r.status === 'idle')
+
+/** An activity line cut to `fits` characters, ending in an ellipsis. */
+const cut = (text: string, fits: number) => `${text.slice(0, Math.max(1, fits - 1))}…`
+
+/** The selection, or '' when it names no row (so a stale one fades no line). */
+export const liveSelection = (rows: readonly AgentRow[], selected: string) =>
+  rows.some(r => r.id === selected) ? selected : ''
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
@@ -113,11 +128,21 @@ async function persist($: $) {
   )
 }
 
+// ---- pane presses ----------------------------------------------------
+
+function togglePinned($: $, id: string) {
+  return update($, pinnedAtom, p => (p === id ? '' : id))
+}
+
+function toggleSelected($: $, id: string) {
+  return update($, selectedAtom, s => (s === id ? '' : id))
+}
+
 // ---- subagents -------------------------------------------------------
 
 async function startHandover($: $, id: string, why: string) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
-  if (!r || r.id === 'main' || !(r.status === 'running' || r.status === 'idle')) return false
+  if (!r || !canHandOver(r)) return false
   const attempt = (r.handovers ?? 0) + 1
   const notePath = notePathFor(await runDir($), r, attempt)
   const now = await $.clock.now()
@@ -403,7 +428,7 @@ export const register: Register = (on, options) => {
               'warn',
             )
           }
-        } else if (r && (r.status === 'running' || r.status === 'idle')) {
+        } else if (r && canHandOver(r)) {
           await startHandover($, id, `at ${fmtTokens(tokens)} ≥ ${fmtTokens(cfg.agentThreshold)}`)
         }
       }
@@ -466,7 +491,7 @@ export const register: Register = (on, options) => {
     }
     if (verb === 'handover') {
       const rows = await read($, agentsAtom)
-      const live = rows.filter(a => a.id !== 'main' && (a.status === 'running' || a.status === 'idle'))
+      const live = rows.filter(canHandOver)
       const r = live.find(a => a.id === target) ?? live.filter(a => a.name === target).at(-1)
       if (!r) return { text: `No live agent named or with id "${target}".` }
       const ok = await startHandover($, r.id, 'by /orch')
@@ -495,19 +520,122 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
     const rows = await read($, agentsAtom)
     const pinned = await read($, pinnedAtom)
     const entries = await read($, logAtom)
     const phase = await read($, phaseAtom)
     const cols = e.props.bodyColumns ?? e.viewport?.columns ?? 80
     const now = await $.clock.now()
+    const header = paneHeader(rows, {
+      agentThreshold: cfg.agentThreshold,
+      mainThreshold: cfg.mainThreshold,
+      mainMode: cfg.mainMode,
+      phase,
+    })
+    const hhmm = (t: number) => new Date(t).toISOString().slice(11, 16)
+    const tone = { ok: 'success', warn: 'warning', hot: 'error' } as const
+
+    if (e.surface !== 'terminal') {
+      // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
+      const { Box, Button, Text, Svg } = $.ui.resolve(e)
+      const selected = liveSelection(rows, await read($, selectedAtom))
+      const colors = seriesColors(rows)
+      const chart = contextChart({
+        rows,
+        now,
+        width: chartWidthPx(cols),
+        height: 180,
+        agentThreshold: cfg.agentThreshold,
+        mainThreshold: cfg.mainThreshold,
+        colors,
+        selected,
+      })
+      const canHandMain = cfg.mainMode !== 'off' && phase !== 'writing' && phase !== 'clearing'
+      const fits = cols - 6
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Box flexDirection="row" flexWrap="wrap" gap={1}>
+            <Text bold>{header}</Text>
+            {canHandMain && (
+              <Button
+                key="handover:main"
+                variant="secondary"
+                label="Hand over main"
+                onPress={() => startMainHandover($)}
+              />
+            )}
+          </Box>
+          {rows.length === 0 ? (
+            <Text dimColor>No model requests yet.</Text>
+          ) : (
+            <Svg key="chart" isInteractive source={chart.source} alt={chart.alt} width={chart.width} height={chart.height} />
+          )}
+          <Box flexDirection="column">
+            {orderRows(rows).map(({ row, depth }) => {
+              const ceiling = ceilingOf(row)
+              const pct = Math.round((row.tokens / ceiling) * 100)
+              return (
+                <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
+                  <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
+                    <Text color={colors.get(row.id)}>● </Text>
+                    <Text bold={selected === row.id}>{label(row)} </Text>
+                    <Text color={tone[level(row.tokens, ceiling)]}>
+                      {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
+                    </Text>
+                    <Text dimColor>{row.status}</Text>
+                  </Button>
+                  {canHandOver(row) && (
+                    <Button
+                      key={`handover:${row.id}`}
+                      variant="secondary"
+                      label="Hand over"
+                      onPress={() => startHandover($, row.id, 'from the pane')}
+                    />
+                  )}
+                </Box>
+              )
+            })}
+          </Box>
+          <Box flexDirection="column">
+            <Text bold>Activity</Text>
+            {entries.length === 0 && <Text dimColor>Nothing yet.</Text>}
+            {entries.slice(-50).map((l, i) => {
+              const color = l.level === 'warn' ? 'warning' : undefined
+              if (l.text.length <= fits) {
+                return (
+                  <Text key={`l${i}`} color={color} wrap="wrap">
+                    <Text dimColor>{hhmm(l.t)} </Text>
+                    {l.text}
+                  </Text>
+                )
+              }
+              const id = logId(l)
+              return (
+                <Box key={`l${i}`} flexDirection="column">
+                  <Button key={id} plain onPress={() => togglePinned($, id)}>
+                    <Text dimColor>{hhmm(l.t)} </Text>
+                    <Text color={color}>{cut(l.text, fits)}</Text>
+                  </Button>
+                  {pinned === id && (
+                    <Box key={`full:${id}`} borderStyle="round" flexDirection="column">
+                      <Text color={color} wrap="wrap">
+                        {l.text}
+                      </Text>
+                    </Box>
+                  )}
+                </Box>
+              )
+            })}
+          </Box>
+        </Box>
+      )
+    }
+
+    const { Box, Button, Text } = $.ui.resolve(e)
     const NAME = Math.min(24, Math.max(12, Math.floor(cols * 0.25)))
     const width = Math.max(8, cols - NAME - 7 - 14)
     const t0 = rows.reduce((m, r) => Math.min(m, r.startedAt), now)
     const ordered = orderRows(rows)
-    const subs = rows.filter(r => r.id !== 'main')
-    const hhmm = (t: number) => new Date(t).toISOString().slice(11, 16)
     const glyph: Record<AgentStatus, string> = {
       running: '●',
       idle: '○',
@@ -516,18 +644,13 @@ export const register: Register = (on, options) => {
       done: '✓',
       stalled: '!',
     }
-    const tone = { ok: 'success', warn: 'warning', hot: 'error' } as const
     const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8)
     return (
       <Box flexDirection="column">
-        <Text bold>
-          {subs.filter(r => LIVE.includes(r.status)).length} live · {subs.filter(r => r.status === 'replaced').length}{' '}
-          handed over · limits {fmtTokens(cfg.agentThreshold)} / main {fmtTokens(cfg.mainThreshold)} ({cfg.mainMode}
-          {phase !== 'idle' ? `, ${phase}` : ''})
-        </Text>
+        <Text bold>{header}</Text>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
         {ordered.map(({ row, depth }) => {
-          const ceiling = row.id === 'main' ? cfg.mainThreshold : cfg.agentThreshold
+          const ceiling = ceilingOf(row)
           const live = LIVE.includes(row.status)
           const name = `${'  '.repeat(depth)}${glyph[row.status]} ${label(row)}`
           return (
@@ -562,15 +685,15 @@ export const register: Register = (on, options) => {
             )
           }
           // Too long: cut with an ellipsis; the full text shows in a card above while hovered, or pinned by a click.
-          const id = `log-${l.t}-${l.text.length}`
+          const id = logId(l)
           // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
           const inner = Math.max(10, cols - 4)
           const wrapped = wrapFill(l.text, inner)
           return (
             <Box key={`l${i}`}>
-              <Button key={id} plain onPress={() => update($, pinnedAtom, p => (p === id ? '' : id))}>
+              <Button key={id} plain onPress={() => togglePinned($, id)}>
                 <Text dimColor>{hhmm(l.t)} </Text>
-                <Text color={color}>{`${l.text.slice(0, Math.max(1, fits - 1))}…`}</Text>
+                <Text color={color}>{cut(l.text, fits)}</Text>
               </Button>
               <Box
                 position="absolute"
