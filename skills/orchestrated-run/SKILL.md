@@ -65,11 +65,11 @@ Hard ceiling 500k tokens per agent; the mod acts at `agentThreshold` (450k).
 
 **Rosters.** The orchestrator's task roster (`<scratchpad>/<task>/roster.md`): one line per agent with name, id, role, task and status. It maps agents to roles. The mod's run roster (`.orchestrator/<run>/roster.md`, also `/orch roster`) has each agent's status, context, peak, note path and replaced-by links.
 
-**Tools:** `/orch` opens the pane (agent tree, context over time, activity log) and `/orch close` closes it; `/orch handover <name or id>` hands an agent over now; `/orch handover` restarts the main session.
+**Tools:** `/orch` opens the pane (agent tree, context over time, activity log) and `/orch close` closes it; `/orch handover <name or id>` hands an agent over now; `/orch handover` restarts the main session. In the desktop app the pane shows a context chart, a `Hand over` button beside each live subagent and a `Hand over main` button, which do what `/orch handover` does, so `/orch` is optional there.
 
 ## 4. Main session while it runs
 
-- Wait for notifications; don't read agent transcripts into your context (they're huge). `/orch roster` or the pane is the cheap progress check.
+- Wait for notifications; don't read agent transcripts into your context (they're huge). `/orch roster` or the pane (in the desktop app, the pane) is the cheap progress check.
 - `[orchestrator mod]` notices about the orchestrator's children are for its roster; the main session needs to act only when its own child (the orchestrator) was replaced: from then on, address the replacement by the name the notice gives.
 - Relay the orchestrator's escalations to the user; never answer them on the user's behalf.
 - When the orchestrator reports, check `git log` on the branch and summarise for the user.

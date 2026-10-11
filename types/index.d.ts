@@ -60,6 +60,10 @@ declare module 'claude-code' {
       mainPhase: MainPhase
       runId: string
       pinnedLog: string
+      /** The agent whose chart line the desktop pane highlights ('' for none). */
+      selectedAgent: string
+      /** A main handover asked for mid-turn, waiting for that turn to end. */
+      mainQueued: boolean
     }
   }
 }
