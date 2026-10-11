@@ -44,31 +44,40 @@ export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 1
 /** An activity line cut to `fits` characters, ending in an ellipsis. */
 export const cut = (text: string, fits: number): string => `${text.slice(0, Math.max(1, fits - 1))}…`
 
+/** Text safe for one pane line: ANSI escapes and control characters removed. */
+const clean = (s: string): string =>
+  s.replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+
 /** `Bash×2, Read`: each tool once, in first-use order, with its count past one. */
 const toolSummary = (uses: SessionMessage['toolUses']): string => {
   const counts = new Map<string, number>()
-  for (const u of uses) counts.set(u.tool, (counts.get(u.tool) ?? 0) + 1)
+  for (const u of uses) {
+    const tool = clean(u.tool)
+    counts.set(tool, (counts.get(tool) ?? 0) + 1)
+  }
   return [...counts].map(([tool, n]) => (n > 1 ? `${tool}×${n}` : tool)).join(', ')
 }
 
 /**
  * An agent's last `n` messages, one line each, for the pane's transcript peek:
- * `role: ⚙ tools · text`, whitespace collapsed, cut to `width`. Messages with no
- * text and no tool use (a user row of tool results alone) are left out.
+ * `role: ⚙ tools · text`, whitespace collapsed, escapes and control characters
+ * stripped, cut to `width`. Messages with no text and no tool use (a user row of
+ * tool results alone) are left out. It reads from the end and stops once it has
+ * `n` lines, so a long transcript costs only its tail; the lines come oldest first.
  */
-export const peekLines = (messages: readonly SessionMessage[], width: number, n: number): string[] =>
-  messages
-    .map(m => {
-      const text = m.text.replace(/\s+/g, ' ').trim()
-      const tools = m.toolUses.length ? `⚙ ${toolSummary(m.toolUses)}` : ''
-      return { m, body: [tools, text].filter(Boolean).join(' · ') }
-    })
-    .filter(x => x.body !== '')
-    .slice(-n)
-    .map(({ m, body }) => {
-      const line = `${m.role}: ${body}`
-      return line.length > width ? cut(line, width) : line
-    })
+export const peekLines = (messages: readonly SessionMessage[], width: number, n: number): string[] => {
+  const out: string[] = []
+  for (let i = messages.length - 1; i >= 0 && out.length < n; i--) {
+    const m = messages[i]!
+    const text = clean(m.text.replace(/\s+/g, ' ')).trim()
+    const tools = m.toolUses.length ? `⚙ ${toolSummary(m.toolUses)}` : ''
+    const body = [tools, text].filter(Boolean).join(' · ')
+    if (body === '') continue
+    const line = `${m.role}: ${body}`
+    out.push(line.length > width ? cut(line, width) : line)
+  }
+  return out.reverse()
+}
 
 /** The context limit a row is held to: main's for main, the agents' otherwise. */
 export const ceilingOf = (r: AgentRow, t: { agentThreshold: number; mainThreshold: number }): number =>
