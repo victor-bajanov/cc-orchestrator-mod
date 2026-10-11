@@ -52,10 +52,10 @@ export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }
 
 /**
  * An agent's transcript tail as the pane last read it, off the render: its lines
- * (cleaned, uncut), or `denied` when the read was refused, failed or timed out.
- * `t` is when the read settled.
+ * (cleaned, each capped), or `denied` when no read has given lines (refused,
+ * failed or timed out).
  */
-export type Peek = { lines: string[]; t: number } | { denied: true; t: number }
+export type Peek = { lines: string[] } | { denied: true }
 
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
 
