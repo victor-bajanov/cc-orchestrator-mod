@@ -488,13 +488,25 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     // Main's turn is over whatever happens beneath: a failing `next` must not leave it marked busy.
-    if (e.agentId === undefined) mainBusy = false
-    const res = await next(e)
+    // A handover queued mid-turn starts even then, so it is taken off the queue before `next` too.
+    const queued = e.agentId === undefined && mainHandoverQueued
+    if (e.agentId === undefined) {
+      mainBusy = false
+      mainHandoverQueued = false
+    }
+    let res: Awaited<ReturnType<typeof next>>
+    try {
+      res = await next(e)
+    } catch (err) {
+      if (queued) {
+        await update($, queuedAtom, () => false)
+        $.clock.after(0, () => void startMainHandover($))
+      }
+      throw err
+    }
     try {
       if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer)
       else {
-        const queued = mainHandoverQueued
-        mainHandoverQueued = false
         if (queued) await update($, queuedAtom, () => false)
         const phase = await read($, phaseAtom)
         if (queued && phase !== 'writing' && phase !== 'clearing') {
