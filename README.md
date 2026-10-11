@@ -53,6 +53,7 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 - the agent open in the main view is marked *in view* and its line highlighted, unless you clicked another
 - a `Hand over` button beside each live subagent, and a `Hand over main` button in the header (hidden unless `mainHandover` is `ask`, and while main is handing over)
 - an activity log; a line too long for the pane ends in `…`, and clicking it expands the full text beneath it
+- a `⧉` beside each agent, each expanded activity or transcript card, and each section of a tool call's detail copies its text (a toast says whether it took). Today's desktop app may answer `Not copied (no-clipboard)` until it supports plugin copies. Nothing else in a desktop pane can be selected. The terminal has no `⧉`: select its text as usual
 
 VS Code and the mobile app get the desktop pane.
 

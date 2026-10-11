@@ -56,9 +56,15 @@ const world = (on: On) => {
     writes: [] as string[],
     /** While set, the engine's turn.step and tool.call beneath the plugin wait on it. */
     holdNext: undefined as Promise<void> | undefined,
-    /** Auto mode: each session.send first asks tool.check for SendMessage, and a verdict other than allow refuses it. */
     /** Each `$.ui.log` line. */
     logs: [] as string[],
+    /** `ui.log` throws while set. */
+    logFails: false,
+    /** Each `ui.copy` as asked. */
+    copies: [] as { text: string; surface?: string }[],
+    /** How `ui.copy` answers: copied, a refusal reason, or a throw. */
+    copyFails: '' as '' | 'no-clipboard' | 'throw',
+    /** Auto mode: each session.send first asks tool.check for SendMessage, and a verdict other than allow refuses it. */
     checkSends: false,
     /** The test's own engine, for checks from inside a hook: a hook's `$` may call only what the plugin's module calls. */
     engine: undefined as Engine | undefined,
@@ -132,12 +138,18 @@ const world = (on: On) => {
     return { value: text }
   })
   on('ui.log', ($, e) => {
+    if (w.logFails) throw new Error('log broke')
     w.logs.push(e.text)
     return { value: undefined }
   })
   on('ui.toast', ($, e) => {
     w.toasts.push(e.text)
     return { value: undefined }
+  })
+  on('ui.copy', ($, e) => {
+    if (w.copyFails === 'throw') throw new Error('clipboard broke')
+    w.copies.push({ text: e.text, surface: e.surface })
+    return { value: w.copyFails ? { isCopied: false, reason: w.copyFails } : { isCopied: true } } as never
   })
   on('ui.status', ($, e) => {
     w.status = e.text
@@ -3293,5 +3305,155 @@ describe("auto mode: the mod's own sends, review fixes", () => {
     expect(checkins[0]!.text).toBe(checkins[1]!.text)
     expect(late).toEqual(['allow'])
     expect(w.checks).toEqual(['allow', 'allow'])
+  })
+})
+
+describe('copy', () => {
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  const copyKeys = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('copy:'))
+  const brief = { role: 'user', text: 'Implement task 1', toolUses: [] }
+  const LONG = `Long thoughts: ${'the plan has many parts and each needs care. '.repeat(12)}END`
+  const bashUse = { tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS 3 tests' }
+  const said = (...toolUses: unknown[]) => ({ value: [brief, { role: 'assistant', text: '', toolUses }] as never })
+  const opened = async ($: Engine, w: World, surface: 'terminal' | 'desktop', cols = 100) => {
+    await running($, w)
+    const ui = await mountPane($, surface, cols)
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    return ui
+  }
+  const mountTool = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator-tool', props: { bodyColumns: 100 } as never })
+
+  test('each desktop agent row has a copy control that copies its name and id', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await step($)
+    const ui = await mountPane($, 'desktop')
+    expect(await ui.find({ key: 'copy:agent:main' })).toBeDefined()
+    expect(await ui.find({ key: 'copy:agent:agent1' })).toBeDefined()
+    await ui.press({ key: 'copy:agent:agent1' })
+    await w.clock.settle()
+    expect(w.copies).toEqual([{ text: 'impl-1 (agent1)', surface: 'desktop' }])
+    expect(w.toasts).toContain('Copied')
+    await ui.press({ key: 'copy:agent:main' })
+    await w.clock.settle()
+    expect(w.copies[1]!.text).toBe('main thread (main)')
+    await ui.unmount()
+  })
+
+  test('the terminal draws no copy control', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => ({ value: [brief, { role: 'assistant', text: LONG, toolUses: [] }] as never }))
+    await spawn($, { prompt: 'P', name: 'a-rather-long-agent-name-that-will-not-fit-in-a-narrow-pane' })
+    const ui = await opened($, w, 'terminal', 40)
+    expect(await ui.find({ key: 'transcript:agent1' })).toBeDefined()
+    const step = (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
+    await ui.press({ key: step.key! })
+    expect(await copyKeys(ui)).toHaveLength(0)
+    const line = (await ui.findAll({ type: 'Button' })).find(b => b.text.includes('spawned'))!
+    expect(line).toBeDefined()
+    await ui.press({ key: line.key! })
+    expect(await copyKeys(ui)).toHaveLength(0)
+    await ui.unmount()
+  })
+
+  test('a copy that fails while logging is broken still toasts', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    w.copyFails = 'throw'
+    w.logFails = true
+    await ui.press({ key: 'copy:agent:agent1' })
+    await w.clock.settle()
+    expect(w.toasts[w.toasts.length - 1]).toBe('Not copied')
+    await ui.unmount()
+  })
+
+  test('a pinned activity card has a copy control for its full text', async ($, on) => {
+    const w = world(on)
+    await start($)
+    const name = 'a-rather-long-agent-name-that-will-not-fit-in-a-narrow-pane'
+    await spawn($, { prompt: 'P', name })
+    const ui = await mountPane($, 'desktop', 40)
+    const line = (await ui.findAll({ type: 'Button' })).find(b => b.text.includes('spawned'))!
+    expect(await ui.find({ key: `copy:${line.key}` })).toBeUndefined()
+    await ui.press({ key: line.key! })
+    await ui.press({ key: `copy:${line.key}` })
+    await w.clock.settle()
+    expect(w.copies[0]!.text).toContain(name)
+    await ui.unmount()
+  })
+
+  test('an expanded transcript text has a copy control for its full text', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => ({ value: [brief, { role: 'assistant', text: LONG, toolUses: [] }] as never }))
+    const ui = await opened($, w, 'desktop', 80)
+    const button = (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
+    expect(await ui.find({ key: `copy:${button.key}` })).toBeUndefined()
+    await ui.press({ key: button.key! })
+    await ui.press({ key: `copy:${button.key}` })
+    await w.clock.settle()
+    expect(w.copies[0]!.text).toContain('END')
+    expect(w.copies[0]!.text).toContain('Long thoughts:')
+    await ui.unmount()
+  })
+
+  test('each tool-detail section has a copy control (desktop dialog)', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(bashUse))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    let tool = await mountTool($, 'desktop')
+    await tool.press({ key: 'copy:sec:b:0' })
+    await w.clock.settle()
+    await tool.press({ key: 'copy:sec:b:1' })
+    await w.clock.settle()
+    expect(w.copies.map(c => c.text)).toEqual(['npm test', 'PASS 3 tests'])
+    await tool.unmount()
+    tool = await mountTool($, 'terminal')
+    expect(await copyKeys(tool)).toHaveLength(0)
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('the inline detail on a desktop that places no dialog has the same controls', async ($, on) => {
+    const w = world(on)
+    w.placesTool = false
+    on('session.messages', () => said(bashUse))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(await ui.find({ key: 'copy:sec:b:0' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('the inline detail on the terminal has no copy controls', async ($, on) => {
+    const w = world(on)
+    w.placesTool = false
+    on('session.messages', () => said(bashUse))
+    const ui = await opened($, w, 'terminal')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(await ui.find({ key: 'tooldetail:b' })).toBeDefined()
+    expect(await copyKeys(ui)).toHaveLength(0)
+    await ui.unmount()
+  })
+
+  test('a copy that fails says why and never throws', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    w.copyFails = 'no-clipboard'
+    await ui.press({ key: 'copy:agent:agent1' })
+    await w.clock.settle()
+    expect(w.toasts).toContain('Not copied (no-clipboard)')
+    w.copyFails = 'throw'
+    await ui.press({ key: 'copy:agent:agent1' })
+    await w.clock.settle()
+    expect(w.toasts[w.toasts.length - 1]).toBe('Not copied')
+    expect(w.logs.some(l => l.includes('copy failed'))).toBe(true)
+    await ui.unmount()
   })
 })

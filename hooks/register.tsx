@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
 import { toolDetail } from './detail'
@@ -242,6 +242,31 @@ async function toggleSelected($: $, id: string) {
   if ((await read($, selectedAtom)) === id) schedulePeek($, id)
 }
 
+/** Copies to the pressing surface's clipboard and says so in a toast. Never throws. */
+async function copyText($: $, text: string, surface: RenderSurface) {
+  try {
+    const r = await $.ui.copy({ text, surface })
+    $.ui.toast(r.isCopied ? 'Copied' : `Not copied (${r.reason})`)
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: copy failed: ${String(err)}`)
+    } catch {
+      // The toast still says it.
+    }
+    try {
+      $.ui.toast('Not copied')
+    } catch {
+      // Nothing more to do.
+    }
+  }
+}
+
+/** The one copy control: a small plain Button, keyed `copy:<id>`, desktop only (the terminal selects natively). */
+function copyButton($: $, ui: Ui, id: string, text: string) {
+  const { Button } = ui
+  return <Button key={`copy:${id}`} plain dimColor label="⧉" onPress={e => void copyText($, text, e.surface)} />
+}
+
 /** Collapses or expands a row's finished descendants. */
 function toggleCollapsed($: $, id: string) {
   return update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
@@ -444,8 +469,11 @@ async function toolIfOpen($: $, agentId: string | undefined, toolUseId: string |
 
 type Ui = ReturnType<$['ui']['resolve']>
 
-/** A tool call's detail as elements: header, then each section labelled (D11). No `$`: it only draws. */
-function detailBody(ui: Ui, d: ToolDetail) {
+/**
+ * A tool call's detail as elements: header, then each section labelled (D11). With `copy`, each label has a
+ * copy control (`copy:sec:<toolUseId>:<i>`); `$` serves only that control's press.
+ */
+function detailBody($: $, ui: Ui, d: ToolDetail, copy?: { toolUseId: string }) {
   const { Box, Text, Code, Markdown } = ui
   return (
     <Box flexDirection="column" gap={1}>
@@ -456,9 +484,12 @@ function detailBody(ui: Ui, d: ToolDetail) {
       </Text>
       {d.sections.map((sec, i) => (
         <Box key={`s${i}`} flexDirection="column">
-          <Text dimColor bold>
-            {sec.label}
-          </Text>
+          <Box flexDirection="row" gap={1}>
+            <Text dimColor bold>
+              {sec.label}
+            </Text>
+            {copy && copyButton($, ui, `sec:${copy.toolUseId}:${i}`, sec.kind === 'code' ? sec.source : sec.text)}
+          </Box>
           {sec.kind === 'code' ? (
             <Code
               source={sec.source}
@@ -478,11 +509,11 @@ function detailBody(ui: Ui, d: ToolDetail) {
   )
 }
 
-/** What the dialog shows for the open call: its detail, or one dim line. */
-function toolBody(ui: Ui, v: ToolView | null) {
+/** What the dialog shows for the open call: its detail (with copy controls when `copyable`), or one dim line. */
+function toolBody($: $, ui: Ui, v: ToolView | null, copyable: boolean) {
   const { Text } = ui
   if (!v) return <Text dimColor>No tool call selected.</Text>
-  if (v.detail) return detailBody(ui, v.detail)
+  if (v.detail) return detailBody($, ui, v.detail, copyable ? { toolUseId: v.toolUseId } : undefined)
   if (v.denied) return <Text dimColor>tool call not readable (teammate in another pane, or finished)</Text>
   return <Text dimColor>loading…</Text>
 }
@@ -1380,7 +1411,7 @@ export const register: Register = (on, options) => {
     const v = await read($, toolViewAtom)
     return (
       <Box flexDirection="column" gap={1}>
-        {toolBody(ui, v)}
+        {toolBody($, ui, v, e.surface !== 'terminal')}
         <Button key="close" role="dismiss" label="Close" onPress={() => closeTool($)} />
       </Box>
     )
@@ -1489,7 +1520,7 @@ export const register: Register = (on, options) => {
             <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
               {button}
               <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
-                {toolBody(ui, tv)}
+                {toolBody($, ui, tv, true)}
               </Box>
             </Box>
           )
@@ -1514,6 +1545,7 @@ export const register: Register = (on, options) => {
             </Button>
             {pinned === pin && (
               <Box key={`full:${pin}`} borderStyle="round" flexDirection="column">
+                {copyButton($, ui, pin, it.full)}
                 <Text wrap="wrap">{it.full}</Text>
               </Box>
             )}
@@ -1562,6 +1594,7 @@ export const register: Register = (on, options) => {
                     <Text dimColor>{shows}</Text>
                     {viewed === row.id && <Text dimColor> · in view</Text>}
                   </Button>
+                  {copyButton($, ui, `agent:${row.id}`, label(row) === row.id ? row.id : `${label(row)} (${row.id})`)}
                   {canHandOver(row) && (
                     <Button
                       key={`handover:${row.id}`}
@@ -1602,6 +1635,7 @@ export const register: Register = (on, options) => {
                   </Button>
                   {pinned === id && (
                     <Box key={`full:${id}`} borderStyle="round" flexDirection="column">
+                      {copyButton($, ui, id, l.text)}
                       <Text color={color} wrap="wrap">
                         {l.text}
                       </Text>
@@ -1660,7 +1694,7 @@ export const register: Register = (on, options) => {
           <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
             {button}
             <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
-              {toolBody(ui, tv)}
+              {toolBody($, ui, tv, false)}
             </Box>
           </Box>
         )
