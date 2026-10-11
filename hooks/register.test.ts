@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
-import { liveSelection } from './register'
+import { PEEK_TIMEOUT_MS, liveSelection } from './register'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
 const STATE = `${RUN_DIR}/state.json`
@@ -967,12 +967,14 @@ describe('agent transcript', () => {
       const ui = await mountPane($, surface)
       expect(await ui.find({ key: 'peek:agent1' })).toBeUndefined()
       await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle() // the read runs off the render
       const peek = (await ui.find({ key: 'peek:agent1' }))!
       expect(peek).toBeDefined()
       expect(peek.text).toContain('Tests are red, as expected')
       expect(peek.text).toContain('⚙ Read, Bash×2 · Reading the plan')
       expect(asked).toContain('agent1')
       await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle() // the read runs off the render
       expect(await ui.find({ key: 'peek:agent1' })).toBeUndefined()
       await ui.unmount()
     })
@@ -983,6 +985,7 @@ describe('agent transcript', () => {
       await running($, w)
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle() // the read runs off the render
       expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
       await ui.unmount()
     })
@@ -993,6 +996,7 @@ describe('agent transcript', () => {
       await running($, w)
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle() // the read runs off the render
       expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('no messages yet')
       await ui.unmount()
     })
@@ -1005,6 +1009,7 @@ describe('agent transcript', () => {
       await running($, w)
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle() // the read runs off the render
       expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
       expect(await ui.find({ text: /impl-1/ })).toBeDefined()
       await ui.unmount()
@@ -1022,6 +1027,7 @@ describe('agent transcript', () => {
       await running($, w)
       const ui = await mountPane($, 'terminal', 40)
       await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle() // the read runs off the render
       type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
       const walk = (n: unknown): Drawn[] =>
         n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
@@ -1060,7 +1066,7 @@ describe('agent transcript', () => {
   })
 
   test('terminal: an open transcript takes its rows from the activity', async ($, on) => {
-    world(on)
+    const w = world(on)
     on('session.messages', () => ({ value: transcript as never }))
     await start($)
     for (let i = 1; i <= 12; i++) await spawn($, { prompt: 'P', name: `impl-${i}` })
@@ -1075,7 +1081,119 @@ describe('agent transcript', () => {
     const ROOM = 30 - 12 - 8 - 1 // the Hand over main button's row, as in 'terminal pane header'
     expect(await activity()).toBe(ROOM)
     await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle() // the read runs off the render
     expect(await activity()).toBe(ROOM - (3 + 2)) // three message lines inside a border
+    await ui.unmount()
+  })
+})
+
+describe('transcript read off the render', () => {
+  const DENIED = 'transcript not readable (teammate in another pane, or finished)'
+  const LINES = [{ role: 'assistant', text: 'Tests are red, as expected', toolUses: [] }]
+  /** A `session.messages` answer the test releases by hand; `calls` counts the reads. */
+  const held = (on: Parameters<typeof world>[0]) => {
+    const h = { calls: 0, release: () => {} }
+    on('session.messages', () => {
+      h.calls++
+      return new Promise(resolve => {
+        h.release = () => resolve({ value: LINES as never })
+      })
+    })
+    return h
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a read that never answers blocks neither the pane nor its Hand over buttons (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => new Promise(() => {}))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      expect(await ui.find({ text: /impl-1/ })).toBeDefined()
+      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('loading…')
+      if (surface === 'desktop') {
+        await ui.press({ key: 'handover:agent1' })
+        expect(row(w, 'agent1')!.status).toBe('handing-over')
+      }
+      await ui.press({ key: 'handover:main' })
+      await w.clock.advance(10)
+      expect(w.prompts.some(p => p.includes('main-1.md'))).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`the transcript shows loading… until the read answers, then its lines (${surface})`, async ($, on) => {
+      const w = world(on)
+      const h = held(on)
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('loading…')
+      h.release()
+      await w.clock.settle()
+      const peek = (await ui.find({ key: 'peek:agent1' }))!.text
+      expect(peek).toContain('Tests are red, as expected')
+      expect(peek).not.toContain('loading…')
+      await ui.unmount()
+    })
+
+    test(`a read that outlasts the timeout reads as not readable (${surface})`, async ($, on) => {
+      const w = world(on)
+      held(on)
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.advance(PEEK_TIMEOUT_MS + 10)
+      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+      await ui.unmount()
+    })
+  }
+
+  test('a read still hung after the timeout keeps later triggers from piling up reads', async ($, on) => {
+    const w = world(on)
+    const h = held(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.advance(PEEK_TIMEOUT_MS + 10)
+    expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+    await step($, 'agent1')
+    await w.clock.settle()
+    expect(h.calls).toBe(1)
+    await ui.unmount()
+  })
+
+  test('a very long message is stored cut, not whole', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => ({ value: [{ role: 'assistant', text: 'y'.repeat(5000), toolUses: [] }] as never }))
+    await running($, w)
+    // So wide that the render's own cut does not apply: what shows is what was stored.
+    const ui = await mountPane($, 'desktop', 4000)
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    const text = (await ui.find({ key: 'peek:agent1' }))!.text
+    expect(text).toContain('yyy')
+    expect(text.length).toBeLessThanOrEqual(500)
+    await ui.unmount()
+  })
+
+  test('triggers for an agent whose read is in flight start no second read', async ($, on) => {
+    const w = world(on)
+    const h = held(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    await w.clock.settle()
+    expect(h.calls).toBe(1)
+    h.release()
+    await w.clock.settle()
+    // Settled: the selected agent's next step reads its transcript afresh.
+    await step($, 'agent1')
+    await w.clock.settle()
+    expect(h.calls).toBe(2)
     await ui.unmount()
   })
 })

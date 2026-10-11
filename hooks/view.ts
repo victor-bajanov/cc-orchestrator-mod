@@ -1,6 +1,6 @@
 import type { SessionMessage } from 'claude-code'
 
-import type { AgentRow, AgentStatus, LogEntry, MainPhase, Sample } from '../types'
+import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek, Sample } from '../types'
 import { fmtTokens, label } from './core'
 
 export const MAIN_COLOR = '#6B7280'
@@ -77,6 +77,21 @@ export const peekLines = (messages: readonly SessionMessage[], width: number, n:
     out.push(line.length > width ? cut(line, width) : line)
   }
   return out.reverse()
+}
+
+/** What the pane shows when an agent's transcript cannot be read. */
+export const PEEK_DENIED = 'transcript not readable (teammate in another pane, or finished)'
+
+/**
+ * What the pane draws for a selected agent's cached transcript: one dim line
+ * (`loading…` before the first read settles, the not-readable line, or
+ * `no messages yet`), or its last `n` lines cut to `width`.
+ */
+export const peekView = (peek: Peek | undefined, width: number, n: number): { dim: string } | { lines: string[] } => {
+  if (!peek) return { dim: 'loading…' }
+  if ('denied' in peek) return { dim: PEEK_DENIED }
+  if (peek.lines.length === 0) return { dim: 'no messages yet' }
+  return { lines: peek.lines.slice(-n).map(l => (l.length > width ? cut(l, width) : l)) }
 }
 
 /** The context limit a row is held to: main's for main, the agents' otherwise. */

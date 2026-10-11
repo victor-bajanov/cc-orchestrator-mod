@@ -43,7 +43,7 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 
 VS Code and the mobile app get the desktop pane.
 
-Clicking a subagent shows its transcript inside the pane, read through the host's own transcript API. Main has none there, since it is the main view already. A teammate running in another pane's process, or a finished agent whose transcript was not saved, can't be read; the box says "transcript not readable (teammate in another pane, or finished)". The host gives mods no way to switch the main view to an agent, so to read a whole transcript open it with `/tasks` (terminal) or the app's agent panel (desktop).
+Clicking a subagent shows its transcript inside the pane, read through the host's own transcript API. Main has none there, since it is the main view already. The box says `loading…` until the first read comes back, and it updates as the agent works. A teammate running in another pane's process, or a finished agent whose transcript was not saved, can't be read; the box says "transcript not readable (teammate in another pane, or finished)". The host gives mods no way to switch the main view to an agent, so to read a whole transcript open it with `/tasks` (terminal) or the app's agent panel (desktop).
 
 On both the terminal and the desktop app, the status line shows live agents, the largest context and main's context; toasts show; and in ask mode the **Hand over & restart** band shows above the prompt past the threshold. The desktop app has no notifications; the stall toast still shows there.
 
