@@ -608,6 +608,9 @@ export const collapseHidden = (rows: readonly AgentRow[], collapsed: readonly st
 export const hiddenCount = (rows: readonly AgentRow[], id: string, hidden: ReadonlySet<string>): number =>
   descendants(rows, id).filter(d => hidden.has(d.id)).length
 
-/** Whether a press is the second of a double: the same key as the last press, within `ms`. */
-export const isDoublePress = (last: { key: string; t: number } | undefined, key: string, now: number, ms = 400): boolean =>
-  last !== undefined && last.key === key && now - last.t >= 0 && now - last.t <= ms
+/** Whether a row offers to fold: it is collapsed (so it can expand), or collapsing it would hide something. */
+export const canFold = (rows: readonly AgentRow[], id: string, collapsed: readonly string[]): boolean =>
+  collapsed.includes(id) || collapseHidden(rows, [id]).size > 0
+
+/** The disclosure glyph: `▸` when collapsed, `▾` when not. */
+export const foldGlyph = (isCollapsed: boolean): string => (isCollapsed ? '▸' : '▾')

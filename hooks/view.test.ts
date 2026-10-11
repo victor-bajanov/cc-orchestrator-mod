@@ -7,6 +7,7 @@ import {
   MAIN_COLOR,
   PALETTE,
   ceilingOf,
+  canFold,
   cleanBlock,
   chartWidthPx,
   contextChart,
@@ -15,12 +16,12 @@ import {
   collapseHidden,
   cut,
   displayStatus,
+  foldGlyph,
   forwardTarget,
   effortAbbrev,
   hashText,
   hhmm,
   hiddenCount,
-  isDoublePress,
   latest,
   logId,
   mainButtonShown,
@@ -954,12 +955,24 @@ describe('collapse', () => {
     expect(hiddenCount(tree(), 'r1', hidden)).toBe(0)
   })
 
-  test('isDoublePress: the same key within 400 ms', () => {
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1399)).toBe(true)
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1000)).toBe(true)
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1401)).toBe(false)
-    expect(isDoublePress({ key: 'a', t: 1000 }, 'b', 1100)).toBe(false)
-    expect(isDoublePress(undefined, 'a', 1100)).toBe(false)
+  test('canFold: a row with finished descendants, or collapsed; not a childless or all-live row', () => {
+    expect(canFold(tree(), 'o', [])).toBe(true)
+    const live = tree({ d1: { status: 'running' }, d2: { status: 'running' } })
+    expect(canFold(live, 'o', [])).toBe(false)
+    expect(canFold(live, 'o', ['o'])).toBe(true)
+    expect(canFold(tree(), 'd1', [])).toBe(false)
+    expect(canFold(tree(), 'main', [])).toBe(true)
+    const grand = [
+      ...tree({ d2: { status: 'running' } }),
+      row({ id: 'g1', parentId: 'd1', status: 'running' }),
+      row({ id: 'g2', parentId: 'd1', status: 'done' }),
+    ]
+    expect(canFold(grand, 'o', [])).toBe(true)
+  })
+
+  test('foldGlyph: ▸ collapsed, ▾ expanded', () => {
+    expect(foldGlyph(true)).toBe('▸')
+    expect(foldGlyph(false)).toBe('▾')
   })
 
   test('contextChart takes a given t0 for its left axis, else the rows', () => {

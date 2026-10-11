@@ -944,8 +944,9 @@ describe('agent in view', () => {
         .filter(b => b.type === 'Box' && typeof b.props?.key === 'string' && /^(main|agent\d+)$/.test(b.props.key as string))
         .map(b => {
           // A subagent's glyph and name sit inside its pressable Button; main's are bare Texts.
-          const first = b.children![0] as Drawn
-          const cell = first.type === 'Button' ? (first.children![1] as Drawn) : (b.children![1] as Drawn)
+          // The row's indent and fold cell come before it.
+          const button = (b.children as Drawn[]).find(c => c.type === 'Button' && String(c.props?.key).startsWith('agent:'))
+          const cell = button ? (button.children![1] as Drawn) : (b.children![1] as Drawn)
           return [b.props!.key as string, cell.props ?? {}]
         }),
     )
@@ -2092,10 +2093,13 @@ describe('stalled handovers and resumed agents', () => {
       if (surface === 'desktop') {
         expect((await ui.find({ key: 'agent:agent1' }))!.text).toMatch(/impl-1\s*↻/)
       } else {
-        // glyph and name, mark included, still fill exactly the NAME columns
+        // indent, fold cell, glyph and name, mark included, still fill exactly the NAME columns
         const NAME = Math.min(24, Math.max(12, Math.floor(100 * 0.25)))
-        const button = walk(await ui.drawn()).find(b => b.props?.key === 'agent:agent1')!
-        expect(textOf(button)).toHaveLength(NAME)
+        const all = walk(await ui.drawn())
+        const button = all.find(b => b.props?.key === 'agent:agent1')!
+        const box = all.find(b => b.type === 'Box' && b.props?.key === 'agent1')!
+        const cells = (box.children as Drawn[]).slice(0, (box.children as Drawn[]).indexOf(button) + 1)
+        expect(cells.map(c => textOf(c) || String(c.props?.label ?? '')).join('')).toHaveLength(NAME)
         expect(textOf(button)).toMatch(/impl-1\s*↻/)
       }
       await ui.unmount()
@@ -2529,9 +2533,10 @@ describe('collapse', () => {
   const textOf = (n: unknown): string =>
     typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
   type Ui = Awaited<ReturnType<typeof mountPane>>
-  /** agent1 orchestrating under main: agent2 and agent3 done, agent4 running. */
+  /** agent1 orchestrating under main (which has its own row): agent2 and agent3 done, agent4 running. */
   const crew = async ($: Engine, w: World) => {
     await running($, w)
+    await step($)
     for (const n of [2, 3, 4]) {
       await spawn($, { prompt: `P${n}`, name: `impl-${n}`, parentAgentId: 'agent1' })
       await step($, `agent${n}`)
@@ -2551,73 +2556,88 @@ describe('collapse', () => {
     surface === 'desktop'
       ? (await ui.find({ key: `agent:${id}` }))!.text
       : textOf(walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === id))
-  const double = async (ui: Ui, id: string) => {
-    await ui.press({ key: `agent:${id}` })
-    await ui.press({ key: `agent:${id}` })
-  }
+  const fold = (ui: Ui, id: string) => ui.press({ key: `fold:${id}` })
+  /** A drawn element's own text: its children, else its label. */
+  const cellText = (n: Drawn) => textOf(n) || String(n.props?.label ?? '')
+  const glyph = async (ui: Ui, id: string) => (await ui.find({ key: `fold:${id}` }))!.text
+  const hotkey = async (ui: Ui) => await ui.find({ key: 'fold-hotkey' })
+  /** The selection, as the c hotkey sees it: none targets main. */
+  const selectedOf = async (ui: Ui) => ((await hotkey(ui))?.props.label === 'collapse main thread' ? '' : 'something')
 
   for (const surface of ['terminal', 'desktop'] as const) {
-    test(`a double-click collapses finished descendants, and another expands them (${surface})`, async ($, on) => {
+    test(`the fold glyph collapses finished descendants, and again expands them (${surface})`, async ($, on) => {
       const w = world(on)
       on('session.messages', () => ({ value: [] }))
       await crew($, w)
       const ui = await mountPane($, surface)
-      await double(ui, 'agent1')
+      expect(await glyph(ui, 'agent1')).toBe('▾')
+      await fold(ui, 'agent1')
       await w.clock.settle()
+      expect(await glyph(ui, 'agent1')).toBe('▸')
       expect(await drawn(ui, surface, 'agent2')).toBe(false)
       expect(await drawn(ui, surface, 'agent3')).toBe(false)
       expect(await drawn(ui, surface, 'agent4')).toBe(true)
       expect(await rowText(ui, surface, 'agent1')).toContain('+2 done')
       expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+      expect(await selectedOf(ui)).toBe('')
       if (surface === 'desktop') {
         const src = String((await ui.find({ type: 'Svg' }))!.props.source)
         expect(src).not.toContain('stroke="#E69F00"')
         expect(src).not.toContain('stroke="#009E73"')
         expect(src).toContain('stroke="#CC79A7"')
       }
-      await double(ui, 'agent1')
+      await fold(ui, 'agent1')
+      expect(await glyph(ui, 'agent1')).toBe('▾')
       expect(await drawn(ui, surface, 'agent2')).toBe(true)
       expect(await drawn(ui, surface, 'agent3')).toBe(true)
       expect(await rowText(ui, surface, 'agent1')).not.toContain('+2 done')
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+      expect(await selectedOf(ui)).toBe('')
       await ui.unmount()
     })
 
-    test(`two presses 500 ms apart are two single clicks (${surface})`, async ($, on) => {
+    test(`a row press only opens and closes the transcript; it never collapses (${surface})`, async ($, on) => {
       const w = world(on)
       on('session.messages', () => ({ value: [] }))
       await crew($, w)
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
-      await w.clock.settle()
       expect(await ui.find({ key: 'transcript:agent1' })).toBeDefined()
-      await w.clock.advance(500)
       await ui.press({ key: 'agent:agent1' })
-      await w.clock.settle()
       expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
       expect(await drawn(ui, surface, 'agent2')).toBe(true)
+      expect(await drawn(ui, surface, 'agent3')).toBe(true)
       await ui.unmount()
     })
 
-    test(`a double-click keeps the transcript that was open; on a childless row it does nothing (${surface})`, async ($, on) => {
+    test(`only rows that can fold have a fold glyph; others reserve its cell (${surface})`, async ($, on) => {
+      const w = world(on)
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      expect(await ui.find({ key: 'fold:agent1' })).toBeDefined()
+      expect(await ui.find({ key: 'fold:main' })).toBeDefined()
+      for (const n of [2, 3, 4]) expect(await ui.find({ key: `fold:agent${n}` })).toBeUndefined()
+      expect(await ui.find({ key: 'nofold:agent2' })).toBeDefined()
+      expect(await ui.find({ key: 'nofold:agent4' })).toBeDefined()
+      await fold(ui, 'agent1')
+      expect(await ui.find({ key: 'fold:agent1' })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`folding keeps the open transcript (${surface})`, async ($, on) => {
       const w = world(on)
       on('session.messages', () => ({ value: [] }))
       await crew($, w)
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent4' })
-      await w.clock.advance(1000)
-      await double(ui, 'agent1')
+      await fold(ui, 'agent1')
       await w.clock.settle()
       expect(await drawn(ui, surface, 'agent2')).toBe(false)
       expect(await ui.find({ key: 'transcript:agent4' })).toBeDefined()
-      await w.clock.advance(1000)
-      await double(ui, 'agent4')
-      await w.clock.settle()
-      expect(await ui.find({ key: 'transcript:agent4' })).toBeDefined()
-      expect(await drawn(ui, surface, 'agent4')).toBe(true)
       await ui.unmount()
     })
 
-    test(`main collapses its finished top-level agents and keeps a running one (${surface})`, async ($, on) => {
+    test(`main folds its finished top-level agents and keeps a running one (${surface})`, async ($, on) => {
       const w = world(on)
       await crew($, w)
       await step($)
@@ -2629,7 +2649,7 @@ describe('collapse', () => {
       await w.clock.advance(30_000)
       const ui = await mountPane($, surface)
       expect(await ui.find({ key: 'agent:main' })).toBeDefined()
-      await double(ui, 'main')
+      await fold(ui, 'main')
       for (const n of [1, 2, 3, 4]) expect(await drawn(ui, surface, `agent${n}`)).toBe(false)
       expect(await drawn(ui, surface, 'agent5')).toBe(true)
       expect(await rowText(ui, surface, 'main')).toContain('+4 done')
@@ -2640,12 +2660,34 @@ describe('collapse', () => {
       const w = world(on)
       await crew($, w)
       const ui = await mountPane($, surface)
-      await double(ui, 'agent1')
+      await fold(ui, 'agent1')
       await complete($, 'agent4', 'R4')
       w.agents = [{ id: 'agent1', name: 'impl-1' }]
       await w.clock.advance(30_000)
       expect(await rowText(ui, surface, 'agent1')).toContain('+3 done')
       expect(await drawn(ui, surface, 'agent4')).toBe(false)
+      await ui.unmount()
+    })
+
+    test(`the c hotkey folds the selected row, else main (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      let key = (await hotkey(ui))!
+      expect(key.props.hotkey).toBe('c')
+      expect(key.props.plain).toBe(true)
+      expect(key.props.label).toBe('collapse main thread')
+      await ui.press({ key: 'agent:agent1' })
+      expect((await hotkey(ui))!.props.label).toBe('collapse impl-1')
+      await ui.press({ key: 'fold-hotkey' })
+      expect(await drawn(ui, surface, 'agent2')).toBe(false)
+      key = (await hotkey(ui))!
+      expect(key.props.label).toBe('expand impl-1')
+      await ui.press({ key: 'fold-hotkey' })
+      expect(await drawn(ui, surface, 'agent2')).toBe(true)
+      await ui.press({ key: 'agent:agent4' })
+      expect(await hotkey(ui)).toBeUndefined()
       await ui.unmount()
     })
   }
@@ -2664,24 +2706,16 @@ describe('collapse', () => {
     await step($, 'agent3') // resumed: running again, with its ↻
     expect(row(w, 'agent3')!.resumedAt).toBeDefined()
     const ui = await mountPane($, 'terminal', 40)
-    await double(ui, 'agent3')
+    await fold(ui, 'agent3')
     expect(await drawn(ui, 'terminal', 'agent4')).toBe(false)
-    const button = walk(await ui.drawn()).find(b => b.props?.key === 'agent:agent3')!
-    const name = textOf((button.children as Drawn[])[1])
-    expect(name).toContain('impl')
-    // glyph and name still fill exactly the NAME columns
-    expect(textOf(button)).toHaveLength(12)
-    await ui.unmount()
-  })
-
-  test('two presses dispatched together still count as a double-click', async ($, on) => {
-    const w = world(on)
-    await crew($, w)
-    const ui = await mountPane($, 'desktop')
-    await Promise.all([ui.press({ key: 'agent:agent1' }), ui.press({ key: 'agent:agent1' })])
-    await w.clock.settle()
-    expect(await ui.find({ key: 'agent:agent2' })).toBeUndefined()
-    expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+    const all = walk(await ui.drawn())
+    const button = all.find(b => b.props?.key === 'agent:agent3')!
+    expect(textOf(button)).toContain('impl')
+    // indent, fold glyph, its space and the agent Button still fill exactly the NAME columns
+    const box = all.find(b => b.type === 'Box' && b.props?.key === 'agent3')!
+    const cells = (box.children as Drawn[]).slice(0, (box.children as Drawn[]).indexOf(button) + 1)
+    expect(cells.reduce((n, c) => n + cellText(c).length, 0)).toBe(12)
+    expect(await glyph(ui, 'agent3')).toBe('▸')
     await ui.unmount()
   })
 
@@ -2690,7 +2724,7 @@ describe('collapse', () => {
     await crew($, w)
     let ui = await mountPane($, 'desktop')
     const header = (await ui.findAll({ type: 'Text' })).find(t => t.text.includes('live'))!.text
-    await double(ui, 'agent1')
+    await fold(ui, 'agent1')
     expect((await ui.findAll({ type: 'Text' })).find(t => t.text.includes('live'))!.text).toBe(header)
     const roster = w.files.get(`${RUN_DIR}/roster.md`) ?? ''
     expect(roster).toContain('agent2')

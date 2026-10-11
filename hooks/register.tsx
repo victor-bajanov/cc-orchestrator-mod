@@ -35,11 +35,11 @@ import {
   modelLabel,
   paneHeader,
   checkinDue,
-  childrenOf,
   collapseHidden,
   forwardTarget,
   hiddenCount,
-  isDoublePress,
+  canFold,
+  foldGlyph,
   latest,
   namesAgent,
   seriesColors,
@@ -73,7 +73,7 @@ const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
 /** Messages timers queued for the next hook to deliver (a send from a timer wakes a run without hooks). */
 const outboxAtom = atom({ plugin: 'orchestrator', key: 'outbox' } as const, [] as Delivery[])
-/** Rows collapsed by a double-click, their finished descendants hidden; display only. */
+/** Rows the person collapsed with a row's fold glyph or the `c` hotkey, their finished descendants hidden; display only. */
 const collapsedAtom = atom({ plugin: 'orchestrator', key: 'collapsed' } as const, [] as string[])
 /** The tool call open in the detail dialog, read off the render by refreshTool. */
 const toolViewAtom = atom({ plugin: 'orchestrator', key: 'toolView' } as const, null as ToolView | null)
@@ -139,10 +139,6 @@ const DRAIN_TIMEOUT_MS = 10_000
 let draining = false
 /** Main was prompted to run a hooked turn for the outbox, and nothing has drained since: no second prompt. */
 let nudgedSinceDrain = false
-/** The last row press, to tell a double-click (two presses within 400 ms) and undo its first click. */
-let lastPress: { key: string; t: number; prevSelected: string } | undefined
-/** Row presses, one at a time in the order they came. */
-let pressQueue: Promise<void> = Promise.resolve()
 /**
  * The mod's sends in flight. Under auto mode the engine judges a plugin's `$.session.send` as a
  * SendMessage call, and the classifier refuses it because no user request asked for it. tool.check
@@ -246,32 +242,9 @@ async function toggleSelected($: $, id: string) {
   if ((await read($, selectedAtom)) === id) schedulePeek($, id)
 }
 
-/**
- * A press on an agent's row. A single press opens or closes its transcript at once. The second press
- * of a double-click restores the selection from before the first, then collapses or expands the
- * row's finished descendants (a row with no children: nothing), so a double-click nets to that alone.
- */
-function pressAgent($: $, id: string): Promise<void> {
-  // Queued synchronously, before any await: presses dispatched together are still seen in order.
-  const run = pressQueue.then(() => pressOnce($, id))
-  pressQueue = run.catch(() => undefined)
-  return run
-}
-
-async function pressOnce($: $, id: string) {
-  const now = await $.clock.now()
-  if (isDoublePress(lastPress, id, now)) {
-    const prev = lastPress!.prevSelected
-    lastPress = undefined
-    await update($, selectedAtom, () => prev)
-    if (childrenOf(await read($, agentsAtom), id).length > 0) {
-      await update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
-    }
-    return
-  }
-  const prevSelected = await read($, selectedAtom)
-  lastPress = { key: id, t: now, prevSelected }
-  await toggleSelected($, id)
+/** Collapses or expands a row's finished descendants. */
+function toggleCollapsed($: $, id: string) {
+  return update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
 }
 
 /** How long a transcript read may take before the pane calls it not readable. */
@@ -1046,8 +1019,6 @@ export const register: Register = (on, options) => {
   stamps.clear()
   toolReads.busy.clear()
   toolReads.again.clear()
-  lastPress = undefined
-  pressQueue = Promise.resolve()
   ownSends.length = 0
   checkMissLogged = false
   draining = false
@@ -1442,6 +1413,37 @@ export const register: Register = (on, options) => {
     }
     // The transcript the host has open beside the pane (read-only; absent on older hosts and kit mounts). Main is never marked.
     const viewed = liveSelection(visible, e.props.view?.agentId ?? '')
+    // A row folds when it is collapsed or collapsing it would hide something; read from every row, as `hidden` is.
+    const foldable = (id: string) => canFold(rows, id, collapsed)
+    /** The header's `c` hotkey: folds the selected row, else main; drawn only when that row can fold. */
+    const foldHotkey = (Button: ReturnType<typeof $.ui.resolve>['Button'], selected: string) => {
+      const target = liveSelection(visible, selected) || 'main'
+      const tRow = rows.find(r => r.id === target)
+      if (!tRow || !foldable(target)) return undefined
+      return (
+        <Button
+          key="fold-hotkey"
+          plain
+          hotkey="c"
+          label={`${collapsed.includes(target) ? 'expand' : 'collapse'} ${label(tRow)}`}
+          onPress={() => toggleCollapsed($, target)}
+        />
+      )
+    }
+    /**
+     * A row's fold cell: its disclosure glyph when it can fold, else a space of the glyph's width.
+     * The space sits in a keyed Box: a drawn Text keeps no key.
+     */
+    const foldCell = (ui: ReturnType<typeof $.ui.resolve>, id: string) =>
+      foldable(id) ? (
+        <ui.Button key={`fold:${id}`} plain onPress={() => toggleCollapsed($, id)}>
+          {foldGlyph(collapsed.includes(id))}
+        </ui.Button>
+      ) : (
+        <ui.Box key={`nofold:${id}`}>
+          <ui.Text> </ui.Text>
+        </ui.Box>
+      )
 
     if (e.surface !== 'terminal') {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
@@ -1530,6 +1532,7 @@ export const register: Register = (on, options) => {
                 onPress={() => startMainHandover($)}
               />
             )}
+            {foldHotkey(Button, selected)}
           </Box>
           {rows.length === 0 ? (
             <Text dimColor>No model requests yet.</Text>
@@ -1545,7 +1548,8 @@ export const register: Register = (on, options) => {
               const folded = doneMark(row.id)
               return [
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
-                  <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
+                  {foldCell(ui, row.id)}
+                  <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
                     <Text bold={hl === row.id}>{label(row)} </Text>
                     {row.resumedAt !== undefined && <Text dimColor>↻ </Text>}
@@ -1615,6 +1619,8 @@ export const register: Register = (on, options) => {
     const NAME = Math.min(24, Math.max(12, Math.floor(cols * 0.25)))
     // The model cell: 16 columns padded, plus a space.
     const MODEL = 17
+    // The fold cell: the disclosure glyph (or a space) and a space.
+    const FOLD = 2
     const width = Math.max(8, cols - NAME - 7 - 14 - MODEL)
     const t0 = rows.reduce((m, r) => Math.min(m, r.startedAt), now)
     const ordered = orderRows(visible)
@@ -1712,6 +1718,7 @@ export const register: Register = (on, options) => {
               onPress={() => startMainHandover($)}
             />
           )}
+          {foldHotkey(Button, selected)}
         </Box>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
         {ordered.flatMap(({ row, depth }) => {
@@ -1719,15 +1726,16 @@ export const register: Register = (on, options) => {
           const live = LIVE.includes(row.status)
           const shows = displayStatus(row, rows)
           const style = statusStyle(shows)
-          // The glyph takes the status colour; the name keeps its own marks. Together they fill NAME columns.
-          const lead = `${'  '.repeat(depth)}${glyph[shows]} `.slice(0, NAME)
+          // Indent, fold cell, status glyph and name together fill NAME columns. Deep rows stop indenting
+          // rather than eat the name's minimum 4 columns.
+          const indentW = Math.min(depth * 2, Math.max(0, NAME - FOLD - 2 - 4))
           const glyphCell = (
             <Text color={style.color} dimColor={style.dimColor} bold={style.bold} wrap="truncate">
-              {lead}
+              {`${glyph[shows]} `}
             </Text>
           )
           // A resumed agent's dim ↻ and a collapsed row's `+N done` sit inside the name cell, which keeps its width.
-          const room = NAME - lead.length
+          const room = NAME - indentW - FOLD - 2
           const folded = doneMark(row.id)
           // The name keeps at least 4 columns (or its whole self); the marks shrink first: `+3 done` to `+3`, then the ↻ goes.
           const spare = room - Math.min(label(row).length, 4)
@@ -1748,8 +1756,11 @@ export const register: Register = (on, options) => {
           const model = modelLabel(row.model ?? row.brief?.model, row.effort)
           return [
             <Box key={row.id}>
-              {/* Main too is pressable, so a double-click can collapse it; a single press only bolds it. */}
-              <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
+              <Text>{' '.repeat(indentW)}</Text>
+              {foldCell(ui, row.id)}
+              <Text> </Text>
+              {/* Main too is pressable: a press selects it, so `c` acts on it; it opens no transcript. */}
+              <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                 {glyphCell}
                 {nameCell}
               </Button>

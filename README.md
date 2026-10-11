@@ -41,7 +41,7 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 - each row's status glyph and status word in the status colour: running `●` bright green, waiting `◐` teal, idle `○` faint orange, handing over `↻` blue, stalled `!` red, done `✓` faint green, replaced `⤳` grey. The colours are theme keys, so they follow your theme
 - each row's model and effort, such as `Sonnet 5.5 med` (the model alone when the engine reports no effort)
 - click a subagent's name to show its transcript in a box beneath it: its last six entries, each with its time. A long entry ends in `…`; hovering it shows the full text in a card, and a click pins it open. Click the name again to close the box. The box takes its rows from the activity log
-- double-click a row with children (main included) to collapse its finished descendants into `+N done`; double-click again to expand them
+- a `▾` before a row with finished agents beneath it (main included) collapses them into `+N done`; the `▸` it becomes expands them again. With the pane focused, `c` collapses or expands the selected row (main when none is selected)
 - each agent's context drawn on one shared time axis, so you can see when each agent was active and how close it is to its limit (green, then amber from 60%, red at the threshold)
 - an activity log; a line too long for the pane ends in `…`, and hovering it shows the full text in a card (a click pins it open)
 
@@ -49,7 +49,7 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 - a chart of each agent's context over time, one coloured line per agent, with the limits as dashed red lines; hover a line for the agent's name, context and status
 - a tree of agents, each with its colour, model and effort (such as `Sonnet 5.5 med`), context, and a status emoji before the status word: running 🏃‍♂️ or 🏃‍♀️ (fixed per agent), waiting ⏳, idle 😴, handing over 📝, stalled 🛑, done ✅, replaced ♻️
 - click an agent to highlight its line in the chart and show its transcript beneath it: its last twelve entries, each with its time, a long one ending in `…` that a click expands in place. Click again to clear both (the agent in view stays highlighted)
-- double-click a row with children to collapse its finished descendants into `+N done`, and their lines leave the chart; double-click again to expand them
+- a `▾` before a row with finished agents beneath it collapses them into `+N done`, and their lines leave the chart; the `▸` it becomes expands them again. With the pane focused, `c` collapses or expands the selected row (main when none is selected)
 - the agent open in the main view is marked *in view* and its line highlighted, unless you clicked another
 - a `Hand over` button beside each live subagent, and a `Hand over main` button in the header (hidden unless `mainHandover` is `ask`, and while main is handing over)
 - an activity log; a line too long for the pane ends in `…`, and clicking it expands the full text beneath it
@@ -60,7 +60,7 @@ Clicking a subagent shows its transcript inside the pane, read through the host'
 
 Clicking a tool call opens its detail in a second pane: a Bash call's command and output, an Edit as a diff (numbered from the start of the edit, since Edit gives no line numbers), a Read's path and the lines it read, a Write's content, a Grep or Glob's pattern and results, an Agent call's prompt and result, and the input and result of any other tool. A subagent's transcript stores only what the model read, so there is no separate stderr or exit code. Escape, the pane's `Close` button, or clicking the tool call again closes it, and the Orchestrator pane shows again. A surface that places no second pane (such as an older desktop app) shows the detail in place, beneath the tool call.
 
-A waiting agent is idle with live children: it ended its turn and is waiting on agents it spawned. A single click on a row still opens its transcript; a double-click (two presses within 400 ms) collapses or expands instead. On the terminal, main's row is pressable too, so it can be collapsed (a single click only bolds it). Collapsing hides the finished agents from the tree and, in the desktop app, from the chart, without changing the other agents' colours. It is display only: the header counts, the roster and handovers still see every agent, and a live agent is never hidden, even under a finished one.
+A waiting agent is idle with live children: it ended its turn and is waiting on agents it spawned. A click on a row only opens or closes its transcript; collapsing is the `▾`/`▸` glyph's job, or `c`'s. Main's row is pressable too: a click selects it (bolds it), so `c` acts on it, and opens no transcript. Collapsing hides the finished agents from the tree and, in the desktop app, from the chart, without changing the other agents' colours. It is display only: the header counts, the roster and handovers still see every agent, and a live agent is never hidden, even under a finished one.
 
 On both the terminal and the desktop app, the status line shows live agents, the largest context and main's context; toasts show; and in ask mode the **Hand over & restart** band shows above the prompt past the threshold. The desktop app has no notifications; the stall toast still shows there.
 
