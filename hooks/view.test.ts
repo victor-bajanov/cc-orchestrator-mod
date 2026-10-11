@@ -5,8 +5,11 @@ import {
   LIVE,
   MAIN_COLOR,
   PALETTE,
+  ceilingOf,
   chartWidthPx,
   contextChart,
+  cut,
+  hhmm,
   logId,
   paneHeader,
   seriesColors,
@@ -71,7 +74,7 @@ describe('paneHeader', () => {
 })
 
 describe('seriesColors', () => {
-  test('main is grey; subagents cycle the palette in tree order', () => {
+  test('main is grey; subagents cycle the palette in spawn (array) order', () => {
     const rows = [
       row({ id: 'p', startedAt: 1 }),
       main(),
@@ -85,10 +88,41 @@ describe('seriesColors', () => {
     const c = seriesColors(rows)
     expect(c.get('main')).toBe(MAIN_COLOR)
     expect(c.get('p')).toBe(PALETTE[0])
-    expect(c.get('c')).toBe(PALETTE[1])
-    expect(c.get('q')).toBe(PALETTE[2])
+    expect(c.get('q')).toBe(PALETTE[1])
+    expect(c.get('c')).toBe(PALETTE[2])
+    expect(c.get('s5')).toBe(PALETTE[4])
     expect(c.get('s6')).toBe(PALETTE[5])
     expect(c.get('s7')).toBe(PALETTE[0])
+  })
+  test('a nested spawn does not shift an existing colour', () => {
+    const before = [row({ id: 'p', startedAt: 1 }), row({ id: 'q', startedAt: 2 })]
+    const q = seriesColors(before).get('q')
+    const after = seriesColors([...before, row({ id: 'c', startedAt: 3, parentId: 'p' })])
+    expect(after.get('q')).toBe(q)
+    expect(after.get('p')).toBe(PALETTE[0])
+  })
+})
+
+describe('hhmm', () => {
+  test('is the UTC hh:mm of a time', () => {
+    expect(hhmm(0)).toBe('00:00')
+    expect(hhmm(3_723_000)).toBe('01:02')
+  })
+})
+
+describe('cut', () => {
+  test('cuts to fits characters, ending in an ellipsis', () => {
+    expect(cut('abcdef', 4)).toBe('abc…')
+    expect(cut('abcdef', 1)).toBe('a…')
+    expect(cut('abcdef', 0)).toBe('a…')
+  })
+})
+
+describe('ceilingOf', () => {
+  test('is the main limit for main and the agent limit otherwise', () => {
+    const t = { agentThreshold: 450_000, mainThreshold: 300_000 }
+    expect(ceilingOf(main(), t)).toBe(300_000)
+    expect(ceilingOf(row({ id: 'a1' }), t)).toBe(450_000)
   })
 })
 
@@ -243,5 +277,71 @@ describe('contextChart geometry', () => {
     const c = contextChart({ ...base, agentThreshold: 0, mainThreshold: 0, rows, colors: seriesColors(rows) })
     expect(c.source).not.toContain('NaN')
     expect(c.source).not.toContain('Infinity')
+  })
+})
+
+describe('contextChart scale and bounds', () => {
+  const dOf = (tag: string) => /d="([^"]*)"/.exec(tag)?.[1] ?? ''
+  const LIMIT = 131072
+
+  test("a row's peak drives the scale", () => {
+    const rows = [row({ id: 's', status: 'done', peak: 900, samples: [{ t: 0, tokens: 0 }, { t: 50, tokens: 500 }] })]
+    const [p] = paths(contextChart({ ...base, agentThreshold: 100, mainThreshold: 100, rows, colors: seriesColors(rows) }).source)
+    const y500 = Math.round(8 + 152 * (1 - 500 / (900 * 1.05)))
+    expect(dOf(p!)).toBe(`M44 160H338V${y500}`)
+  })
+
+  const crowd = (n: number, name: (i: number) => string) =>
+    Array.from({ length: n }, (_, i) =>
+      row({
+        id: `agent-${i}`,
+        name: name(i),
+        startedAt: i,
+        status: i % 5 === 0 ? 'running' : 'done',
+        tokens: 400_000,
+        peak: 449_000,
+        samples: Array.from({ length: 180 }, (_, k) => ({ t: i + k * 1000, tokens: 1000 * ((k * 7919 + i * 31) % 450) })),
+      }),
+    )
+  const opts = { ...base, width: 1200, now: 500_000 }
+
+  test('250 agents of 180 samples share a point budget and stay under the limit', () => {
+    const rows = crowd(250, i => `implementer-number-${i}`)
+    const c = contextChart({ ...opts, rows, colors: seriesColors(rows) })
+    expect(c.source.length).toBeLessThan(LIMIT)
+    expect(paths(c.source)).toHaveLength(250)
+  })
+
+  test('past the limit, the oldest finished agents are dropped and the alt says so; live ones stay', () => {
+    const rows = crowd(250, i => `${i}-${'x'.repeat(200)}`)
+    const c = contextChart({ ...opts, rows, colors: seriesColors(rows) })
+    expect(c.source.length).toBeLessThan(LIMIT)
+    for (const r of rows.filter(r => r.status === 'running')) expect(c.source).toContain(`<title>${r.startedAt}-`)
+    const drawn = paths(c.source).length
+    expect(drawn).toBeLessThan(250)
+    expect(c.alt).toContain(`${250 - drawn} finished agents not drawn`)
+    // The newest finished agent survives before the oldest does.
+    expect(c.source).toContain(`<title>249-`)
+    expect(c.source).not.toContain(`<title>1-`)
+  })
+
+  const liveCrowd = (n: number) =>
+    crowd(n, i => `${i}-${'y'.repeat(500)}`).map(r => ({ ...r, status: 'running' as const }))
+
+  test('long labels are cut to 80 characters in tooltips', () => {
+    const rows = liveCrowd(120)
+    const c = contextChart({ ...opts, rows, colors: seriesColors(rows) })
+    expect(c.source.length).toBeLessThan(LIMIT)
+    expect(paths(c.source)).toHaveLength(120)
+    expect(c.source).toContain(`<title>7-${'y'.repeat(80 - 3)}… · `)
+  })
+
+  test('when live series alone are past the limit, circles lose their tooltips; lines keep theirs', () => {
+    const rows = liveCrowd(250)
+    const c = contextChart({ ...opts, rows, colors: seriesColors(rows) })
+    expect(c.source.length).toBeLessThan(LIMIT)
+    expect(paths(c.source)).toHaveLength(250)
+    expect(c.source).not.toContain('</title></circle>')
+    expect(c.source.match(/<\/title><\/path>/g)).toHaveLength(250)
   })
 })
