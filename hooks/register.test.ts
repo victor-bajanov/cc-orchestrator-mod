@@ -883,6 +883,21 @@ describe('agent in view', () => {
     await ui.unmount()
   })
 
+  test('desktop: with no click, the agent in view has its label bold', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2' })
+    await step($, 'agent2')
+    const ui = await mountViewed($, 'desktop', { agentId: 'agent1' })
+    const labelOf = async (id: string) => {
+      const button = walk(await ui.drawn()).find(b => b.type === 'Button' && b.props?.key === `agent:${id}`)!
+      return (button.children!.filter(c => (c as Drawn).type === 'Text')[1] as Drawn).props ?? {}
+    }
+    expect((await labelOf('agent1')).bold).toBe(true)
+    expect((await labelOf('agent2')).bold).toBeFalsy()
+    await ui.unmount()
+  })
+
   test('terminal: the agent in view has its name inverted; main does not', async ($, on) => {
     const w = world(on)
     await running($, w)
@@ -917,4 +932,32 @@ describe('agent in view', () => {
       })
     }
   }
+})
+
+describe('terminal pane header', () => {
+  /** Twelve agents, each logging its spawn: more activity than the terminal pane has room for. */
+  const crowded = async ($: Engine) => {
+    await start($)
+    for (let i = 1; i <= 12; i++) await spawn($, { prompt: 'P', name: `impl-${i}` })
+    const ui = await mountPane($, 'terminal', 80)
+    type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+    const walk = (n: unknown): Drawn[] =>
+      n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+    const lines = walk(await ui.drawn()).filter(
+      b => b.type === 'Text' && b.props?.wrap === 'truncate' && (b.children ?? []).some(c => typeof c === 'string' && c.includes('spawned')),
+    )
+    await ui.unmount()
+    return lines.length
+  }
+  // Options are per test, so each world is mounted in its own test against the same room:
+  // 30 rows (no viewport given) less 12 agent rows less 8 for the frame.
+  const ROOM = 30 - 12 - 8
+  test('with mainHandover off, the activity fills the room left', { options: { mainHandover: 'off' } }, async ($, on) => {
+    world(on)
+    expect(await crowded($)).toBe(ROOM)
+  })
+  test('the Hand over main button costs the activity one line', async ($, on) => {
+    world(on)
+    expect(await crowded($)).toBe(ROOM - 1)
+  })
 })

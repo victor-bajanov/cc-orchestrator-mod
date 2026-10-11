@@ -612,6 +612,8 @@ export const register: Register = (on, options) => {
       const { Box, Button, Text, Svg } = $.ui.resolve(e)
       const selected = liveSelection(rows, await read($, selectedAtom))
       const colors = seriesColors(rows)
+      // A click selection wins; with none, the agent in view stands out.
+      const hl = selected || viewed
       const chart = contextChart({
         rows,
         now,
@@ -620,8 +622,7 @@ export const register: Register = (on, options) => {
         agentThreshold: cfg.agentThreshold,
         mainThreshold: cfg.mainThreshold,
         colors,
-        // A click selection wins; with none, the line in view stands out.
-        selected: selected || viewed,
+        selected: hl,
       })
       const fits = cols - 6
       return (
@@ -650,7 +651,7 @@ export const register: Register = (on, options) => {
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
                   <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
-                    <Text bold={selected === row.id}>{label(row)} </Text>
+                    <Text bold={hl === row.id}>{label(row)} </Text>
                     <Text color={tone[level(row.tokens, ceiling)]}>
                       {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
                     </Text>
@@ -717,10 +718,11 @@ export const register: Register = (on, options) => {
       done: '✓',
       stalled: '!',
     }
-    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8)
+    // The header's button can wrap onto a row of its own.
+    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0))
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" gap={1}>
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
           <Text bold>{header}</Text>
           {shown && (
             <Button
