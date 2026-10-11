@@ -103,10 +103,22 @@ export type ToolDetail = { tool: string; time: string; isError: boolean; isPendi
 export type ToolView = { agentId: string; toolUseId: string; inline: boolean; detail?: ToolDetail; denied?: true }
 
 /**
- * A message a timer wanted sent. A run woken by a send made from a timer callback runs without the
- * mod's hooks, so timers queue it and the next hook delivers it.
+ * A message or spawn the mod could not safely make where it decided to. A run woken (or started) from
+ * a timer runs without the mod's hooks, and one woken from inside a hook registration runs without that
+ * registration; so such work is queued and a drain-only turn.complete registration (or /orch) does it.
  */
-export type Delivery = { id: string; agentId: string; text: string; what: string; t: number }
+export type Delivery = {
+  id: string
+  /** A message (`send`, the default), a HANDOVER (its stall clock starts once sent), or a respawn of `agentId`. */
+  kind?: 'send' | 'handover' | 'respawn'
+  agentId: string
+  text: string
+  /** What the warning says if it fails, e.g. `check-in for impl-2 not delivered`. */
+  what: string
+  t: number
+  /** For a respawn: the replaced row as it ended, check-in included, for the replacement to inherit. */
+  row?: AgentRow
+}
 
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
 

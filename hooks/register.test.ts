@@ -50,6 +50,8 @@ const world = (on: On) => {
     inTimer: false,
     /** Sends made while `inTimer`. */
     timerSends: [] as string[],
+    /** Every state.json the plugin wrote, in order. */
+    writes: [] as string[],
     /** While set, the engine's turn.step and tool.call beneath the plugin wait on it. */
     holdNext: undefined as Promise<void> | undefined,
   }
@@ -92,6 +94,7 @@ const world = (on: On) => {
     return { model: 'opus', agentId: `agent${w.spawns.length}` }
   })
   on('fs.write', ($, e) => {
+    if (e.path === STATE) w.writes.push(e.text)
     w.files.set(e.path, e.text)
     return { value: undefined }
   })
@@ -2080,10 +2083,10 @@ const family = async ($: Engine, w: World) => {
 describe('check-in', () => {
   const MIN = 60_000
   const CHECKIN = 'mcp__orchestrator__checkin'
-  /** Time passes, then any hook runs (a main step), which delivers what the timers queued. */
+  /** Time passes, then a turn ends (main's), which delivers what the timers queued. */
   const later = async ($: Engine, w: World, ms: number) => {
     await w.clock.advance(ms)
-    await step($)
+    await complete($, undefined)
     await w.clock.settle()
   }
   const checkins = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes('check-in'))
@@ -2473,6 +2476,8 @@ describe('auto-forward', () => {
       await kin($, w)
       w.sendFails = fails
       await end($, 'agent2', 'R')
+      // the forward goes out from the turn end's drain, unawaited: its warning lands once it settles
+      await w.clock.settle()
       expect(w.toasts.some(t => t.includes('not forwarded'))).toBe(true)
       expect(row(w, 'agent2')!.status).toBe('idle')
     })
@@ -2690,18 +2695,22 @@ describe('delivery from timers', () => {
   const checkins = (w: World) => w.sent.filter(m => m.to.includes('agent1') && m.text.includes('check-in'))
   const nudges = (w: World) => w.prompts.filter(p => p.startsWith('[orchestrator mod]') && p.includes('queued'))
 
-  test('a check-in fired by sync is queued, not sent, until a hook delivers it', async ($, on) => {
+  test('a check-in fired by sync is queued, not sent, until a turn ends', async ($, on) => {
     const w = world(on)
     await family($, w)
     await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
     await w.clock.advance(6 * MIN)
     expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
     expect(checkins(w)).toHaveLength(0)
+    // a step or a tool call does not deliver: a run woken from inside one would lose that hook
     await tool($, 'agent2')
+    await step($, 'agent2')
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(0)
+    await complete($, 'agent2', 'R')
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(1)
-    await step($, 'agent2')
-    await complete($, 'agent2', 'R')
+    await complete($, undefined)
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(1)
   })
@@ -2719,8 +2728,8 @@ describe('delivery from timers', () => {
     await w.clock.advance(90_000)
     expect(nudges(w)).toHaveLength(1)
     expect(checkins(w)).toHaveLength(0)
-    // main's hooked turn delivers it
-    await step($)
+    // main's hooked turn delivers it as it ends
+    await complete($, undefined)
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(1)
     await w.clock.advance(90_000)
@@ -2732,7 +2741,7 @@ describe('delivery from timers', () => {
     await family($, w)
     await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
     await w.clock.advance(6 * MIN)
-    await Promise.all([step($), tool($, 'agent2'), step($, 'agent1')])
+    await Promise.all([complete($, undefined), complete($, undefined), step($, 'agent1')])
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(1)
   })
@@ -2743,11 +2752,11 @@ describe('delivery from timers', () => {
     await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
     await w.clock.advance(6 * MIN)
     w.sendFails = 'throw'
-    await step($)
+    await complete($, undefined)
     await w.clock.settle()
     expect(w.toasts.some(t => t.includes('check-in') && t.includes('not delivered'))).toBe(true)
     w.sendFails = ''
-    await step($)
+    await complete($, undefined)
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(0)
   })
@@ -2785,9 +2794,9 @@ describe('delivery from timers: hardening', () => {
     await family($, w)
     await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
     await tick(w, 6 * MIN)
-    await step($, 'agent2')
+    await complete($, undefined)
     await tick(w, 30_000)
-    await tool($, 'agent1')
+    await complete($, undefined)
     await tick(w, 2 * MIN)
     expect(checkins(w)).toHaveLength(1)
     expect(w.timerSends).toEqual([])
@@ -2809,12 +2818,12 @@ describe('delivery from timers: hardening', () => {
     await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
     await w.clock.advance(5 * MIN)
     w.hangNext = true
-    await step($)
+    await complete($, undefined)
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(1)
     await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
     await w.clock.advance(5 * MIN)
-    await step($)
+    await complete($, undefined)
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(2)
   })
@@ -2850,8 +2859,7 @@ describe('delivery from timers: hardening', () => {
     expect(checkins(w)).toHaveLength(0)
     wipe()
     await step($) // restores from state.json
-    await tool($, 'agent2')
-    await step($, 'agent2')
+    await complete($, undefined)
     await w.clock.settle()
     expect(row(w, 'agent2')).toBeDefined()
     expect(checkins(w)).toHaveLength(1)
@@ -2865,14 +2873,14 @@ describe('delivery from timers: hardening', () => {
     await w.clock.advance(5 * MIN)
     const stale = w.files.get(STATE)!
     expect(stale).toContain('check-in')
-    await step($)
+    await complete($, undefined)
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(1)
     // a persist that read the queue before the drain lands last
     w.files.set(STATE, stale)
     wipe()
     await step($)
-    await tool($, 'agent2')
+    await complete($, undefined)
     await w.clock.settle()
     expect(checkins(w)).toHaveLength(1)
   })
@@ -2885,7 +2893,7 @@ describe('delivery from timers: hardening', () => {
     const saved = JSON.parse(w.files.get(STATE)!) as { outbox?: { agentId: string; text: string }[] }
     expect(saved.outbox).toHaveLength(1)
     expect(saved.outbox![0]!.agentId).toBe('agent1')
-    await step($)
+    await complete($, undefined)
     await w.clock.settle()
     expect((JSON.parse(w.files.get(STATE)!) as { outbox?: unknown[] }).outbox ?? []).toHaveLength(0)
   })
@@ -2896,21 +2904,78 @@ describe('delivery waits for the engine', () => {
   const checkins = (w: World) => w.sent.filter(m => m.to.includes('agent1') && m.text.includes('check-in'))
 
   for (const hook of ['turn.step', 'tool.call'] as const) {
-    test(`${hook} sends nothing while the engine's own work beneath it is under way`, async ($, on) => {
+    test(`${hook} never delivers; the next turn end does`, async ($, on) => {
       const w = world(on)
       await family($, w)
       await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
       await w.clock.advance(5 * 60_000)
-      let release = () => {}
-      w.holdNext = new Promise<void>(r => (release = r))
-      const running = hook === 'turn.step' ? step($, 'agent2') : tool($, 'agent2')
+      if (hook === 'turn.step') await step($, 'agent2')
+      else await tool($, 'agent2')
       await w.clock.settle()
       expect(checkins(w)).toHaveLength(0)
-      w.holdNext = undefined
-      release()
-      await running
+      await complete($, undefined)
       await w.clock.settle()
       expect(checkins(w)).toHaveLength(1)
     })
   }
+
+  test('/orch delivers what is queued', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * 60_000)
+    await $.command.run({ command: 'orch', args: 'roster' } as never)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+  })
+})
+
+describe('deliveries from a turn end go through the outbox', () => {
+  /** The outboxes state.json held over time, flattened. */
+  const queued = (w: World) =>
+    w.writes.flatMap(t => ((JSON.parse(t) as { outbox?: Record<string, unknown>[] }).outbox ?? []) as Record<string, unknown>[])
+
+  test("a child's final answer is queued, then delivered once by the same turn end", async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await step($, 'agent2')
+    await complete($, 'agent2', 'R: green')
+    await w.clock.settle()
+    expect(queued(w).some(d => String(d.text).includes('R: green'))).toBe(true)
+    expect(w.sent.filter(m => m.text.includes('R: green'))).toHaveLength(1)
+  })
+
+  test('a respawn is queued, then spawned once by the same turn end', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(queued(w).some(d => d.kind === 'respawn' && d.agentId === 'agent1')).toBe(true)
+    expect(w.spawns).toHaveLength(2)
+    expect(row(w, 'agent2')!.replaces).toBe('agent1')
+  })
+
+  test('a HANDOVER sent after the run ended is queued, and its stall clock starts at delivery', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1') // handing over; it ends before any tool result carries it
+    await w.clock.advance(10 * 60_000)
+    const ended = w.clock.now()
+    await complete($, 'agent1', 'stopped')
+    await w.clock.settle()
+    const write = w.writes.find(t => ((JSON.parse(t) as { outbox?: { kind?: string }[] }).outbox ?? []).some(d => d.kind === 'handover'))
+    expect(write).toBeDefined()
+    // while queued, no stall clock runs
+    expect((JSON.parse(write!) as { agents: AgentRow[] }).agents.find(a => a.id === 'agent1')!.handoverAt).toBeUndefined()
+    expect(w.sent.filter(m => m.to.includes('agent1') && m.text.includes('HANDOVER'))).toHaveLength(1)
+    expect(row(w, 'agent1')).toEqual(expect.objectContaining({ handoverVia: 'message', handoverAt: ended }))
+  })
 })

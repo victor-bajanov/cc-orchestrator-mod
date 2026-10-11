@@ -154,7 +154,6 @@ const STAMPS_MAX = 500
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
 
-
 async function runDir($: $) {
   let id = await read($, runAtom)
   if (!id) {
@@ -523,11 +522,27 @@ async function startHandover($: $, id: string, why: string) {
   return true
 }
 
-/** Sends HANDOVER as a message, which wakes an idle teammate or resumes a finished subagent. */
-async function sendHandover($: $, id: string, why: string) {
+/**
+ * Sends HANDOVER as a message, which wakes an idle teammate or resumes a finished subagent. From inside a
+ * turn.complete registration it is queued (`queue`), and its stall clock is stopped until it is sent.
+ */
+async function sendHandover($: $, id: string, why: string, queue = false) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   if (!r?.notePath) return false
-  const sent = await $.session.send({ to: { agentId: id }, text: handoverMessage(r.notePath, cfg.autoRespawn) })
+  const text = handoverMessage(r.notePath, cfg.autoRespawn)
+  if (queue) {
+    await update($, agentsAtom, l => patch(l, id, { handoverAt: undefined }))
+    await enqueue($, { kind: 'handover', agentId: id, text, what: `${label(r)} ${why}: HANDOVER not delivered` })
+    return true
+  }
+  return deliverHandover($, id, why, text)
+}
+
+/** Sends a HANDOVER now and starts its stall clock; one that cannot be delivered marks the agent stalled. */
+async function deliverHandover($: $, id: string, why: string, text: string) {
+  const r = (await read($, agentsAtom)).find(a => a.id === id)
+  if (!r) return false
+  const sent = await $.session.send({ to: { agentId: id }, text })
   if (sent.isDelivered) {
     const now = await $.clock.now()
     await update($, agentsAtom, l => patch(l, id, { handoverVia: 'message', handoverAt: now }))
@@ -686,10 +701,12 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
 // ---- delivery from timers ---------------------------------------------
 //
 // A run woken by `$.session.send` (or started by `$.agent.spawn`) from a `$.clock` callback runs
-// without the mod's hooks: no tool.call, no turn.step, so no HANDOVER and no tracking. The same call
-// made inside a hook keeps them. So timers never send: they queue, and every hook drains the queue.
+// without the mod's hooks: no tool.call, no turn.step, so no HANDOVER and no tracking. One woken from
+// inside a hook registration runs without that registration alone. So timers never send, and the main
+// turn.complete registration never sends or spawns: both queue, and a drain-only turn.complete
+// registration (and /orch) deliver, so a woken run loses only a registration it never needs.
 
-/** Queues a message for the next hook to deliver, and writes it to state.json so a /clear keeps it. */
+/** Queues a message for the next turn end (or /orch) to deliver, and writes it to state.json so a /clear keeps it. */
 async function enqueue($: $, d: Omit<Delivery, 't' | 'id'>) {
   const t = await $.clock.now()
   const id = `${t}-${++deliverySeq}`
@@ -722,26 +739,47 @@ async function drain($: $) {
   // Recorded as delivered before any send starts: a restore never brings one back.
   delivered.push(...taken.map(d => d.id))
   delivered.splice(0, Math.max(0, delivered.length - DELIVERED_MAX))
+  // A respawn or a HANDOVER changes rows: those are awaited (in a turn.complete, not a handover path).
+  const changes: Promise<unknown>[] = []
   for (const d of taken) {
+    if (d.kind === 'respawn') {
+      changes.push(
+        (d.row ? respawn($, d.row) : Promise.resolve()).catch(err => log($, `${d.what}: ${String(err)}`, 'warn')),
+      )
+      continue
+    }
+    if (d.kind === 'handover') {
+      changes.push(
+        deliverHandover($, d.agentId, 'ended before seeing it', d.text).catch(err =>
+          log($, `${d.what}: ${String(err)}`, 'warn'),
+        ),
+      )
+      continue
+    }
     try {
       void $.session
         .send({ to: { agentId: d.agentId }, text: d.text })
         .then(
-          sent => (sent.isDelivered ? undefined : log($, `${d.what} not delivered (${sent.reason})`, 'warn')),
-          err => log($, `${d.what} not delivered: ${String(err)}`, 'warn'),
+          sent => (sent.isDelivered ? undefined : log($, `${d.what} (${sent.reason})`, 'warn')),
+          err => log($, `${d.what}: ${String(err)}`, 'warn'),
         )
         .catch(() => undefined)
     } catch (err) {
-      void log($, `${d.what} not delivered: ${String(err)}`, 'warn').catch(() => undefined)
+      void log($, `${d.what}: ${String(err)}`, 'warn').catch(() => undefined)
     }
   }
-  // The emptied queue reaches state.json too, off the hook's path.
-  void persist($).catch(() => undefined)
+  if (changes.length > 0) {
+    await Promise.all(changes).catch(() => undefined)
+    await persist($).catch(() => undefined)
+  } else {
+    // The emptied queue reaches state.json too, off the hook's path.
+    void persist($).catch(() => undefined)
+  }
 }
 
 /**
- * From sync: when messages have waited a whole sync with no hook to deliver them, prompts main once
- * (marked as the mod's), whose hooked turn drains them. Not while main is mid-turn (its steps drain),
+ * From sync: when messages have waited a whole sync with no turn end to deliver them, prompts main once
+ * (marked as the mod's), whose turn end drains them. Not while main is mid-turn (that turn's end drains),
  * and not again until a drain has happened.
  */
 async function nudgeIfStuck($: $) {
@@ -770,7 +808,7 @@ async function fireCheckins($: $, now: number) {
         $.ui.toast(`orchestrator: check-in: ${label(r)} has not reported after ${r.checkinMins ?? '?'} min`)
       } else {
         // From sync, a timer: queued for the next hook to deliver, so the woken parent keeps its hooks.
-        await enqueue($, { agentId: by, text, what: `check-in for ${label(r)}` })
+        await enqueue($, { agentId: by, text, what: `check-in for ${label(r)} not delivered` })
       }
     } catch (err) {
       await log($, `check-in for ${label(r)} not delivered: ${String(err)}`, 'warn')
@@ -788,9 +826,9 @@ async function forwardAnswer($: $, r: AgentRow, answer: string, reason: string) 
   const text =
     `[orchestrator mod] final report of ${label(r)} (id ${r.id}${r.replaces ? `, replacement for ${r.replaces}` : ''})` +
     `${to.mayDuplicate ? ' (may duplicate a message it sent you)' : ''}, auto-forwarded:\n\n${answer}`
+  // Queued: sent from inside this turn.complete registration, the woken parent would run without it.
   try {
-    const sent = await $.session.send({ to: { agentId: to.agentId }, text })
-    if (!sent.isDelivered) await log($, `${label(r)}: final report not forwarded to ${to.agentId} (${sent.reason})`, 'warn')
+    await enqueue($, { agentId: to.agentId, text, what: `${label(r)}: final report not forwarded to ${to.agentId}` })
   } catch (err) {
     await log($, `${label(r)}: final report not forwarded to ${to.agentId}: ${String(err)}`, 'warn')
   }
@@ -808,10 +846,13 @@ async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
       // Disarmed here too, so no check-in fires about it when nothing respawns it; respawn reads `r`, still armed.
       await update($, agentsAtom, l => patch(l, id, { status: 'replaced', ...DISARMED }))
       await log($, `${label(r)} handed over (${r.notePath})`)
-      if (cfg.autoRespawn) await respawn($, { ...r, status: 'replaced' })
+      // Queued: started from inside this registration, the replacement's run would end unseen by it.
+      if (cfg.autoRespawn) {
+        await enqueue($, { kind: 'respawn', agentId: id, text: '', what: `${label(r)}: respawn failed`, row: { ...r, status: 'replaced' } })
+      }
     } else if (r.status === 'handing-over' && r.handoverVia !== 'message') {
       // It finished before a tool result could carry the HANDOVER: the message wakes it to write the note.
-      await sendHandover($, id, 'ended before seeing it')
+      await sendHandover($, id, 'ended before seeing it', true)
       return
     } else {
       await update($, agentsAtom, l => patch(l, id, { status: 'done', ...DISARMED }))
@@ -1036,129 +1077,117 @@ export const register: Register = (on, options) => {
  }).catch(($, e, next) => next(e)) // tracking failed: the spawn goes ahead either way
 
   on('turn.step', async function* ($, e, next) {
+    const res = yield* next(e)
+    if (!res.usage) return res
     try {
-      const res = yield* next(e)
-      if (!res.usage) return res
-      try {
-        await restore($)
-        const id = e.agentId ?? 'main'
-        const now = await $.clock.now()
-        if (id !== 'main' && !(await read($, agentsAtom)).some(a => a.id === id)) {
-          const info = (await $.agent.list()).find(a => a.id === id)
-          if (!info) return res // an engine fork (compaction, memory): not an agent of the run
-          // Adopted from the engine's list, which says nothing of background: `background` stays absent, and
-          // `forwardTarget` treats absent as background on purpose (only a known foreground child is skipped).
-          await update($, agentsAtom, l => [
-            ...l,
-            { ...newRow(id, now), name: info.name, description: info.description, type: info.type, parentId: info.parentId ?? 'main' },
-          ])
-        }
-        const tokens = contextOf(res.usage)
-        // The answering model wins over the requested one; an engine without effort leaves it out.
-        const ran = { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }
-        await update($, agentsAtom, l => patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran))
-        try {
-          // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
-          if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now, true)
-        } catch {
-          // A lost stamp only leaves the item's time `--:--`.
-        }
-        if (id === 'main') await checkMain($, tokens)
-        else if (tokens >= cfg.agentThreshold) {
-          const r = (await read($, agentsAtom)).find(a => a.id === id)
-          const startedAt = r?.samples[0]?.tokens ?? 0
-          if (r && r.replaces && startedAt >= cfg.agentThreshold * 0.5) {
-            // Its brief and note alone fill half the window: another handover would only loop.
-            if (!r.noHandover) {
-              await update($, agentsAtom, l => patch(l, id, { noHandover: true }))
-              await log(
-                $,
-                `${label(r)} starts at ${fmtTokens(startedAt)} (≥ half the ${fmtTokens(cfg.agentThreshold)} threshold): not handing it over again`,
-                'warn',
-              )
-            }
-          } else if (r && canHandOver(r)) {
-            await startHandover($, id, `at ${fmtTokens(tokens)} ≥ ${fmtTokens(cfg.agentThreshold)}`)
-          }
-        }
-        await persist($)
-      } catch (err) {
-        $.ui.log(`orchestrator: step not recorded: ${String(err)}`)
+      await restore($)
+      const id = e.agentId ?? 'main'
+      const now = await $.clock.now()
+      if (id !== 'main' && !(await read($, agentsAtom)).some(a => a.id === id)) {
+        const info = (await $.agent.list()).find(a => a.id === id)
+        if (!info) return res // an engine fork (compaction, memory): not an agent of the run
+        // Adopted from the engine's list, which says nothing of background: `background` stays absent, and
+        // `forwardTarget` treats absent as background on purpose (only a known foreground child is skipped).
+        await update($, agentsAtom, l => [
+          ...l,
+          { ...newRow(id, now), name: info.name, description: info.description, type: info.type, parentId: info.parentId ?? 'main' },
+        ])
       }
-      // Last, after the step is recorded and any handover started: the peek can cost them nothing.
-      await peekIfSelected($, e.agentId)
-      if (e.agentId !== undefined) await toolIfPending($, e.agentId)
-      return res
-    } finally {
-      // Last, after the engine's own work beneath is done: delivers what timers queued. A send made while
-      // that work is under way wakes its run with this hook kind skipped, so nothing is sent earlier.
-      await drain($)
+      const tokens = contextOf(res.usage)
+      // The answering model wins over the requested one; an engine without effort leaves it out.
+      const ran = { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }
+      await update($, agentsAtom, l => patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran))
+      try {
+        // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
+        if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now, true)
+      } catch {
+        // A lost stamp only leaves the item's time `--:--`.
+      }
+      if (id === 'main') await checkMain($, tokens)
+      else if (tokens >= cfg.agentThreshold) {
+        const r = (await read($, agentsAtom)).find(a => a.id === id)
+        const startedAt = r?.samples[0]?.tokens ?? 0
+        if (r && r.replaces && startedAt >= cfg.agentThreshold * 0.5) {
+          // Its brief and note alone fill half the window: another handover would only loop.
+          if (!r.noHandover) {
+            await update($, agentsAtom, l => patch(l, id, { noHandover: true }))
+            await log(
+              $,
+              `${label(r)} starts at ${fmtTokens(startedAt)} (≥ half the ${fmtTokens(cfg.agentThreshold)} threshold): not handing it over again`,
+              'warn',
+            )
+          }
+        } else if (r && canHandOver(r)) {
+          await startHandover($, id, `at ${fmtTokens(tokens)} ≥ ${fmtTokens(cfg.agentThreshold)}`)
+        }
+      }
+      await persist($)
+    } catch (err) {
+      $.ui.log(`orchestrator: step not recorded: ${String(err)}`)
     }
+    // Last, after the step is recorded and any handover started: the peek can cost them nothing.
+    await peekIfSelected($, e.agentId)
+    if (e.agentId !== undefined) await toolIfPending($, e.agentId)
+    return res
   })
 
   on('tool.call', async ($, e, next) => {
-    try {
-      // The mod's own tool: answered here, never passed on (a call no hook answers fails).
-      if (e.tool === CHECKIN_TOOL) {
-        const answer = await checkin($, e.agentId, argsOf(e))
-        // Still an action of the caller's run: a report before it was not its last.
-        if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, {}, answer).catch(() => undefined)
-        return answer as never
-      }
-      if (e.agentId !== undefined) {
-        // Stamped as the call starts, when the mod saw it, for the transcript. The call never waits on the clock,
-        // and a lost stamp only leaves the item's time `--:--`: the call and its HANDOVER go ahead.
-        const agentId = e.agentId
-        const id = e.tool_use_id
-        try {
-          void $.clock.now().then(
-            t => {
-              try {
-                stamp(agentId, id, t)
-              } catch {
-                // see above
-              }
-            },
-            () => undefined,
-          )
-        } catch {
-          // see above
-        }
-      }
-      const res = await next(e)
-      if (e.agentId === undefined) return res
-      if (res.deny !== undefined) {
-        // A refused call is still an action: a report before it was not the run's last (a refused report is not ok).
-        await noteReport($, e.agentId, e.tool, argsOf(e), res).catch(() => undefined)
-        return res
-      }
-      let out = res
-      try {
-        const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
-        if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
-          await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
-          await log($, `${label(r)}: HANDOVER delivered with a tool result`)
-          await persist($)
-          out = { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
-        }
-      } catch (err) {
-        $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
-      }
-      try {
-        // After the HANDOVER is attached, and it never alters `out`: a report to the parent disarms the check-in.
-        await noteReport($, e.agentId, e.tool, argsOf(e), res)
-      } catch (err) {
-        $.ui.log(`orchestrator: report not noted: ${String(err)}`)
-      }
-      // Last, after the HANDOVER is attached: the peek and the open detail's reread can cost it nothing.
-      await peekIfSelected($, e.agentId)
-      await toolIfOpen($, e.agentId, e.tool_use_id)
-      return out
-    } finally {
-      // Last, after the engine's own work beneath is done: delivers what timers queued. A send made while
-      // that work is under way wakes its run with this hook kind skipped, so nothing is sent earlier.
-      await drain($)
+    // The mod's own tool: answered here, never passed on (a call no hook answers fails).
+    if (e.tool === CHECKIN_TOOL) {
+      const answer = await checkin($, e.agentId, argsOf(e))
+      // Still an action of the caller's run: a report before it was not its last.
+      if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, {}, answer).catch(() => undefined)
+      return answer as never
     }
+    if (e.agentId !== undefined) {
+      // Stamped as the call starts, when the mod saw it, for the transcript. The call never waits on the clock,
+      // and a lost stamp only leaves the item's time `--:--`: the call and its HANDOVER go ahead.
+      const agentId = e.agentId
+      const id = e.tool_use_id
+      try {
+        void $.clock.now().then(
+          t => {
+            try {
+              stamp(agentId, id, t)
+            } catch {
+              // see above
+            }
+          },
+          () => undefined,
+        )
+      } catch {
+        // see above
+      }
+    }
+    const res = await next(e)
+    if (e.agentId === undefined) return res
+    if (res.deny !== undefined) {
+      // A refused call is still an action: a report before it was not the run's last (a refused report is not ok).
+      await noteReport($, e.agentId, e.tool, argsOf(e), res).catch(() => undefined)
+      return res
+    }
+    let out = res
+    try {
+      const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
+      if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
+        await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
+        await log($, `${label(r)}: HANDOVER delivered with a tool result`)
+        await persist($)
+        out = { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+      }
+    } catch (err) {
+      $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
+    }
+    try {
+      // After the HANDOVER is attached, and it never alters `out`: a report to the parent disarms the check-in.
+      await noteReport($, e.agentId, e.tool, argsOf(e), res)
+    } catch (err) {
+      $.ui.log(`orchestrator: report not noted: ${String(err)}`)
+    }
+    // Last, after the HANDOVER is attached: the peek and the open detail's reread can cost it nothing.
+    await peekIfSelected($, e.agentId)
+    await toolIfOpen($, e.agentId, e.tool_use_id)
+    return out
   })
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.
@@ -1167,48 +1196,55 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('turn.complete', async ($, e, next) => {
+  // Drain-only: delivers what was queued. A run woken (or spawned) by a call made inside a hook
+  // registration runs without that registration, so deliveries come from this one, which does nothing
+  // else: a woken run keeps the turn.complete registration below, and with it its end's tracking.
+  // (Registered first, so it wraps the one below and drains after it. A second registration of an event
+  // needs a matcher; every turn end has a reason, so this matches all.)
+  on('turn.complete', { reason: /./ }, async ($, e, next) => {
     try {
-      // Main's turn is over whatever happens beneath: a failing `next` must not leave it marked busy.
-      // A handover queued mid-turn starts even then, so it is taken off the queue before `next` too.
-      const queued = e.agentId === undefined && mainHandoverQueued
-      if (e.agentId === undefined) {
-        mainBusy = false
-        mainHandoverQueued = false
-      }
-      let res: Awaited<ReturnType<typeof next>>
-      try {
-        res = await next(e)
-      } catch (err) {
-        if (queued) {
-          await update($, queuedAtom, () => false)
-          $.clock.after(0, () => void startMainHandover($))
-        }
-        throw err
-      }
-      try {
-        if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer, e.reason)
-        else {
-          if (queued) await update($, queuedAtom, () => false)
-          const phase = await read($, phaseAtom)
-          if (queued && phase !== 'writing' && phase !== 'clearing') {
-            // Asked for mid-turn: started now, before the `writing` check, so this turn's end never looks for a note.
-            $.clock.after(0, () => void startMainHandover($))
-          } else if (phase === 'offered' && cfg.mainMode === 'auto' && !e.isAborted) {
-            $.clock.after(0, () => void startMainHandover($))
-          } else if (phase === 'writing') {
-            $.clock.after(0, () => void finishMainHandover($))
-          }
-        }
-      } catch (err) {
-        $.ui.log(`orchestrator: turn end not handled: ${String(err)}`)
-      }
-      return res
+      return await next(e)
     } finally {
-      // Last, after the engine's own work beneath is done: delivers what timers queued. A send made while
-      // that work is under way wakes its run with this hook kind skipped, so nothing is sent earlier.
       await drain($)
     }
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    // Main's turn is over whatever happens beneath: a failing `next` must not leave it marked busy.
+    // A handover queued mid-turn starts even then, so it is taken off the queue before `next` too.
+    const queued = e.agentId === undefined && mainHandoverQueued
+    if (e.agentId === undefined) {
+      mainBusy = false
+      mainHandoverQueued = false
+    }
+    let res: Awaited<ReturnType<typeof next>>
+    try {
+      res = await next(e)
+    } catch (err) {
+      if (queued) {
+        await update($, queuedAtom, () => false)
+        $.clock.after(0, () => void startMainHandover($))
+      }
+      throw err
+    }
+    try {
+      if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer, e.reason)
+      else {
+        if (queued) await update($, queuedAtom, () => false)
+        const phase = await read($, phaseAtom)
+        if (queued && phase !== 'writing' && phase !== 'clearing') {
+          // Asked for mid-turn: started now, before the `writing` check, so this turn's end never looks for a note.
+          $.clock.after(0, () => void startMainHandover($))
+        } else if (phase === 'offered' && cfg.mainMode === 'auto' && !e.isAborted) {
+          $.clock.after(0, () => void startMainHandover($))
+        } else if (phase === 'writing') {
+          $.clock.after(0, () => void finishMainHandover($))
+        }
+      }
+    } catch (err) {
+      $.ui.log(`orchestrator: turn end not handled: ${String(err)}`)
+    }
+    return res
   })
 
   on('command.run', { command: 'orch' }, async ($, e) => {
@@ -1238,8 +1274,8 @@ export const register: Register = (on, options) => {
       }
       return { text: 'Usage: /orch [close | roster | handover [name|id|main]]' }
     } finally {
-      // Last, after the engine's own work beneath is done: delivers what timers queued. A send made while
-      // that work is under way wakes its run with this hook kind skipped, so nothing is sent earlier.
+      // Last: delivers what timers queued. A run woken from inside a hook runs without that hook kind, and
+      // none needs turn.complete (or command.run) to be tracked, so only these two deliver.
       await drain($)
     }
   })
