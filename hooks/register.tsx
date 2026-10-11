@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
+import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
 import { toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
@@ -71,6 +71,8 @@ const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
+/** Messages timers queued for the next hook to deliver (a send from a timer wakes a run without hooks). */
+const outboxAtom = atom({ plugin: 'orchestrator', key: 'outbox' } as const, [] as Delivery[])
 /** Rows collapsed by a double-click, their finished descendants hidden; display only. */
 const collapsedAtom = atom({ plugin: 'orchestrator', key: 'collapsed' } as const, [] as string[])
 /** The tool call open in the detail dialog, read off the render by refreshTool. */
@@ -121,6 +123,20 @@ const transcriptReads: ReadSlot = { busy: new Set(), again: new Set() }
 const toolReads: ReadSlot = { busy: new Set(), again: new Set() }
 /** What guardedRead gives when the key's read was already in flight (the trigger is remembered instead). */
 const IN_FLIGHT = Symbol('in flight')
+/**
+ * Ids of queued messages already delivered, newest last: a restore skips them, even from a state.json
+ * written by a persist that read the queue before the drain. Kept in memory (a /clear does not reset
+ * it) and in state.json (for a reload).
+ */
+const delivered: string[] = []
+/** How many delivered ids are kept. */
+const DELIVERED_MAX = 200
+/** Numbers queued messages within this module's life. */
+let deliverySeq = 0
+/** A drain is under way: another hook does not start a second. */
+let draining = false
+/** Main was prompted to run a hooked turn for the outbox, and nothing has drained since: no second prompt. */
+let nudgedSinceDrain = false
 /** The last row press, to tell a double-click (two presses within 400 ms) and undo its first click. */
 let lastPress: { key: string; t: number; prevSelected: string } | undefined
 /** Row presses, one at a time in the order they came. */
@@ -165,10 +181,19 @@ async function restore($: $) {
   if (!runDirCache || (await read($, runAtom))) return
   const path = `${runDirCache}/state.json`
   if (!(await $.fs.exists(path))) return
-  const saved = JSON.parse(await $.fs.read(path)) as { agents: AgentRow[]; mainPhase: MainPhase; runId: string }
+  const saved = JSON.parse(await $.fs.read(path)) as {
+    agents: AgentRow[]
+    mainPhase: MainPhase
+    runId: string
+    outbox?: Delivery[]
+    delivered?: string[]
+  }
   await update($, runAtom, () => saved.runId)
   await update($, agentsAtom, () => saved.agents)
   await update($, phaseAtom, () => saved.mainPhase)
+  // Undelivered messages outlive a /clear too; anything queued since is kept after them.
+  const done = new Set([...delivered, ...(saved.delivered ?? [])])
+  await update($, outboxAtom, q => [...(saved.outbox ?? []).filter(d => !done.has(d.id)), ...q])
 }
 
 async function log($: $, text: string, lvl: LogEntry['level'] = 'info') {
@@ -182,7 +207,8 @@ async function persist($: $) {
   const agents = await read($, agentsAtom)
   const mainPhase = await read($, phaseAtom)
   const runId = await read($, runAtom)
-  await $.fs.write(`${dir}/state.json`, JSON.stringify({ runId, mainPhase, agents }))
+  const outbox = await read($, outboxAtom)
+  await $.fs.write(`${dir}/state.json`, JSON.stringify({ runId, mainPhase, agents, outbox, delivered }))
   await $.fs.write(`${dir}/roster.md`, rosterMarkdown(agents))
   const subs = agents.filter(a => a.id !== 'main')
   const live = subs.filter(a => LIVE.includes(a.status))
@@ -657,6 +683,75 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
   }
 }
 
+// ---- delivery from timers ---------------------------------------------
+//
+// A run woken by `$.session.send` (or started by `$.agent.spawn`) from a `$.clock` callback runs
+// without the mod's hooks: no tool.call, no turn.step, so no HANDOVER and no tracking. The same call
+// made inside a hook keeps them. So timers never send: they queue, and every hook drains the queue.
+
+/** Queues a message for the next hook to deliver, and writes it to state.json so a /clear keeps it. */
+async function enqueue($: $, d: Omit<Delivery, 't' | 'id'>) {
+  const t = await $.clock.now()
+  const id = `${t}-${++deliverySeq}`
+  await update($, outboxAtom, q => [...q, { ...d, t, id }])
+  await persist($)
+}
+
+/**
+ * Delivers every queued message from the hook that awaits it. It waits for one state update only:
+ * the queue is taken and emptied at once (so two hooks never deliver one message twice), then every
+ * send is started before it returns, still inside the hook, and none is awaited, so a send that never
+ * answers holds up neither the hook nor a later drain. A failed send is warned and dropped. Never throws.
+ */
+async function drain($: $) {
+  if (draining) return
+  draining = true
+  let taken: Delivery[] = []
+  try {
+    await update($, outboxAtom, q => {
+      taken = q
+      return []
+    })
+  } catch (err) {
+    $.ui.log(`orchestrator: outbox not drained: ${String(err)}`)
+  } finally {
+    draining = false
+  }
+  if (taken.length === 0) return
+  nudgedSinceDrain = false
+  // Recorded as delivered before any send starts: a restore never brings one back.
+  delivered.push(...taken.map(d => d.id))
+  delivered.splice(0, Math.max(0, delivered.length - DELIVERED_MAX))
+  for (const d of taken) {
+    try {
+      void $.session
+        .send({ to: { agentId: d.agentId }, text: d.text })
+        .then(
+          sent => (sent.isDelivered ? undefined : log($, `${d.what} not delivered (${sent.reason})`, 'warn')),
+          err => log($, `${d.what} not delivered: ${String(err)}`, 'warn'),
+        )
+        .catch(() => undefined)
+    } catch (err) {
+      void log($, `${d.what} not delivered: ${String(err)}`, 'warn').catch(() => undefined)
+    }
+  }
+  // The emptied queue reaches state.json too, off the hook's path.
+  void persist($).catch(() => undefined)
+}
+
+/**
+ * From sync: when messages have waited a whole sync with no hook to deliver them, prompts main once
+ * (marked as the mod's), whose hooked turn drains them. Not while main is mid-turn (its steps drain),
+ * and not again until a drain has happened.
+ */
+async function nudgeIfStuck($: $) {
+  if (mainBusy || nudgedSinceDrain || (await read($, outboxAtom)).length === 0) return
+  nudgedSinceDrain = true
+  await $.prompt.submit({
+    text: '[orchestrator mod] queued messages are waiting for delivery to your agents; this turn delivers them. Nothing to do: reply "ok".',
+  })
+}
+
 /** Sends each due check-in to whoever armed it, once: the deadline is cleared before the message goes. */
 async function fireCheckins($: $, now: number) {
   for (const r of checkinDue(await read($, agentsAtom), now)) {
@@ -674,8 +769,8 @@ async function fireCheckins($: $, now: number) {
         $.clock.after(0, () => void $.prompt.submit({ text }))
         $.ui.toast(`orchestrator: check-in: ${label(r)} has not reported after ${r.checkinMins ?? '?'} min`)
       } else {
-        const sent = await $.session.send({ to: { agentId: by }, text })
-        if (!sent.isDelivered) await log($, `check-in for ${label(r)} not delivered (${sent.reason})`, 'warn')
+        // From sync, a timer: queued for the next hook to deliver, so the woken parent keeps its hooks.
+        await enqueue($, { agentId: by, text, what: `check-in for ${label(r)}` })
       }
     } catch (err) {
       await log($, `check-in for ${label(r)} not delivered: ${String(err)}`, 'warn')
@@ -759,6 +854,12 @@ async function sync($: $) {
     }
   }
   if (changed) await persist($)
+  try {
+    // Messages queued by an earlier sync and still undelivered get main to run a hooked turn.
+    await nudgeIfStuck($)
+  } catch (err) {
+    $.ui.log(`orchestrator: outbox nudge failed: ${String(err)}`)
+  }
   try {
     await fireCheckins($, now)
   } catch (err) {
@@ -861,6 +962,8 @@ export const register: Register = (on, options) => {
   toolReads.again.clear()
   lastPress = undefined
   pressQueue = Promise.resolve()
+  draining = false
+  nudgedSinceDrain = false
 
   // ---- events ----------------------------------------------------------
 
@@ -933,7 +1036,10 @@ export const register: Register = (on, options) => {
  }).catch(($, e, next) => next(e)) // tracking failed: the spawn goes ahead either way
 
   on('turn.step', async function* ($, e, next) {
+    // Every hook delivers what timers queued: once as it starts, once as the engine's own work settles.
+    await drain($)
     const res = yield* next(e)
+    await drain($)
     if (!res.usage) return res
     try {
       await restore($)
@@ -988,6 +1094,7 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    await drain($)
     // The mod's own tool: answered here, never passed on (a call no hook answers fails).
     if (e.tool === CHECKIN_TOOL) {
       const answer = await checkin($, e.agentId, argsOf(e))
@@ -1016,6 +1123,8 @@ export const register: Register = (on, options) => {
       }
     }
     const res = await next(e)
+    // A long call may have outlasted a sync: deliver what it queued meanwhile.
+    await drain($)
     if (e.agentId === undefined) return res
     if (res.deny !== undefined) {
       // A refused call is still an action: a report before it was not the run's last (a refused report is not ok).
@@ -1053,6 +1162,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    await drain($)
     // Main's turn is over whatever happens beneath: a failing `next` must not leave it marked busy.
     // A handover queued mid-turn starts even then, so it is taken off the queue before `next` too.
     const queued = e.agentId === undefined && mainHandoverQueued
@@ -1070,6 +1180,7 @@ export const register: Register = (on, options) => {
       }
       throw err
     }
+    await drain($)
     try {
       if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer, e.reason)
       else {
@@ -1091,6 +1202,7 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'orch' }, async ($, e) => {
+    await drain($)
     const [verb, ...rest] = e.args.trim().split(/\s+/)
     const target = rest.join(' ')
     if (!verb) {
@@ -1140,6 +1252,19 @@ export const register: Register = (on, options) => {
         <Button key="dismiss" label="Not now" onPress={() => setPhase($, 'cooldown')} />
       </Box>
     )
+  })
+
+  // A pane Hand over press is handled here, in hook context: a send from the button's own closure runs in
+  // the plugin's environment like a timer's, and could wake the agent without the mod's hooks.
+  on('ui.press', async ($, e, next) => {
+    const id = e.element.startsWith('handover:') ? e.element.slice('handover:'.length) : ''
+    if (e.plugin !== 'orchestrator' || e.requestId !== PANE || id === '' || id === 'main') return next(e)
+    try {
+      await startHandover($, id, 'from the pane')
+    } catch (err) {
+      $.ui.log(`orchestrator: hand over from the pane failed: ${String(err)}`)
+    }
+    return { element: e.element }
   })
 
   // The dialog closed by anyone (Close, Escape, the host): forget its call. The close always goes on.
@@ -1312,7 +1437,8 @@ export const register: Register = (on, options) => {
                       key={`handover:${row.id}`}
                       variant="secondary"
                       label="Hand over"
-                      onPress={() => startHandover($, row.id, 'from the pane')}
+                      // The send is made in the ui.press hook (real hook context); this closure only marks the press.
+                      onPress={() => undefined}
                     />
                   )}
                 </Box>,

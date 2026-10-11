@@ -102,6 +102,12 @@ export type ToolDetail = { tool: string; time: string; isError: boolean; isPendi
  */
 export type ToolView = { agentId: string; toolUseId: string; inline: boolean; detail?: ToolDetail; denied?: true }
 
+/**
+ * A message a timer wanted sent. A run woken by a send made from a timer callback runs without the
+ * mod's hooks, so timers queue it and the next hook delivers it.
+ */
+export type Delivery = { id: string; agentId: string; text: string; what: string; t: number }
+
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
 
 declare module 'claude-code' {
@@ -117,6 +123,8 @@ declare module 'claude-code' {
       selectedAgent: string
       /** Each agent's last transcript items by id, read off the render; the pane draws the selected one's. */
       transcripts: Record<string, Transcript>
+      /** Messages queued by timers, delivered by the next hook to run. */
+      outbox: Delivery[]
       /** Rows collapsed by a double-click: their finished descendants are hidden from the pane (display only). */
       collapsed: string[]
       /** The tool call open in the detail dialog, or null. */
