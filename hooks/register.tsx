@@ -496,12 +496,13 @@ async function respawn($: $, old: AgentRow) {
 async function onAgentEnd($: $, id: string, answer: string) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   if (!r) return
-  if (r.status === 'handing-over') {
+  // A stalled handover is settled by its end like any other: by the note, if it wrote one late.
+  if (r.status === 'handing-over' || r.status === 'stalled') {
     if (r.notePath && (await $.fs.exists(r.notePath))) {
       await update($, agentsAtom, l => patch(l, id, { status: 'replaced' }))
       await log($, `${label(r)} handed over (${r.notePath})`)
       if (cfg.autoRespawn) await respawn($, { ...r, status: 'replaced' })
-    } else if (r.handoverVia !== 'message') {
+    } else if (r.status === 'handing-over' && r.handoverVia !== 'message') {
       // It finished before a tool result could carry the HANDOVER: the message wakes it to write the note.
       await sendHandover($, id, 'ended before seeing it')
       return
@@ -520,6 +521,13 @@ async function onAgentEnd($: $, id: string, answer: string) {
   await persist($)
 }
 
+/**
+ * A resumed run not yet ended (its end sets idle) that stepped within STALL_MS: the engine may leave it
+ * out of its list while it runs, so only its end, or that long a silence, settles it.
+ */
+const resumedRunning = (r: AgentRow, now: number) =>
+  r.status === 'running' && r.resumedAt !== undefined && now - r.lastActive <= STALL_MS
+
 /** Marks agents the engine no longer lists as done, and handovers that hang as stalled. */
 async function sync($: $) {
   const listed = new Set((await $.agent.list()).map(a => a.id))
@@ -533,7 +541,7 @@ async function sync($: $) {
       await log($, `${label(r)} has not handed over after ${Math.round(STALL_MS / 60_000)} min`, 'warn')
       void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' })
       changed = true
-    } else if (isActive(r) && !listed.has(r.id)) {
+    } else if (isActive(r) && !listed.has(r.id) && !resumedRunning(r, now)) {
       await update($, agentsAtom, l => patch(l, r.id, { status: 'done' }))
       changed = true
     }
@@ -1016,6 +1024,7 @@ export const register: Register = (on, options) => {
                   <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
                     <Text bold={hl === row.id}>{label(row)} </Text>
+                    {row.resumedAt !== undefined && <Text dimColor>↻ </Text>}
                     {model !== '' && <Text dimColor>{model} </Text>}
                     <Text color={tone[level(row.tokens, ceiling)]}>
                       {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
@@ -1179,9 +1188,15 @@ export const register: Register = (on, options) => {
               {lead}
             </Text>
           )
+          // A resumed agent's dim ↻ sits inside the name cell, which keeps its width.
+          const room = NAME - lead.length
+          const mark = (row.resumedAt === undefined ? '' : ' ↻').slice(0, room)
+          const name = label(row).slice(0, room - mark.length)
           const nameCell = (
             <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
-              {label(row).slice(0, NAME - lead.length).padEnd(NAME - lead.length)}
+              {name}
+              {mark !== '' && <Text dimColor>{mark}</Text>}
+              {' '.repeat(room - name.length - mark.length)}
             </Text>
           )
           const model = modelLabel(row.model ?? row.brief?.model, row.effort)

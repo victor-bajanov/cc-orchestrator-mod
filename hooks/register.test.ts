@@ -1878,3 +1878,109 @@ describe('tool detail', () => {
     await ui.unmount()
   })
 })
+
+describe('stalled handovers and resumed agents', () => {
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const own = (n: Drawn): string => (n.children ?? []).filter(c => typeof c === 'string').join('')
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+  const STALL = 20 * 60_000 + 30_000
+
+  /** impl-1 past the threshold, its HANDOVER carried by a tool result, then left past the stall time. */
+  const stalled = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    await w.clock.advance(STALL)
+    expect(row(w, 'agent1')!.status).toBe('stalled')
+  }
+
+  test('a stalled agent that ends having written its note is replaced and respawned', async ($, on) => {
+    const w = world(on)
+    await stalled($, w)
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    expect(row(w, 'agent1')!.status).toBe('replaced')
+    expect(w.spawns).toHaveLength(2)
+  })
+
+  test('a stalled agent that ends without a note is done, and is sent nothing more', async ($, on) => {
+    const w = world(on)
+    await stalled($, w)
+    const sent = w.sent.length
+    await complete($, 'agent1', 'gave up')
+    expect(row(w, 'agent1')!.status).toBe('done')
+    expect(w.sent).toHaveLength(sent)
+    expect(w.spawns).toHaveLength(1)
+  })
+
+  /** A replacement (agent2, ours, reporting to main) that ran once, ended and was settled done by sync. */
+  const finishedReplacement = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'Orchestrate.', name: 'orchestrator' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/orchestrator-agent1-1.md`, 'x')
+    await complete($, 'agent1')
+    await step($, 'agent2')
+    await complete($, 'agent2', 'FIRST REPORT')
+    await w.clock.advance(30_000)
+    expect(w.prompts.some(p => p.includes('FIRST REPORT'))).toBe(true)
+    expect(row(w, 'agent2')!.status).toBe('done')
+  }
+
+  test('an agent resumed after it ended runs again, reports again, and ends done', async ($, on) => {
+    const w = world(on)
+    await finishedReplacement($, w)
+    const now = await w.clock.now()
+    await step($, 'agent2')
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ status: 'running', resumedAt: now }))
+    // the engine may leave a resumed agent out of its list while it runs: sync must not settle it mid-run
+    await w.clock.advance(30_000)
+    expect(row(w, 'agent2')!.status).toBe('running')
+    await complete($, 'agent2', 'SECOND REPORT')
+    expect(row(w, 'agent2')!.status).toBe('idle')
+    await w.clock.advance(30_000)
+    expect(w.prompts.some(p => p.includes('SECOND REPORT'))).toBe(true)
+    expect(row(w, 'agent2')!.status).toBe('done')
+  })
+
+  test('a resumed agent silent past the stall time is settled done by sync', async ($, on) => {
+    const w = world(on)
+    await finishedReplacement($, w)
+    await step($, 'agent2')
+    await w.clock.advance(STALL)
+    expect(row(w, 'agent2')!.status).toBe('done')
+  })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a resumed agent shows a dim ↻ after its label (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      await complete($, 'agent1')
+      await w.clock.advance(30_000)
+      const ui = await mountPane($, surface, 100)
+      const marks = async () => walk(await ui.drawn()).filter(b => b.type === 'Text' && own(b).includes('↻'))
+      expect(await marks()).toHaveLength(0)
+      await step($, 'agent1')
+      const found = await marks()
+      expect(found).toHaveLength(1)
+      expect(own(found[0]!).trim()).toBe('↻')
+      expect(found[0]!.props?.dimColor).toBe(true)
+      if (surface === 'desktop') {
+        expect((await ui.find({ key: 'agent:agent1' }))!.text).toMatch(/impl-1\s*↻/)
+      } else {
+        // glyph and name, mark included, still fill exactly the NAME columns
+        const NAME = Math.min(24, Math.max(12, Math.floor(100 * 0.25)))
+        const button = walk(await ui.drawn()).find(b => b.props?.key === 'agent:agent1')!
+        expect(textOf(button)).toHaveLength(NAME)
+        expect(textOf(button)).toMatch(/impl-1\s*↻/)
+      }
+      await ui.unmount()
+    })
+  }
+})
