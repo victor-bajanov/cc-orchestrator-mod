@@ -1,8 +1,8 @@
-# Bug: runs a mod starts from a timer, or wakes from inside a hook, lose that mod's hooks
+# Bug: a run a mod starts from a `$.clock` timer loses that mod's hooks
 
 **Versions:** Claude Code 2.1.296 (terminal) and 2.1.295 (the desktop app's bundled engine). Both reproduce.
 
-Two related re-entry quirks, filed together. Finding 1 is about timers; finding 2 is about sends made inside a hook.
+Finding 1 is the bug to file. Finding 2 is documented behaviour that is easy to trip over across a send; it is here because it shapes the workaround, and because it shows finding 1 isn't the same rule.
 
 ## Finding 1: a run started from a `$.clock` timer has no `tool.call` or `turn.step` hooks
 
@@ -73,27 +73,30 @@ The probe plugin, headless runs and logs are in the session scratchpad `probe-se
 
 In `markers.log` (run 7), the timer's `spawn(timer)` resolves `{"agentId":"a51dad60336b1a283"}`. The log then has a `turn.complete agent=a51dad60336b1a283` line, but no `tool.call` and no `turn.step` line for that agent. No `CATCH` line appears at all. The send or spawn itself always resolved (`{"isDelivered":true}` for sends).
 
-## Finding 2: a run woken by a send made inside hook X runs without the mod's hook X
+## Finding 2 (documented, not a bug): re-entry is per hook registration, and it follows a send
 
 ### Summary
 
-A run woken by a `$.session.send` made inside hook X runs without the mod's hook X (observed for `turn.step` and `tool.call`), even when the send comes after `next()`. Its other hooks still fire.
+A run woken by a `$.session.send` made inside one hook registration R runs without R, even when the send comes after `next()`. The mod's other registrations, including other registrations of the same event, still run for it. This is the documented re-entry rule: "no hook runs under its own frame" (`HookFailure.kind`, `re-entry`, in the engine's `index.d.ts` at line 5145). What surprises is that the frame carries across a send into a different agent's run.
 
-- A send from inside `turn.step` wakes a run whose steps reach no `turn.step` hook, so the mod can't track its context.
-- A send from inside `tool.call` wakes a run whose calls reach no `tool.call` hook, so a call to the mod's own tool fails with "no tool.call hook answered".
-- A send from inside `turn.complete` wakes a run that keeps every hook.
+- A send from inside a `turn.step` registration: the woken run's steps skip that registration, so a mod tracking context there loses them.
+- A send from inside a `tool.call` registration: the woken run's tool calls skip it, so if that registration is the one that answers the mod's tool, the call fails with "no tool.call hook answered".
+- A send from a registration that the woken run doesn't need (for example, a `turn.complete` registration that only sends) costs nothing.
 
-### Expected
+This explains finding 1's `kid-inline` row: there, the send was made from the `poke` `tool.call` registration, and the woken run's `ping` was answered by a different registration, the `ping` one.
 
-A woken run gets all of the mod's hooks, whichever hook the send was made in.
+### Suggestion
 
-### Minimal repro
+Say in the `session.send` and `agent.spawn` docs that a run they start counts as beneath the calling registration's frame.
 
-With plugin `x` from finding 1, and the `turn.complete` hook removed, add:
+### Repro
+
+Start from plugin `x` in finding 1, without its `turn.complete` hook. Replace its `ping` registration with one catch-all `tool.call` registration that both answers the ping and sends:
 
 ```ts
 let target: string | undefined // a finished background subagent's id, recorded at its turn.complete
 on('tool.call', async ($, e, next) => {
+  if (e.tool === 'mcp__x__ping') return { result: 'pong' } as never
   const res = await next(e)
   if (target && e.agentId && e.agentId !== target) {
     const to = target
@@ -104,10 +107,10 @@ on('tool.call', async ($, e, next) => {
 })
 ```
 
-1. Spawn two background subagents. Let one finish (record its id as `target`), and keep the other running tool calls (for example, a few `sleep 25` Bash calls).
-2. On the busy agent's next tool call, the hook sends to `target`. `target` resumes and calls `mcp__x__ping`, and the result is `no tool.call hook answered this call`.
-3. Move the same send into a `turn.step` hook (after `yield* next(e)`). The woken run's ping now works, but no `turn.step` fires for its steps.
-4. Move it into `turn.complete`: the woken run keeps both hooks.
+1. Spawn two background subagents. Let one finish and record its id as `target`. Keep the other making tool calls (for example, a few `sleep 25` Bash calls).
+2. On the busy agent's next tool call, the registration sends to `target`. `target` resumes and calls `mcp__x__ping`. The result is `no tool.call hook answered this call`, because the only registration that answers it is the one the send came from.
+3. Keep the ping in its own registration, as finding 1 has it, and send from the catch-all one: the ping returns `pong`.
+4. Send from a `turn.step` registration instead, after `yield* next(e)`: the ping works, but that registration doesn't run for the woken run's steps.
 
 ### Evidence
 
@@ -117,11 +120,16 @@ Two headless runs of the orchestrator mod itself (2.1.296), in the session scrat
 - **Run A, send inside `turn.step`.** The check-in is sent during main's turn (started by the mod's `[orchestrator mod] queued messages…` prompt at 08:09:00). The woken `parent` calls `mcp__orchestrator__checkin` at 08:09:06 and gets `checkin: armed…`, so `tool.call` fired. But `state.json` has no samples for its steps at 08:09:06 or 08:09:08 (samples jump from 08:08:13.330 to 08:10:14.681), so `turn.step` did not.
 - **Both runs, send inside `turn.complete`.** The auto-forwarded final reports (`… (may duplicate a message it sent you), auto-forwarded`) are sent from `turn.complete`. The runs they wake are fully tracked: their steps are in `state.json` (A: 08:10:14.681; B: 08:10:26.767, 08:10:44.385).
 
-A tension to note: in finding 1's probe, `kid-inline` (a send awaited inside a `tool.call` hook) kept its `tool.call` hook. That probe mode's exact code wasn't kept, so how it differs from run B is unknown.
+- **Runs C and D (mod at commit d9e6000), sends from a dedicated `turn.complete` registration that does nothing but drain the queue.** Every woken run and replacement was fully tracked. In run C (`promptC.txt`, `runC.jsonl`, `projC/…/state.json`), the parent was woken by check-ins and forwards and called `mcp__orchestrator__checkin` successfully every time (9 `checkin: armed` results, none unanswered), and all 8 of its steps were recorded. In run D (`promptD.txt`, `runD.jsonl`, `projD/…/state.json`), a HANDOVER and a respawn went through the drain, and the replacement's step was recorded.
 
 ## Impact on mods
 
-- A mod that wakes an agent on a deadline has to do it from a timer, or from whichever hook runs next. The agent it wakes then can't call the mod's tools, and the mod loses its context tracking (`turn.step`) and HANDOVER attachment (`tool.call`) for that run.
-- The failure is silent: the send resolves as delivered and no `.catch` fires. The agent sees only a tool error.
-- Finding 2 means a send can't simply move from the timer into the next hook: only `turn.complete` is a safe place to send from.
-- **Workaround** (used by the orchestrator mod): timers never send or spawn. Cross-agent sends that would come from a timer, `turn.step` or `tool.call` (check-in wake-ups, a HANDOVER message to an idle agent) are queued and sent from the next `turn.complete` of any agent. If the queue survives a sync while main is idle, one short `[orchestrator mod]` `$.prompt.submit` to main starts a turn whose end sends them.
+- A mod that wakes an agent on a deadline has to do it from a timer, and finding 1 means the run it wakes can't use the mod's tools and isn't tracked. The failure is silent: the send resolves as delivered and no `.catch` fires, not even with `re-entry`. The agent sees only a tool error.
+- Finding 2 means the next hook isn't automatically a safe place to send from: a send from the registration that tracks steps, or that answers the mod's tool, disables it for the woken run.
+
+## Workaround (used by the orchestrator mod)
+
+- Timers never send or spawn.
+- Cross-agent sends and spawns (check-in wake-ups, idle HANDOVER messages, forwarded reports, respawns) go into a queue (state key `outbox`).
+- A dedicated `turn.complete` registration that does nothing but drain the queue sends them at the next turn end of any agent. A woken run loses only that drain registration, and keeps every hook it needs.
+- A run the drain wakes or spawns can't drain the queue itself, so whatever it queues waits for another agent's turn end. If the queue survives a 30-second sync while main is idle, the mod submits one short `[orchestrator mod]` prompt to main, whose turn end drains it.
