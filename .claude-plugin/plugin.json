@@ -21,7 +21,7 @@
     "mainHandover": {
       "type": "string",
       "title": "Main thread handover",
-      "description": "auto: restart without asking; ask: offer a button above the prompt; off: never.",
+      "description": "auto: restart without asking; ask: offer a Hand over main button in the pane, and a band above the prompt past the threshold; off: never.",
       "options": ["ask", "auto", "off"],
       "default": "ask"
     },
