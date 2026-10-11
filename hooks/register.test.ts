@@ -1071,13 +1071,21 @@ describe('agent transcript', () => {
     })
   }
 
-  test('terminal: main has no transcript button', async ($, on) => {
+  test('terminal: main is pressable (to collapse it) but opens no transcript', async ($, on) => {
     const w = world(on)
+    let asked = 0
+    on('session.messages', () => {
+      asked++
+      return { value: transcript as never }
+    })
     await running($, w)
     await step($)
     const ui = await mountPane($, 'terminal')
     expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
-    expect(await ui.find({ key: 'agent:main' })).toBeUndefined()
+    await ui.press({ key: 'agent:main' })
+    await w.clock.settle()
+    expect(await ui.find({ key: 'transcript:main' })).toBeUndefined()
+    expect(asked).toBe(0)
     await ui.unmount()
   })
 
@@ -2350,4 +2358,175 @@ describe('auto-forward', () => {
       expect(row(w, 'agent2')!.status).toBe('idle')
     })
   }
+})
+
+describe('collapse', () => {
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  /** agent1 orchestrating under main: agent2 and agent3 done, agent4 running. */
+  const crew = async ($: Engine, w: World) => {
+    await running($, w)
+    for (const n of [2, 3, 4]) {
+      await spawn($, { prompt: `P${n}`, name: `impl-${n}`, parentAgentId: 'agent1' })
+      await step($, `agent${n}`)
+    }
+    await complete($, 'agent2', 'R2')
+    await complete($, 'agent3', 'R3')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent4', name: 'impl-4' }]
+    await w.clock.advance(30_000)
+    expect([2, 3].map(n => row(w, `agent${n}`)!.status)).toEqual(['done', 'done'])
+  }
+  /** Whether a row is drawn: the desktop's row Button, the terminal's row Box. */
+  const drawn = async (ui: Ui, surface: 'terminal' | 'desktop', id: string) =>
+    surface === 'desktop'
+      ? (await ui.find({ key: `agent:${id}` })) !== undefined
+      : walk(await ui.drawn()).some(b => b.type === 'Box' && b.props?.key === id)
+  const rowText = async (ui: Ui, surface: 'terminal' | 'desktop', id: string) =>
+    surface === 'desktop'
+      ? (await ui.find({ key: `agent:${id}` }))!.text
+      : textOf(walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === id))
+  const double = async (ui: Ui, id: string) => {
+    await ui.press({ key: `agent:${id}` })
+    await ui.press({ key: `agent:${id}` })
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a double-click collapses finished descendants, and another expands them (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await double(ui, 'agent1')
+      await w.clock.settle()
+      expect(await drawn(ui, surface, 'agent2')).toBe(false)
+      expect(await drawn(ui, surface, 'agent3')).toBe(false)
+      expect(await drawn(ui, surface, 'agent4')).toBe(true)
+      expect(await rowText(ui, surface, 'agent1')).toContain('+2 done')
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+      if (surface === 'desktop') {
+        const src = String((await ui.find({ type: 'Svg' }))!.props.source)
+        expect(src).not.toContain('stroke="#E69F00"')
+        expect(src).not.toContain('stroke="#009E73"')
+        expect(src).toContain('stroke="#CC79A7"')
+      }
+      await double(ui, 'agent1')
+      expect(await drawn(ui, surface, 'agent2')).toBe(true)
+      expect(await drawn(ui, surface, 'agent3')).toBe(true)
+      expect(await rowText(ui, surface, 'agent1')).not.toContain('+2 done')
+      await ui.unmount()
+    })
+
+    test(`two presses 500 ms apart are two single clicks (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeDefined()
+      await w.clock.advance(500)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+      expect(await drawn(ui, surface, 'agent2')).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`a double-click keeps the transcript that was open; on a childless row it does nothing (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent4' })
+      await w.clock.advance(1000)
+      await double(ui, 'agent1')
+      await w.clock.settle()
+      expect(await drawn(ui, surface, 'agent2')).toBe(false)
+      expect(await ui.find({ key: 'transcript:agent4' })).toBeDefined()
+      await w.clock.advance(1000)
+      await double(ui, 'agent4')
+      await w.clock.settle()
+      expect(await ui.find({ key: 'transcript:agent4' })).toBeDefined()
+      expect(await drawn(ui, surface, 'agent4')).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`main collapses its finished top-level agents and keeps a running one (${surface})`, async ($, on) => {
+      const w = world(on)
+      await crew($, w)
+      await step($)
+      await complete($, 'agent4', 'R4')
+      await complete($, 'agent1', 'R1')
+      await spawn($, { prompt: 'P5', name: 'impl-5' })
+      await step($, 'agent5')
+      w.agents = [{ id: 'agent5', name: 'impl-5' }]
+      await w.clock.advance(30_000)
+      const ui = await mountPane($, surface)
+      expect(await ui.find({ key: 'agent:main' })).toBeDefined()
+      await double(ui, 'main')
+      for (const n of [1, 2, 3, 4]) expect(await drawn(ui, surface, `agent${n}`)).toBe(false)
+      expect(await drawn(ui, surface, 'agent5')).toBe(true)
+      expect(await rowText(ui, surface, 'main')).toContain('+4 done')
+      await ui.unmount()
+    })
+
+    test(`a collapsed row counts a child that finishes later (${surface})`, async ($, on) => {
+      const w = world(on)
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await double(ui, 'agent1')
+      await complete($, 'agent4', 'R4')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }]
+      await w.clock.advance(30_000)
+      expect(await rowText(ui, surface, 'agent1')).toContain('+3 done')
+      expect(await drawn(ui, surface, 'agent4')).toBe(false)
+      await ui.unmount()
+    })
+  }
+
+  test('terminal: a narrow, nested, resumed, collapsed row keeps its name visible', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await spawn($, { prompt: 'P3', name: 'impl-3', parentAgentId: 'agent2' })
+    await spawn($, { prompt: 'P4', name: 'impl-4', parentAgentId: 'agent3' })
+    for (const n of [2, 3, 4]) await step($, `agent${n}`)
+    await complete($, 'agent4', 'R4')
+    await complete($, 'agent3', 'R3')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+    await w.clock.advance(30_000)
+    await step($, 'agent3') // resumed: running again, with its ↻
+    expect(row(w, 'agent3')!.resumedAt).toBeDefined()
+    const ui = await mountPane($, 'terminal', 40)
+    await double(ui, 'agent3')
+    expect(await drawn(ui, 'terminal', 'agent4')).toBe(false)
+    const button = walk(await ui.drawn()).find(b => b.props?.key === 'agent:agent3')!
+    const name = textOf((button.children as Drawn[])[1])
+    expect(name).toContain('impl')
+    // glyph and name still fill exactly the NAME columns
+    expect(textOf(button)).toHaveLength(12)
+    await ui.unmount()
+  })
+
+  test('collapse is display only and persists across a remount', async ($, on) => {
+    const w = world(on)
+    await crew($, w)
+    let ui = await mountPane($, 'desktop')
+    const header = (await ui.findAll({ type: 'Text' })).find(t => t.text.includes('live'))!.text
+    await double(ui, 'agent1')
+    expect((await ui.findAll({ type: 'Text' })).find(t => t.text.includes('live'))!.text).toBe(header)
+    const roster = w.files.get(`${RUN_DIR}/roster.md`) ?? ''
+    expect(roster).toContain('agent2')
+    expect(snapshot(w).agents.map(a => a.id)).toEqual(expect.arrayContaining(['agent2', 'agent3']))
+    await ui.unmount()
+    ui = await mountPane($, 'desktop')
+    expect(await ui.find({ key: 'agent:agent2' })).toBeUndefined()
+    await ui.press({ key: 'handover:agent4' })
+    expect(row(w, 'agent4')!.status).toBe('handing-over')
+    await ui.unmount()
+  })
 })

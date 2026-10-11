@@ -35,7 +35,11 @@ import {
   modelLabel,
   paneHeader,
   checkinDue,
+  childrenOf,
+  collapseHidden,
   forwardTarget,
+  hiddenCount,
+  isDoublePress,
   latest,
   namesAgent,
   seriesColors,
@@ -67,6 +71,8 @@ const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
+/** Rows collapsed by a double-click, their finished descendants hidden; display only. */
+const collapsedAtom = atom({ plugin: 'orchestrator', key: 'collapsed' } as const, [] as string[])
 /** The tool call open in the detail dialog, read off the render by refreshTool. */
 const toolViewAtom = atom({ plugin: 'orchestrator', key: 'toolView' } as const, null as ToolView | null)
 /** Each agent's last transcript items, read off the render by refreshTranscript. */
@@ -108,6 +114,8 @@ let mainHandoverStarting = false
 const peeking = new Set<string>()
 /** Agents triggered while their read was in flight: each is read once more when it settles. */
 const peekAgain = new Set<string>()
+/** The last row press, to tell a double-click (two presses within 400 ms) and undo its first click. */
+let lastPress: { key: string; t: number; prevSelected: string } | undefined
 /** Tool calls (`agentId:toolUseId`) whose detail read is in flight, and those triggered meanwhile. */
 const toolReading = new Set<string>()
 const toolAgain = new Set<string>()
@@ -192,6 +200,27 @@ async function toggleSelected($: $, id: string) {
   await update($, selectedAtom, s => (s === id ? '' : id))
   // Opening a transcript starts its read; the pane shows `loading…` until it settles.
   if ((await read($, selectedAtom)) === id) schedulePeek($, id)
+}
+
+/**
+ * A press on an agent's row. A single press opens or closes its transcript at once. The second press
+ * of a double-click restores the selection from before the first, then collapses or expands the
+ * row's finished descendants (a row with no children: nothing), so a double-click nets to that alone.
+ */
+async function pressAgent($: $, id: string) {
+  const now = await $.clock.now()
+  if (isDoublePress(lastPress, id, now)) {
+    const prev = lastPress!.prevSelected
+    lastPress = undefined
+    await update($, selectedAtom, () => prev)
+    if (childrenOf(await read($, agentsAtom), id).length > 0) {
+      await update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
+    }
+    return
+  }
+  const prevSelected = await read($, selectedAtom)
+  lastPress = { key: id, t: now, prevSelected }
+  await toggleSelected($, id)
 }
 
 /** How long a transcript read may take before the pane calls it not readable. */
@@ -774,6 +803,7 @@ export const register: Register = (on, options) => {
   stamps.clear()
   toolReading.clear()
   toolAgain.clear()
+  lastPress = undefined
 
   // ---- events ----------------------------------------------------------
 
@@ -1093,18 +1123,28 @@ export const register: Register = (on, options) => {
     const shown = mainButtonShown(cfg.mainMode, phase)
     // A press while queued does nothing: startMainHandover returns on the queued flag.
     const queued = await read($, queuedAtom)
+    // Collapsed rows hide their finished descendants from the tree and the chart; all else reads every row.
+    const collapsed = await read($, collapsedAtom)
+    const hidden = collapseHidden(rows, collapsed)
+    const visible = rows.filter(r => !hidden.has(r.id))
+    const doneMark = (id: string) => {
+      const n = collapsed.includes(id) ? hiddenCount(rows, id, hidden) : 0
+      return n > 0 ? `+${n} done` : ''
+    }
     // The transcript the host has open beside the pane (read-only; absent on older hosts and kit mounts). Main is never marked.
-    const viewed = liveSelection(rows, e.props.view?.agentId ?? '')
+    const viewed = liveSelection(visible, e.props.view?.agentId ?? '')
 
     if (e.surface !== 'terminal') {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
       const { Box, Button, Text, Svg } = $.ui.resolve(e)
-      const selected = liveSelection(rows, await read($, selectedAtom))
+      const selected = liveSelection(visible, await read($, selectedAtom))
+      // Colours and the time axis come from every row, so collapsing neither recolours nor rescales.
       const colors = seriesColors(rows)
       // A click selection wins; with none, the agent in view stands out.
       const hl = selected || viewed
       const chart = contextChart({
-        rows,
+        rows: visible,
+        t0: rows.reduce((m, r) => Math.min(m, r.startedAt), now),
         now,
         width: chartWidthPx(cols),
         height: 180,
@@ -1188,17 +1228,19 @@ export const register: Register = (on, options) => {
             <Svg key="chart" isInteractive source={chart.source} alt={chart.alt} width={chart.width} height={chart.height} />
           )}
           <Box flexDirection="column">
-            {orderRows(rows).flatMap(({ row, depth }) => {
+            {orderRows(visible).flatMap(({ row, depth }) => {
               const ceiling = ceilingOf(row, cfg)
               const pct = Math.round((row.tokens / ceiling) * 100)
               const shows = displayStatus(row, rows)
               const model = modelLabel(row.model ?? row.brief?.model, row.effort)
+              const folded = doneMark(row.id)
               return [
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
-                  <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
+                  <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
                     <Text bold={hl === row.id}>{label(row)} </Text>
                     {row.resumedAt !== undefined && <Text dimColor>↻ </Text>}
+                    {folded !== '' && <Text dimColor>{folded} </Text>}
                     {model !== '' && <Text dimColor>{model} </Text>}
                     <Text color={tone[level(row.tokens, ceiling)]}>
                       {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
@@ -1265,7 +1307,7 @@ export const register: Register = (on, options) => {
     const MODEL = 17
     const width = Math.max(8, cols - NAME - 7 - 14 - MODEL)
     const t0 = rows.reduce((m, r) => Math.min(m, r.startedAt), now)
-    const ordered = orderRows(rows)
+    const ordered = orderRows(visible)
     const glyph: Record<DisplayStatus, string> = {
       running: '●',
       waiting: '◐',
@@ -1275,7 +1317,7 @@ export const register: Register = (on, options) => {
       done: '✓',
       stalled: '!',
     }
-    const selected = liveSelection(rows, await read($, selectedAtom))
+    const selected = liveSelection(visible, await read($, selectedAtom))
     // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.
     const peek =
       selected && selected !== 'main'
@@ -1362,9 +1404,17 @@ export const register: Register = (on, options) => {
               {lead}
             </Text>
           )
-          // A resumed agent's dim ↻ sits inside the name cell, which keeps its width.
+          // A resumed agent's dim ↻ and a collapsed row's `+N done` sit inside the name cell, which keeps its width.
           const room = NAME - lead.length
-          const mark = (row.resumedAt === undefined ? '' : ' ↻').slice(0, room)
+          const folded = doneMark(row.id)
+          // The name keeps at least 4 columns (or its whole self); the marks shrink first: `+3 done` to `+3`, then the ↻ goes.
+          const spare = room - Math.min(label(row).length, 4)
+          const turn = row.resumedAt === undefined ? '' : ' ↻'
+          const short = folded.replace(/ done$/, '')
+          const mark =
+            [`${turn}${folded ? ` ${folded}` : ''}`, `${turn}${short ? ` ${short}` : ''}`, short ? ` ${short}` : '', ''].find(
+              m => m.length <= spare,
+            ) ?? ''
           const name = label(row).slice(0, room - mark.length)
           const nameCell = (
             <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
@@ -1376,15 +1426,11 @@ export const register: Register = (on, options) => {
           const model = modelLabel(row.model ?? row.brief?.model, row.effort)
           return [
             <Box key={row.id}>
-              {row.id === 'main' ? (
-                glyphCell
-              ) : (
-                <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
-                  {glyphCell}
-                  {nameCell}
-                </Button>
-              )}
-              {row.id === 'main' && nameCell}
+              {/* Main too is pressable, so a double-click can collapse it; a single press only bolds it. */}
+              <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
+                {glyphCell}
+                {nameCell}
+              </Button>
               <Text dimColor={!live}>{fmtTokens(row.tokens).padStart(6)} </Text>
               <Text dimColor>{model.slice(0, MODEL - 1).padEnd(MODEL - 1)} </Text>
               <Text color={live ? tone[level(row.tokens, ceiling)] : 'subtle'}>

@@ -11,12 +11,16 @@ import {
   chartWidthPx,
   contextChart,
   checkinDue,
+  childrenOf,
+  collapseHidden,
   cut,
   displayStatus,
   forwardTarget,
   effortAbbrev,
   hashText,
   hhmm,
+  hiddenCount,
+  isDoublePress,
   latest,
   logId,
   mainButtonShown,
@@ -863,5 +867,77 @@ describe('latest', () => {
     const rows = [row({ id: 'p1', replacedBy: 'p2' }), row({ id: 'p2' })]
     const c = row({ id: 'c', parentId: 'p1', background: true })
     expect(forwardTarget(c, 'R', 'answer', rows)).toEqual({ agentId: 'p2', mayDuplicate: false })
+  })
+})
+
+describe('collapse', () => {
+  const tree = (over: Record<string, Partial<AgentRow>> = {}) => [
+    main(),
+    row({ id: 'o', parentId: 'main', status: 'idle', ...over.o }),
+    row({ id: 'd1', parentId: 'o', status: 'done', ...over.d1 }),
+    row({ id: 'd2', parentId: 'o', status: 'done', ...over.d2 }),
+    row({ id: 'r1', parentId: 'o', status: 'running', ...over.r1 }),
+  ]
+  const ids = (s: Set<string>) => [...s].sort()
+
+  test('childrenOf: main has the top-level rows, an orchestrator its own', () => {
+    const rows = [...tree(), row({ id: 'top2', parentId: undefined })]
+    expect(childrenOf(rows, 'main').map(r => r.id)).toEqual(['o', 'top2'])
+    expect(childrenOf(rows, 'o').map(r => r.id)).toEqual(['d1', 'd2', 'r1'])
+    expect(childrenOf(rows, 'd1')).toEqual([])
+  })
+
+  test('collapsing hides done and replaced descendants only, and nothing when not collapsed', () => {
+    expect(ids(collapseHidden(tree(), ['o']))).toEqual(['d1', 'd2'])
+    expect(ids(collapseHidden(tree(), []))).toEqual([])
+    expect(ids(collapseHidden(tree({ d2: { status: 'replaced' } }), ['o']))).toEqual(['d1', 'd2'])
+  })
+
+  test('a done child with a live grandchild stays; its own done children go', () => {
+    const rows = [
+      ...tree(),
+      row({ id: 'g1', parentId: 'd1', status: 'running' }),
+      row({ id: 'g2', parentId: 'd1', status: 'done' }),
+    ]
+    expect(ids(collapseHidden(rows, ['o']))).toEqual(['d2', 'g2'])
+  })
+
+  test('a fully finished orchestrator collapsed hides all its descendants', () => {
+    const rows = tree({ r1: { status: 'done' } })
+    expect(ids(collapseHidden(rows, ['o']))).toEqual(['d1', 'd2', 'r1'])
+  })
+
+  test('main collapsed hides finished top-level agents and keeps running and stalled ones', () => {
+    const rows = [
+      main(),
+      row({ id: 'a', parentId: 'main', status: 'done' }),
+      row({ id: 'b', parentId: 'main', status: 'running' }),
+      row({ id: 'c', parentId: 'main', status: 'stalled' }),
+      row({ id: 'e', parentId: 'main', status: 'replaced' }),
+    ]
+    expect(ids(collapseHidden(rows, ['main']))).toEqual(['a', 'e'])
+  })
+
+  test('a stale id or a childless row hides nothing; hiddenCount matches', () => {
+    expect(ids(collapseHidden(tree(), ['ghost', 'd1']))).toEqual([])
+    const hidden = collapseHidden(tree(), ['o'])
+    expect(hiddenCount(tree(), 'o', hidden)).toBe(2)
+    expect(hiddenCount(tree(), 'main', hidden)).toBe(2)
+    expect(hiddenCount(tree(), 'r1', hidden)).toBe(0)
+  })
+
+  test('isDoublePress: the same key within 400 ms', () => {
+    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1399)).toBe(true)
+    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1000)).toBe(true)
+    expect(isDoublePress({ key: 'a', t: 1000 }, 'a', 1401)).toBe(false)
+    expect(isDoublePress({ key: 'a', t: 1000 }, 'b', 1100)).toBe(false)
+    expect(isDoublePress(undefined, 'a', 1100)).toBe(false)
+  })
+
+  test('contextChart takes a given t0 for its left axis, else the rows', () => {
+    const rows = [row({ id: 'x', startedAt: 600_000, samples: [{ t: 600_000, tokens: 10 }] })]
+    const base2 = { ...base, now: 900_000, colors: new Map([['x', '#000']]), selected: '' }
+    expect(contextChart({ ...base2, rows }).source).toContain(`>${hhmm(600_000)}<`)
+    expect(contextChart({ ...base2, rows, t0: 60_000 }).source).toContain(`>${hhmm(60_000)}<`)
   })
 })

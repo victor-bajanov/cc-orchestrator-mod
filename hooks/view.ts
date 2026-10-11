@@ -340,6 +340,8 @@ export type ChartInput = {
   mainThreshold: number
   colors: ReadonlyMap<string, string>
   selected?: string // agent id; '' or undefined = none
+  /** The left edge of the time axis; defaults to the earliest start among `rows` (or `now`). */
+  t0?: number
 }
 
 const M = { left: 44, right: 8, top: 8, bottom: 20 }
@@ -383,7 +385,7 @@ export const contextChart = (i: ChartInput): { source: string; alt: string; widt
   const right = M.left + plotW
   const bottom = M.top + plotH
   const series = i.rows.filter(r => r.samples.length > 0)
-  const t0 = i.rows.reduce((m, r) => Math.min(m, r.startedAt), i.now)
+  const t0 = i.t0 ?? i.rows.reduce((m, r) => Math.min(m, r.startedAt), i.now)
   const span = Math.max(1, i.now - t0)
   const peak = series.reduce((m, r) => Math.max(m, r.peak), 0)
   const yMax = Math.max(i.agentThreshold, i.mainThreshold, peak, 1) * 1.05
@@ -536,3 +538,49 @@ export const forwardTarget = (
   // A parent that handed over is carried on by its replacement: the answer goes there.
   return { agentId: latest(rows, parent), mayDuplicate: r !== undefined }
 }
+
+/** A row's children: rows whose `parentId` is its id; main's also include rows with no parent. */
+export const childrenOf = (rows: readonly AgentRow[], id: string): AgentRow[] =>
+  rows.filter(r => r.id !== id && r.id !== 'main' && (r.parentId === id || (id === 'main' && r.parentId === undefined)))
+
+/** Every descendant of a row, each once (cycle-safe). */
+const descendants = (rows: readonly AgentRow[], id: string): AgentRow[] => {
+  const out: AgentRow[] = []
+  const seen = new Set<string>([id])
+  const walk = (at: string) => {
+    for (const c of childrenOf(rows, at)) {
+      if (seen.has(c.id)) continue
+      seen.add(c.id)
+      out.push(c)
+      walk(c.id)
+    }
+  }
+  walk(id)
+  return out
+}
+
+const FINISHED: readonly AgentStatus[] = ['done', 'replaced']
+
+/**
+ * The rows a collapsed tree hides: for each collapsed id naming a present row, its finished (done or
+ * replaced) descendants that have no live descendant of their own. Nothing live is ever hidden, and a
+ * finished agent above a live one stays, so the tree never orphans a live row. Display only.
+ */
+export const collapseHidden = (rows: readonly AgentRow[], collapsed: readonly string[]): Set<string> => {
+  const hidden = new Set<string>()
+  for (const id of collapsed) {
+    if (!rows.some(r => r.id === id)) continue
+    for (const d of descendants(rows, id)) {
+      if (FINISHED.includes(d.status) && descendants(rows, d.id).every(x => FINISHED.includes(x.status))) hidden.add(d.id)
+    }
+  }
+  return hidden
+}
+
+/** How many of a row's descendants are hidden. */
+export const hiddenCount = (rows: readonly AgentRow[], id: string, hidden: ReadonlySet<string>): number =>
+  descendants(rows, id).filter(d => hidden.has(d.id)).length
+
+/** Whether a press is the second of a double: the same key as the last press, within `ms`. */
+export const isDoublePress = (last: { key: string; t: number } | undefined, key: string, now: number, ms = 400): boolean =>
+  last !== undefined && last.key === key && now - last.t >= 0 && now - last.t <= ms

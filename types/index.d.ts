@@ -116,6 +116,8 @@ declare module 'claude-code' {
       selectedAgent: string
       /** Each agent's last transcript items by id, read off the render; the pane draws the selected one's. */
       transcripts: Record<string, Transcript>
+      /** Rows collapsed by a double-click: their finished descendants are hidden from the pane (display only). */
+      collapsed: string[]
       /** The tool call open in the detail dialog, or null. */
       toolView: ToolView | null
       /** A main handover asked for mid-turn, waiting for that turn to end. */
