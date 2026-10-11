@@ -20,7 +20,7 @@ import {
   timeline,
   wrapFill,
 } from './core'
-import { LIVE, chartWidthPx, contextChart, logId, paneHeader, seriesColors } from './view'
+import { LIVE, ceilingOf, chartWidthPx, contextChart, cut, hhmm, logId, paneHeader, seriesColors } from './view'
 
 type $ = EngineInterface
 
@@ -49,14 +49,11 @@ const cfg = {
   runRoot: '',
 }
 
-/** The context limit a row is held to: main's or the subagents'. */
-const ceilingOf = (r: AgentRow) => (r.id === 'main' ? cfg.mainThreshold : cfg.agentThreshold)
+/** Running or idle: an agent loop that has not settled or started handing over. */
+const isActive = (r: AgentRow) => r.status === 'running' || r.status === 'idle'
 
-/** A subagent that can be handed over now: running or idle. */
-const canHandOver = (r: AgentRow) => r.id !== 'main' && (r.status === 'running' || r.status === 'idle')
-
-/** An activity line cut to `fits` characters, ending in an ellipsis. */
-const cut = (text: string, fits: number) => `${text.slice(0, Math.max(1, fits - 1))}…`
+/** A subagent that can be handed over now. */
+const canHandOver = (r: AgentRow) => r.id !== 'main' && isActive(r)
 
 /** The selection, or '' when it names no row (so a stale one fades no line). */
 export const liveSelection = (rows: readonly AgentRow[], selected: string) =>
@@ -64,6 +61,12 @@ export const liveSelection = (rows: readonly AgentRow[], selected: string) =>
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
+/** Main is mid-turn: from its `turn.start` (main's alone) to its `turn.complete`. */
+let mainBusy = false
+/** A main handover asked for mid-turn: it starts when that turn ends. */
+let mainHandoverQueued = false
+/** A main handover is being set up: a second press in the meantime does nothing. */
+let mainHandoverStarting = false
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
 
@@ -251,7 +254,7 @@ async function onAgentEnd($: $, id: string, answer: string) {
       await update($, agentsAtom, l => patch(l, id, { status: 'done' }))
       await log($, `${label(r)} ended without writing its handover note`, 'warn')
     }
-  } else if (r.status === 'running' || r.status === 'idle') {
+  } else if (isActive(r)) {
     await update($, agentsAtom, l => patch(l, id, { status: 'idle' }))
     if (r.isOurs && !r.isTeammate && r.parentId !== undefined) {
       const text = `[orchestrator mod] ${label(r)} (id ${id}, replacement for ${r.replaces}) reports:\n\n${answer}`
@@ -275,7 +278,7 @@ async function sync($: $) {
       await log($, `${label(r)} has not handed over after ${Math.round(STALL_MS / 60_000)} min`, 'warn')
       void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' })
       changed = true
-    } else if ((r.status === 'running' || r.status === 'idle') && !listed.has(r.id)) {
+    } else if (isActive(r) && !listed.has(r.id)) {
       await update($, agentsAtom, l => patch(l, r.id, { status: 'done' }))
       changed = true
     }
@@ -290,20 +293,34 @@ function setPhase($: $, p: MainPhase) {
 }
 
 async function startMainHandover($: $) {
-  const phase = await read($, phaseAtom)
-  if (phase === 'writing' || phase === 'clearing') return
-  const main = (await read($, agentsAtom)).find(a => a.id === 'main') ?? newRow('main', await $.clock.now())
-  const attempt = (main.handovers ?? 0) + 1
-  const notePath = `${await runDir($)}/handover/main-${attempt}.md`
-  await update($, agentsAtom, l =>
-    (l.some(a => a.id === 'main') ? l : [main, ...l]).map(a =>
-      a.id === 'main' ? { ...a, notePath, handovers: attempt } : a,
-    ),
-  )
-  await setPhase($, 'writing')
-  await log($, `main thread at ${fmtTokens(main.tokens)}: writing handover note`)
-  await persist($)
-  await $.prompt.submit({ text: mainHandoverPrompt(notePath) })
+  // Synchronous guards, before any await: a second press cannot start a second round.
+  if (mainHandoverStarting) return
+  if (mainBusy) {
+    // A prompt submitted now would queue behind the running turn, whose end would then look for the note too early.
+    if (mainHandoverQueued) return
+    mainHandoverQueued = true
+    await log($, 'main thread hands over when this turn ends')
+    return
+  }
+  mainHandoverStarting = true
+  try {
+    const phase = await read($, phaseAtom)
+    if (phase === 'writing' || phase === 'clearing') return
+    const main = (await read($, agentsAtom)).find(a => a.id === 'main') ?? newRow('main', await $.clock.now())
+    const attempt = (main.handovers ?? 0) + 1
+    const notePath = `${await runDir($)}/handover/main-${attempt}.md`
+    await update($, agentsAtom, l =>
+      (l.some(a => a.id === 'main') ? l : [main, ...l]).map(a =>
+        a.id === 'main' ? { ...a, notePath, handovers: attempt } : a,
+      ),
+    )
+    await setPhase($, 'writing')
+    await log($, `main thread at ${fmtTokens(main.tokens)}: writing handover note`)
+    await persist($)
+    await $.prompt.submit({ text: mainHandoverPrompt(notePath) })
+  } finally {
+    mainHandoverStarting = false
+  }
 }
 
 async function finishMainHandover($: $) {
@@ -349,6 +366,9 @@ export const register: Register = (on, options) => {
   cfg.injectClause = options.injectClause !== false
   cfg.runRoot = String(options.runRoot ?? '').replace(/\/+$/, '')
   paneOffered = false
+  mainBusy = false
+  mainHandoverQueued = false
+  mainHandoverStarting = false
 
   // ---- events ----------------------------------------------------------
 
@@ -455,13 +475,26 @@ export const register: Register = (on, options) => {
     }
   })
 
+  // Raised for main's turns alone: a subagent's run raises no turn.start.
+  on('turn.start', ($, e, next) => {
+    mainBusy = true
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
+    // Main's turn is over whatever happens beneath: a failing `next` must not leave it marked busy.
+    if (e.agentId === undefined) mainBusy = false
     const res = await next(e)
     try {
       if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer)
       else {
+        const queued = mainHandoverQueued
+        mainHandoverQueued = false
         const phase = await read($, phaseAtom)
-        if (phase === 'offered' && cfg.mainMode === 'auto' && !e.isAborted) {
+        if (queued && phase !== 'writing' && phase !== 'clearing') {
+          // Asked for mid-turn: started now, before the `writing` check, so this turn's end never looks for a note.
+          $.clock.after(0, () => void startMainHandover($))
+        } else if (phase === 'offered' && cfg.mainMode === 'auto' && !e.isAborted) {
           $.clock.after(0, () => void startMainHandover($))
         } else if (phase === 'writing') {
           $.clock.after(0, () => void finishMainHandover($))
@@ -532,7 +565,6 @@ export const register: Register = (on, options) => {
       mainMode: cfg.mainMode,
       phase,
     })
-    const hhmm = (t: number) => new Date(t).toISOString().slice(11, 16)
     const tone = { ok: 'success', warn: 'warning', hot: 'error' } as const
 
     if (e.surface !== 'terminal') {
@@ -572,7 +604,7 @@ export const register: Register = (on, options) => {
           )}
           <Box flexDirection="column">
             {orderRows(rows).map(({ row, depth }) => {
-              const ceiling = ceilingOf(row)
+              const ceiling = ceilingOf(row, cfg)
               const pct = Math.round((row.tokens / ceiling) * 100)
               return (
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
@@ -650,7 +682,7 @@ export const register: Register = (on, options) => {
         <Text bold>{header}</Text>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
         {ordered.map(({ row, depth }) => {
-          const ceiling = ceilingOf(row)
+          const ceiling = ceilingOf(row, cfg)
           const live = LIVE.includes(row.status)
           const name = `${'  '.repeat(depth)}${glyph[row.status]} ${label(row)}`
           return (

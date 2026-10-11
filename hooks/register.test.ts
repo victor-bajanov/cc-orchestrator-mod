@@ -26,6 +26,8 @@ const world = (on: On) => {
     closed: [] as string[],
     /** The status line as last set. */
     status: undefined as string | undefined,
+    /** Makes the next main turn end fail beneath the plugin, once. */
+    failMainEnd: false,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -97,7 +99,13 @@ const world = (on: On) => {
       },
     }
   })
-  on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('turn.complete', ($, e) => {
+    if (w.failMainEnd && e.agentId === undefined) {
+      w.failMainEnd = false
+      throw new Error('engine failed')
+    }
+    return { text: e.answer }
+  })
   on('tool.call', () => ({ result: 'ok' }) as never)
   return Object.assign(w, { session })
 }
@@ -602,6 +610,49 @@ describe('desktop pane', () => {
     await ui.press({ key: 'handover:main' })
     expect(await ui.find({ key: 'handover:main' })).toBeUndefined()
     await w.clock.advance(10)
+    await ui.unmount()
+  })
+
+  test('Hand over main pressed mid-turn waits for that turn to end', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await running($, w)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(0)
+    await complete($, undefined)
+    await w.clock.advance(10)
+    expect(w.toasts.some(t => t.includes('did not write'))).toBe(false)
+    expect(w.prompts).toHaveLength(1)
+    expect(w.prompts[0]).toContain('main-1.md')
+    expect(phase(w)).toBe('writing')
+    await ui.unmount()
+  })
+
+  test('a main turn end that fails beneath still leaves main free to hand over', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await running($, w)
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    w.failMainEnd = true
+    await complete($, undefined).catch(() => undefined)
+    expect(w.failMainEnd).toBe(false)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:main' })
+    expect(w.prompts).toHaveLength(1)
+    await ui.unmount()
+  })
+
+  test('two quick presses of Hand over main start one handover', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await Promise.all([ui.press({ key: 'handover:main' }), ui.press({ key: 'handover:main' })])
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(1)
+    expect(row(w, 'main')!.handovers).toBe(1)
     await ui.unmount()
   })
 
