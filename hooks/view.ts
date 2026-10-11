@@ -1,6 +1,6 @@
-import type { SessionMessage } from 'claude-code'
+import type { SessionMessage, ToolUseSummary } from 'claude-code'
 
-import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek, Sample } from '../types'
+import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek, Sample, Transcript, TranscriptItem } from '../types'
 import { fmtTokens, label } from './core'
 
 export const MAIN_COLOR = '#6B7280'
@@ -92,6 +92,256 @@ export const peekView = (peek: Peek | undefined, width: number, n: number): { di
   if ('denied' in peek) return { dim: PEEK_DENIED }
   if (peek.lines.length === 0) return { dim: 'no messages yet' }
   return { lines: peek.lines.slice(-n).map(l => (l.length > width ? cut(l, width) : l)) }
+}
+
+/** Model families the mod names, and the effort levels it abbreviates. */
+const FAMILY = 'opus|sonnet|haiku|fable'
+const EFFORT: Record<string, string> = { low: 'low', medium: 'med', high: 'high', xhigh: 'xhigh', max: 'max' }
+
+const capital = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase()
+
+/**
+ * A model id or alias as a short display name: `claude-sonnet-5-5` → `Sonnet 5.5`,
+ * `claude-3-5-sonnet-…` → `Sonnet 3.5`, `sonnet` → `Sonnet`, `inherit` → ''.
+ * Context suffixes, provider prefixes, versions and dates are dropped first;
+ * anything else stays as written, cut to 16 characters.
+ */
+export const modelName = (id: string): string => {
+  const raw = id.trim()
+  const s = raw
+    .replace(/\[[^\]]*\]$/, '')
+    .replace(/^.*anthropic\./, '')
+    .replace(/@.*$/, '')
+    .replace(/-v\d+(:\d+)?$/, '')
+    .replace(/-latest$/, '')
+    .replace(/-\d{8}$/, '')
+    .toLowerCase()
+  if (s === '' || s === 'inherit') return ''
+  const modern = new RegExp(`^claude-(${FAMILY})-(\\d+)(?:-(\\d{1,2}))?$`).exec(s)
+  if (modern) return `${capital(modern[1]!)} ${modern[2]}${modern[3] ? `.${modern[3]}` : ''}`
+  const legacy = new RegExp(`^claude-(\\d+)(?:-(\\d))?-(${FAMILY})$`).exec(s)
+  if (legacy) return `${capital(legacy[3]!)} ${legacy[1]}${legacy[2] ? `.${legacy[2]}` : ''}`
+  if (new RegExp(`^(${FAMILY})$`).test(s)) return capital(s)
+  return raw.length > 16 ? cut(raw, 16) : raw
+}
+
+/** An effort level abbreviated (`medium` → `med`), a token budget formatted (`32000` → `32k`), else as written. */
+export const effortAbbrev = (effort: string): string =>
+  EFFORT[effort] ?? (/^\d+$/.test(effort) ? fmtTokens(Number(effort)) : effort)
+
+/** `Sonnet 5.5 med`: '' when the model is unknown, the model alone when the effort is. */
+export const modelLabel = (model?: string, effort?: string): string => {
+  const name = model ? modelName(model) : ''
+  if (name === '') return ''
+  const e = effort ? effortAbbrev(effort) : ''
+  return e ? `${name} ${e}` : name
+}
+
+/** The terminal's glyph and status-word style per status, in theme keys so it follows the theme. */
+export const statusStyle = (status: AgentStatus): { color: string; dimColor?: true; bold?: true } => {
+  switch (status) {
+    case 'running':
+      return { color: 'success', bold: true }
+    case 'idle':
+      return { color: 'warning', dimColor: true }
+    case 'done':
+      return { color: 'success', dimColor: true }
+    case 'stalled':
+      return { color: 'error', bold: true }
+    case 'handing-over':
+      return { color: 'suggestion', bold: true }
+    case 'replaced':
+      return { color: 'inactive', dimColor: true }
+  }
+}
+
+/** djb2 over UTF-16 code units, as an unsigned 32-bit number. */
+const djb2 = (s: string): number => {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
+  return h >>> 0
+}
+
+/** djb2 of a string, base 36. */
+export const hashText = (s: string): string => djb2(s).toString(36)
+
+/** A running agent's runner, fixed per id: 🏃‍♂️ for an even hash, 🏃‍♀️ for an odd one. */
+export const runnerFor = (id: string): string => (djb2(id) % 2 === 0 ? '🏃‍♂️' : '🏃‍♀️')
+
+/** The desktop's status emoji, placed before the status word. */
+export const statusEmoji = (status: AgentStatus, id: string): string => {
+  switch (status) {
+    case 'running':
+      return runnerFor(id)
+    case 'idle':
+      return '😴'
+    case 'done':
+      return '✅'
+    case 'stalled':
+      return '🛑'
+    case 'handing-over':
+      return '📝'
+    case 'replaced':
+      return '♻️'
+  }
+}
+
+/** Text safe for a Code, Markdown or Text body: ANSI escapes and every control character but `\n` and `\t` removed. */
+export const cleanBlock = (s: string): string =>
+  s
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -\/]*[@-~]/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '')
+
+/** Text as one pane line: control characters stripped, then whitespace collapsed and trimmed. */
+const oneLine = (s: string): string => clean(cleanBlock(s).replace(/\s+/g, ' ')).trim()
+
+/**
+ * The key a message's text is stamped and looked up under: `txt:` plus the hash of
+ * its role and its whole one-line text, so whitespace and escapes do not change it.
+ */
+export const textKey = (role: string, text: string): string => `txt:${hashText(`${role}:${oneLine(text)}`)}`
+
+/** `$.session.messages` gives at most this many entries; a list this long may have lost its first (the brief). */
+const MESSAGES_CAP = 4096
+
+/** The longest tool brief kept. */
+const BRIEF_CHARS = 300
+
+/** The input field each tool is summed up by; other tools use their first string field. */
+const BRIEF_FIELD: Record<string, string> = {
+  Bash: 'command',
+  Read: 'file_path',
+  Edit: 'file_path',
+  Write: 'file_path',
+  Grep: 'pattern',
+  Glob: 'pattern',
+  Agent: 'description',
+}
+
+/** A tool call in one line: Bash's command, a file's path, a search's `pattern in path`, … capped at 300. */
+export const toolBrief = (tool: string, input: Record<string, unknown>): string => {
+  const field = BRIEF_FIELD[tool]
+  const named = field !== undefined ? input[field] : undefined
+  let brief = typeof named === 'string' ? named : (Object.values(input).find(v => typeof v === 'string') as string | undefined) ?? ''
+  if ((tool === 'Grep' || tool === 'Glob') && typeof named === 'string' && typeof input.path === 'string' && input.path !== '') {
+    brief = `${named} in ${input.path}`
+  }
+  const line = oneLine(brief)
+  return line.length > BRIEF_CHARS ? cut(line, BRIEF_CHARS) : line
+}
+
+/**
+ * An agent's last `n` transcript items: per message, its text (cleaned, newlines kept,
+ * capped at `chars`) then one item per tool call. A user row of tool results alone adds
+ * nothing; its outcome is on the call. It reads from the end and stops once it has
+ * `n` items. Times come from `stampOf` (a call's id, a text's `textKey`, else the
+ * message's first call), message 0 (the brief, unless the list hit the 4096 cap)
+ * falls back to `startedAt`, and an
+ * item never seen has no `t`. A repeated text's keys are numbered over the whole list.
+ */
+export const transcriptItems = (
+  messages: readonly SessionMessage[],
+  stampOf: (key: string) => number | undefined,
+  o: { n: number; chars: number; startedAt: number },
+): TranscriptItem[] => {
+  const groups: TranscriptItem[][] = []
+  let count = 0
+  let nth: number[] | undefined
+  for (let i = messages.length - 1; i >= 0 && count < o.n; i--) {
+    const m = messages[i]!
+    const uses: readonly ToolUseSummary[] = m.toolUses
+    const fallback = i === 0 && messages.length < MESSAGES_CAP ? o.startedAt : undefined
+    const group: TranscriptItem[] = []
+    if (oneLine(m.text) !== '') {
+      const key = textKey(m.role, m.text)
+      const t = stampOf(key) ?? (uses[0] ? stampOf(uses[0].tool_use_id) : undefined) ?? fallback
+      const text = cleanBlock(m.text).trim()
+      const capped = text.length > o.chars ? cut(text, o.chars) : text
+      group.push({ kind: 'text', key: `${key}#${(nth ??= occurrences(messages))[i]}`, ...(t !== undefined && { t }), role: m.role, text: capped })
+    }
+    for (const u of uses) {
+      const t = stampOf(u.tool_use_id) ?? fallback
+      group.push({
+        kind: 'tool',
+        key: `tool:${u.tool_use_id}`,
+        ...(t !== undefined && { t }),
+        toolUseId: u.tool_use_id,
+        tool: clean(u.tool),
+        brief: toolBrief(u.tool, u.input ?? {}),
+        ...(u.isError && { isError: true as const }),
+        ...(u.text === undefined && { isPending: true as const }),
+      })
+    }
+    if (group.length) groups.push(group)
+    count += group.length
+  }
+  return groups.reverse().flat().slice(-o.n)
+}
+
+/**
+ * Per message, how many earlier messages carry the same text key, counted over the
+ * whole list in one pass, so a repeat's key stays put as the window slides.
+ */
+const occurrences = (messages: readonly SessionMessage[]): number[] => {
+  const seen = new Map<string, number>()
+  return messages.map(m => {
+    if (m.text === '') return 0
+    const key = textKey(m.role, m.text)
+    const k = seen.get(key) ?? 0
+    seen.set(key, k + 1)
+    return k
+  })
+}
+
+export type TranscriptLine = {
+  id: string
+  time: string
+  short: string
+  full?: string
+  kind: TranscriptItem['kind']
+  toolUseId?: string
+  isError?: true
+  isPending?: true
+  role?: 'user' | 'assistant'
+}
+
+/**
+ * What the pane draws for a selected agent's cached transcript: one dim line
+ * (`loading…`, the not-readable line, or `no messages yet`), or its last `n`
+ * items, each with its `hh:mm` (or `--:--`) and its content on one line, cut to
+ * `width - 6` less any tool markers; `full` holds the whole content (newlines
+ * kept) only when it was cut.
+ */
+export const transcriptView = (
+  tr: Transcript | undefined,
+  width: number,
+  n: number,
+): { dim: string } | { items: TranscriptLine[] } => {
+  if (!tr) return { dim: 'loading…' }
+  if ('denied' in tr) return { dim: PEEK_DENIED }
+  if (tr.items.length === 0) return { dim: 'no messages yet' }
+  const fits = Math.max(1, width - 6)
+  return {
+    items: tr.items.slice(-n).map(it => {
+      const content = it.kind === 'text' ? it.text : `⚙ ${it.tool}${it.brief ? ` ${it.brief}` : ''}`
+      const line = it.kind === 'text' ? oneLine(content) : content
+      // Room for the markers drawn around a tool item: `✗ ` before it, ` (running)` after.
+      const room = it.kind === 'tool' ? Math.max(1, fits - (it.isError ? 2 : 0) - (it.isPending ? 10 : 0)) : fits
+      const isCut = line.length > room
+      return {
+        id: `step-${it.key}`,
+        time: it.t === undefined ? '--:--' : hhmm(it.t),
+        short: isCut ? cut(line, room) : line,
+        ...(isCut && { full: content }),
+        kind: it.kind,
+        ...(it.kind === 'text'
+          ? { role: it.role }
+          : { toolUseId: it.toolUseId, ...(it.isError && { isError: it.isError }), ...(it.isPending && { isPending: it.isPending }) }),
+      }
+    }),
+  }
 }
 
 /** The context limit a row is held to: main's for main, the agents' otherwise. */

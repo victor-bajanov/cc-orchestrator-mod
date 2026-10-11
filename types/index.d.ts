@@ -46,6 +46,10 @@ export type AgentRow = {
   handovers?: number
   /** A replacement that started too full for another handover to help: left to run. */
   noHandover?: boolean
+  /** The model its last step ran on (the answering id, else the requested one). */
+  model?: string
+  /** Its last step's effort, as a string (`'medium'`, or a token budget such as `'32000'`). */
+  effort?: string
 }
 
 export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }
@@ -56,6 +60,18 @@ export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }
  * failed or timed out).
  */
 export type Peek = { lines: string[] } | { denied: true }
+
+/**
+ * One entry of an agent's transcript as the pane shows it: a message's text, or
+ * one of its tool calls. `key` is stable across reads; `t` is when the mod saw it
+ * (absent when it never did).
+ */
+export type TranscriptItem =
+  | { kind: 'text'; key: string; t?: number; role: 'user' | 'assistant'; text: string }
+  | { kind: 'tool'; key: string; t?: number; toolUseId: string; tool: string; brief: string; isError?: true; isPending?: true }
+
+/** An agent's transcript items as the pane last read them, off the render, or `denied`. */
+export type Transcript = { items: TranscriptItem[] } | { denied: true }
 
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
 

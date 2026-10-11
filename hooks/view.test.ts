@@ -7,19 +7,31 @@ import {
   MAIN_COLOR,
   PALETTE,
   ceilingOf,
+  cleanBlock,
   chartWidthPx,
   contextChart,
   cut,
+  effortAbbrev,
+  hashText,
   hhmm,
   logId,
   mainButtonShown,
+  modelLabel,
+  modelName,
   paneHeader,
   peekLines,
   peekView,
+  runnerFor,
   seriesColors,
+  statusEmoji,
+  statusStyle,
+  textKey,
+  toolBrief,
+  transcriptItems,
+  transcriptView,
 } from './view'
-import type { SessionMessage } from 'claude-code'
-import type { AgentRow } from '../types'
+import type { SessionMessage, ToolUseSummary } from 'claude-code'
+import type { AgentRow, AgentStatus, TranscriptItem } from '../types'
 
 const row = (over: Partial<AgentRow>): AgentRow => ({
   id: 'a1',
@@ -435,5 +447,327 @@ describe('contextChart scale and bounds', () => {
     expect(paths(c.source)).toHaveLength(250)
     expect(c.source).not.toContain('</title></circle>')
     expect(c.source.match(/<\/title><\/path>/g)).toHaveLength(250)
+  })
+})
+
+describe('modelName', () => {
+  test('maps model ids and aliases to display names', () => {
+    expect(modelName('claude-sonnet-5-5')).toBe('Sonnet 5.5')
+    expect(modelName('claude-opus-5-5[1m]')).toBe('Opus 5.5')
+    expect(modelName('claude-haiku-4-5-20251001')).toBe('Haiku 4.5')
+    expect(modelName('claude-opus-4-20250514')).toBe('Opus 4')
+    expect(modelName('us.anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe('Sonnet 4.5')
+    expect(modelName('claude-sonnet-4-5@20250929')).toBe('Sonnet 4.5')
+    expect(modelName('claude-3-5-sonnet-20241022')).toBe('Sonnet 3.5')
+    expect(modelName('sonnet')).toBe('Sonnet')
+    expect(modelName('inherit')).toBe('')
+    expect(modelName('gpt-x')).toBe('gpt-x')
+  })
+
+  test('an unknown id longer than 16 characters is cut to 16', () => {
+    const name = modelName('some-very-long-model-identifier')
+    expect(name).toHaveLength(16)
+    expect(name.endsWith('…')).toBe(true)
+  })
+})
+
+describe('effortAbbrev and modelLabel', () => {
+  test('abbreviates the effort levels and formats a token budget', () => {
+    expect(effortAbbrev('low')).toBe('low')
+    expect(effortAbbrev('medium')).toBe('med')
+    expect(effortAbbrev('high')).toBe('high')
+    expect(effortAbbrev('xhigh')).toBe('xhigh')
+    expect(effortAbbrev('max')).toBe('max')
+    expect(effortAbbrev('32000')).toBe('32k')
+    expect(effortAbbrev('odd')).toBe('odd')
+  })
+
+  test('joins the model and effort; the model alone without effort; nothing without a model', () => {
+    expect(modelLabel('claude-sonnet-5-5', 'medium')).toBe('Sonnet 5.5 med')
+    expect(modelLabel('claude-sonnet-5-5')).toBe('Sonnet 5.5')
+    expect(modelLabel(undefined, 'medium')).toBe('')
+    expect(modelLabel('inherit', 'high')).toBe('')
+  })
+})
+
+describe('statusStyle', () => {
+  test('gives each status its theme colour and weight', () => {
+    expect(statusStyle('running')).toEqual({ color: 'success', bold: true })
+    expect(statusStyle('idle')).toEqual({ color: 'warning', dimColor: true })
+    expect(statusStyle('done')).toEqual({ color: 'success', dimColor: true })
+    expect(statusStyle('stalled')).toEqual({ color: 'error', bold: true })
+    expect(statusStyle('handing-over')).toEqual({ color: 'suggestion', bold: true })
+    expect(statusStyle('replaced')).toEqual({ color: 'inactive', dimColor: true })
+  })
+})
+
+describe('runnerFor and statusEmoji', () => {
+  const runners = ['🏃‍♂️', '🏃‍♀️']
+
+  test('the same id always gets the same runner, and both runners occur', () => {
+    expect(runnerFor('agent7')).toBe(runnerFor('agent7'))
+    const seen = new Set(Array.from({ length: 20 }, (_, i) => runnerFor(`agent${i + 1}`)))
+    expect([...seen].sort()).toEqual([...runners].sort())
+  })
+
+  test('gives each status its emoji; running is the agent own runner', () => {
+    expect(statusEmoji('idle', 'x')).toBe('😴')
+    expect(statusEmoji('done', 'x')).toBe('✅')
+    expect(statusEmoji('stalled', 'x')).toBe('🛑')
+    expect(statusEmoji('handing-over', 'x')).toBe('📝')
+    expect(statusEmoji('replaced', 'x')).toBe('♻️')
+    for (const id of ['a', 'b', 'agent3']) expect(statusEmoji('running', id)).toBe(runnerFor(id))
+  })
+})
+
+describe('hashText and textKey', () => {
+  test('hashText is a stable base-36 djb2', () => {
+    expect(hashText('abc')).toBe(hashText('abc'))
+    expect(hashText('abc')).not.toBe(hashText('abd'))
+    expect(hashText('abc')).toMatch(/^[0-9a-z]+$/)
+  })
+
+  test('textKey ignores whitespace and ANSI differences and differs by role', () => {
+    const k = textKey('assistant', 'hi there')
+    expect(k.startsWith('txt:')).toBe(true)
+    expect(textKey('assistant', '  hi\n\tthere ')).toBe(k)
+    expect(textKey('assistant', '\x1b[31mhi\x1b[0m there')).toBe(k)
+    expect(textKey('user', 'hi there')).not.toBe(k)
+    expect(textKey('assistant', 'hi where')).not.toBe(k)
+  })
+})
+
+describe('toolBrief', () => {
+  test('Bash gives its command with newlines collapsed', () => {
+    expect(toolBrief('Bash', { command: 'cd x &&\n  ls -la', description: 'list' })).toBe('cd x && ls -la')
+  })
+
+  test('Read, Edit and Write give the path; Agent its description', () => {
+    expect(toolBrief('Read', { file_path: '/a/b.ts', limit: 5 })).toBe('/a/b.ts')
+    expect(toolBrief('Edit', { old_string: 'x', file_path: '/a/c.ts' })).toBe('/a/c.ts')
+    expect(toolBrief('Write', { content: 'x', file_path: '/a/d.ts' })).toBe('/a/d.ts')
+    expect(toolBrief('Agent', { prompt: 'long', description: 'review task 1' })).toBe('review task 1')
+  })
+
+  test('Grep and Glob give the pattern, in the path when there is one', () => {
+    expect(toolBrief('Grep', { pattern: 'foo.*', path: 'hooks' })).toBe('foo.* in hooks')
+    expect(toolBrief('Glob', { pattern: '**/*.ts' })).toBe('**/*.ts')
+  })
+
+  test('an unknown tool gives its first string field; none gives nothing', () => {
+    expect(toolBrief('Mystery', { n: 3, flag: true, what: 'thing', other: 'x' })).toBe('thing')
+    expect(toolBrief('Mystery', { n: 3 })).toBe('')
+  })
+
+  test('strips escapes and caps the brief at 300 characters', () => {
+    expect(toolBrief('Bash', { command: '\x1b[1mls\x1b[0m\x07' })).toBe('ls')
+    const b = toolBrief('Bash', { command: 'x'.repeat(1000) })
+    expect(b).toHaveLength(300)
+    expect(b.endsWith('…')).toBe(true)
+  })
+})
+
+const use = (id: string, tool: string, input: Record<string, unknown>, over: Partial<ToolUseSummary> = {}): ToolUseSummary => ({
+  tool_use_id: id,
+  tool,
+  input,
+  text: 'ok',
+  ...over,
+})
+const tmsg = (role: 'user' | 'assistant', text: string, uses: ToolUseSummary[] = []): SessionMessage => ({ role, text, toolUses: uses })
+const noStamps = () => undefined
+const opts0 = { n: 12, chars: 2000, startedAt: 1000 }
+
+describe('transcriptItems', () => {
+  test('gives one text item and one tool item per use, in order', () => {
+    const items = transcriptItems(
+      [tmsg('user', 'go'), tmsg('assistant', 'looking', [use('t1', 'Bash', { command: 'ls' }), use('t2', 'Read', { file_path: '/x' })])],
+      noStamps,
+      opts0,
+    )
+    expect(items.map(i => i.kind)).toEqual(['text', 'text', 'tool', 'tool'])
+    expect(items[0]).toMatchObject({ kind: 'text', role: 'user', text: 'go' })
+    expect(items[1]).toMatchObject({ kind: 'text', role: 'assistant', text: 'looking' })
+    expect(items[2]).toMatchObject({ kind: 'tool', toolUseId: 't1', tool: 'Bash', brief: 'ls' })
+    expect(items[3]).toMatchObject({ kind: 'tool', toolUseId: 't2', tool: 'Read', brief: '/x' })
+  })
+
+  test('a message without text gives only its tool items; a tool-result-only user row adds nothing', () => {
+    const results: SessionMessage = { ...tmsg('user', ''), toolResults: [{ tool_use_id: 't1', text: 'ok' } as never] }
+    const items = transcriptItems([tmsg('assistant', '', [use('t1', 'Bash', { command: 'ls' })]), results], noStamps, opts0)
+    expect(items.map(i => i.kind)).toEqual(['tool'])
+  })
+
+  test('keeps only the last n items', () => {
+    const all = [tmsg('user', 'one'), tmsg('assistant', 'two', [use('t1', 'Bash', { command: 'a' })]), tmsg('assistant', 'three')]
+    const items = transcriptItems(all, noStamps, { ...opts0, n: 3 })
+    expect(items.map(i => (i.kind === 'text' ? i.text : i.brief))).toEqual(['two', 'a', 'three'])
+  })
+
+  test('strips escapes, keeps the text as written and caps it at chars', () => {
+    const items = transcriptItems([tmsg('assistant', 'a\n  b'), tmsg('assistant', `\x1b[31m${'x'.repeat(50)}`)], noStamps, {
+      ...opts0,
+      chars: 20,
+    })
+    expect((items[0] as { text: string }).text).toBe('a\n  b')
+    const long = (items[1] as { text: string }).text
+    expect(long).toHaveLength(20)
+    expect(long.endsWith('…')).toBe(true)
+  })
+
+  test('carries isError, and isPending for a call with no result text', () => {
+    const items = transcriptItems(
+      [tmsg('assistant', '', [use('t1', 'Bash', { command: 'a' }, { isError: true }), use('t2', 'Bash', { command: 'b' }, { text: undefined })])],
+      noStamps,
+      opts0,
+    )
+    expect(items[0]).toMatchObject({ isError: true })
+    expect('isPending' in items[0]!).toBe(false)
+    expect(items[1]).toMatchObject({ isPending: true })
+    expect('isError' in items[1]!).toBe(false)
+  })
+})
+
+describe('transcriptItems stamps', () => {
+  const stamps = (m: Record<string, number>) => (k: string) => m[k]
+
+  test('a tool item takes its tool_use_id stamp', () => {
+    const items = transcriptItems([tmsg('user', 'go'), tmsg('assistant', '', [use('t1', 'Bash', { command: 'a' })])], stamps({ t1: 5000 }), opts0)
+    expect(items[1]!.t).toBe(5000)
+  })
+
+  test('a text item takes its textKey stamp, else its first tool use stamp', () => {
+    const all = [
+      tmsg('user', 'brief'),
+      tmsg('assistant', 'stamped  text'),
+      tmsg('assistant', 'unstamped', [use('t2', 'Read', { file_path: '/x' }), use('t3', 'Read', { file_path: '/y' })]),
+    ]
+    const items = transcriptItems(all, stamps({ [textKey('assistant', 'stamped text')]: 7000, t2: 8000, t3: 9000 }), opts0)
+    expect(items[1]!.t).toBe(7000)
+    expect(items[2]!.t).toBe(8000)
+    expect(items[4]!.t).toBe(9000)
+  })
+
+  test('message 0 takes startedAt; any other unstamped item has no t', () => {
+    const items = transcriptItems([tmsg('user', 'brief'), tmsg('assistant', 'later')], noStamps, opts0)
+    expect(items[0]!.t).toBe(1000)
+    expect('t' in items[1]!).toBe(false)
+  })
+
+  test('a repeated identical text gets distinct keys', () => {
+    const items = transcriptItems([tmsg('user', 'brief'), tmsg('assistant', 'same'), tmsg('assistant', 'same')], noStamps, opts0)
+    const base = textKey('assistant', 'same')
+    expect(items[1]!.key).toBe(`${base}#0`)
+    expect(items[2]!.key).toBe(`${base}#1`)
+    expect(new Set(items.map(i => i.key)).size).toBe(3)
+  })
+})
+
+describe('transcriptView', () => {
+  const text = (over: Partial<TranscriptItem & { kind: 'text' }> = {}): TranscriptItem => ({
+    kind: 'text',
+    key: 'txt:a#0',
+    role: 'assistant',
+    text: 'hello',
+    ...over,
+  })
+
+  test('nothing read yet is loading; denied is the not-readable line; no items is nothing yet', () => {
+    expect(transcriptView(undefined, 40, 5)).toEqual({ dim: 'loading…' })
+    expect(transcriptView({ denied: true }, 40, 5)).toEqual({ dim: PEEK_DENIED })
+    expect(transcriptView({ items: [] }, 40, 5)).toEqual({ dim: 'no messages yet' })
+  })
+
+  test('a stamped item shows hh:mm, an unstamped one --:--; the id is step-<key>', () => {
+    const v = transcriptView({ items: [text({ t: Date.UTC(2026, 0, 1, 9, 5) }), text({ key: 'txt:b#0' })] }, 40, 5) as {
+      items: { id: string; time: string }[]
+    }
+    expect(v.items[0]).toMatchObject({ id: 'step-txt:a#0', time: '09:05', short: 'hello', kind: 'text', role: 'assistant' })
+    expect(v.items[1]!.time).toBe('--:--')
+  })
+
+  test('a long item is cut with an ellipsis and keeps its full text; a short one has no full', () => {
+    const long = 'y'.repeat(100)
+    const v = transcriptView({ items: [text({ text: long }), text({ key: 'txt:b#0', text: 'short' })] }, 40, 5) as {
+      items: { short: string; full?: string }[]
+    }
+    expect(v.items[0]!.short).toHaveLength(34)
+    expect(v.items[0]!.short.endsWith('…')).toBe(true)
+    expect(v.items[0]!.full).toBe(long)
+    expect('full' in v.items[1]!).toBe(false)
+  })
+
+  test('a tool item reads ⚙ <Tool> <brief> and carries its id and flags', () => {
+    const tool: TranscriptItem = { kind: 'tool', key: 'tool:t1', toolUseId: 't1', tool: 'Bash', brief: 'ls', isError: true, isPending: true }
+    const v = transcriptView({ items: [tool] }, 40, 5) as { items: Record<string, unknown>[] }
+    expect(v.items[0]).toMatchObject({ id: 'step-tool:t1', short: '⚙ Bash ls', kind: 'tool', toolUseId: 't1', isError: true, isPending: true })
+    const bare = transcriptView({ items: [{ ...tool, brief: '' }] }, 40, 5) as { items: { short: string }[] }
+    expect(bare.items[0]!.short).toBe('⚙ Bash')
+  })
+
+  test('n keeps the last items', () => {
+    const items = ['a', 'b', 'c'].map(k => text({ key: k, text: k }))
+    const v = transcriptView({ items }, 40, 2) as { items: { short: string }[] }
+    expect(v.items.map(i => i.short)).toEqual(['b', 'c'])
+  })
+})
+
+describe('review fixes', () => {
+  test('textKey strips control characters before collapsing whitespace', () => {
+    expect(textKey('assistant', 'a \x07 b')).toBe(textKey('assistant', 'a b'))
+  })
+
+  test('a text item keeps its newlines; the view flattens short but full keeps them', () => {
+    const [item] = transcriptItems([tmsg('assistant', 'line one\n\x1b[31mline\x1b[0m two\x07')], noStamps, opts0)
+    expect((item as { text: string }).text).toBe('line one\nline two')
+    const v = transcriptView({ items: [{ kind: 'text', key: 'k', role: 'assistant', text: `first\n${'z'.repeat(80)}` }] }, 40, 5) as {
+      items: { short: string; full?: string }[]
+    }
+    expect(v.items[0]!.short.includes('\n')).toBe(false)
+    expect(v.items[0]!.short.startsWith('first z')).toBe(true)
+    expect(v.items[0]!.full).toBe(`first\n${'z'.repeat(80)}`)
+    const flat = transcriptView({ items: [{ kind: 'text', key: 'k', role: 'assistant', text: 'a\nb' }] }, 40, 5) as {
+      items: { short: string; full?: string }[]
+    }
+    expect(flat.items[0]!.short).toBe('a b')
+  })
+
+  test('a repeated text keeps its key when earlier copies scroll out of the window', () => {
+    const all = [tmsg('user', 'brief'), tmsg('assistant', 'same'), tmsg('assistant', 'other'), tmsg('assistant', 'same')]
+    const items = transcriptItems(all, noStamps, { ...opts0, n: 1 })
+    expect(items[0]!.key).toBe(`${textKey('assistant', 'same')}#1`)
+  })
+
+  test('message 0 is the brief only when the transcript was not cut at 4096 entries', () => {
+    const full = Array.from({ length: 4096 }, (_, i) => tmsg('assistant', `m${i}`))
+    const items = transcriptItems(full, noStamps, { ...opts0, n: 4096 })
+    expect('t' in items[0]!).toBe(false)
+    const short = transcriptItems(full.slice(0, 4095), noStamps, { ...opts0, n: 1 + 4095 })
+    expect(short[0]!.t).toBe(1000)
+  })
+
+  test('a failed or running tool item leaves room for its markers', () => {
+    const tool: TranscriptItem = { kind: 'tool', key: 'tool:t1', toolUseId: 't1', tool: 'Bash', brief: 'x'.repeat(100) }
+    const len = (it: TranscriptItem) => ((transcriptView({ items: [it] }, 40, 5) as { items: { short: string }[] }).items[0]!.short.length)
+    expect(len(tool)).toBe(34)
+    expect(len({ ...tool, isError: true })).toBe(32)
+    expect(len({ ...tool, isPending: true })).toBe(24)
+    expect(len({ ...tool, isError: true, isPending: true })).toBe(22)
+  })
+
+  test('modelName drops a -latest suffix', () => {
+    expect(modelName('claude-3-5-haiku-latest')).toBe('Haiku 3.5')
+    expect(modelName('claude-sonnet-4-5-latest')).toBe('Sonnet 4.5')
+  })
+})
+
+describe('cleanBlock', () => {
+  test('keeps only newline and tab among control characters', () => {
+    expect(cleanBlock('a\x1b[1;32mb\x1b[0m\tc\r\nd\x07e\x00f')).toBe('ab\tc\ndef')
+  })
+
+  test('strips the one-byte CSI form and OSC sequences whole', () => {
+    expect(cleanBlock('\x9b31mred\x9b0m')).toBe('red')
+    expect(cleanBlock('\x1b]8;;http://x\x07link\x1b]8;;\x1b\\')).toBe('link')
   })
 })
