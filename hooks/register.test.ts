@@ -50,6 +50,8 @@ const world = (on: On) => {
     inTimer: false,
     /** Sends made while `inTimer`. */
     timerSends: [] as string[],
+    /** While set, the engine's turn.step and tool.call beneath the plugin wait on it. */
+    holdNext: undefined as Promise<void> | undefined,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -119,6 +121,7 @@ const world = (on: On) => {
     return { value: { isPlaced: true } }
   })
   on('turn.step', async function* ($, e) {
+    if (w.holdNext) await w.holdNext
     const tokens = w.tokens.get(e.agentId ?? 'main') ?? 1000
     return {
       turnId: e.turnId,
@@ -142,7 +145,10 @@ const world = (on: On) => {
     }
     return { text: e.answer }
   })
-  on('tool.call', ($, e) => (w.toolAnswer?.(e as never) ?? { result: 'ok' }) as never)
+  on('tool.call', async ($, e) => {
+    if (w.holdNext) await w.holdNext
+    return (w.toolAnswer?.(e as never) ?? { result: 'ok' }) as never
+  })
   return Object.assign(w, { session })
 }
 
@@ -2883,4 +2889,28 @@ describe('delivery from timers: hardening', () => {
     await w.clock.settle()
     expect((JSON.parse(w.files.get(STATE)!) as { outbox?: unknown[] }).outbox ?? []).toHaveLength(0)
   })
+})
+
+describe('delivery waits for the engine', () => {
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  const checkins = (w: World) => w.sent.filter(m => m.to.includes('agent1') && m.text.includes('check-in'))
+
+  for (const hook of ['turn.step', 'tool.call'] as const) {
+    test(`${hook} sends nothing while the engine's own work beneath it is under way`, async ($, on) => {
+      const w = world(on)
+      await family($, w)
+      await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+      await w.clock.advance(5 * 60_000)
+      let release = () => {}
+      w.holdNext = new Promise<void>(r => (release = r))
+      const running = hook === 'turn.step' ? step($, 'agent2') : tool($, 'agent2')
+      await w.clock.settle()
+      expect(checkins(w)).toHaveLength(0)
+      w.holdNext = undefined
+      release()
+      await running
+      await w.clock.settle()
+      expect(checkins(w)).toHaveLength(1)
+    })
+  }
 })
