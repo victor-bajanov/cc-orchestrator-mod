@@ -1,6 +1,6 @@
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 
-import type { AgentRow, AgentStatus, DisplayStatus, LogEntry, MainPhase, Peek, Sample, Transcript, TranscriptItem } from '../types'
+import type { AgentRow, AgentStatus, DisplayStatus, LogEntry, MainPhase, Sample, Transcript, TranscriptItem } from '../types'
 import { fmtTokens, label } from './core'
 
 export type { DisplayStatus }
@@ -50,51 +50,8 @@ export const cut = (text: string, fits: number): string => `${text.slice(0, Math
 const clean = (s: string): string =>
   s.replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
 
-/** `Bash×2, Read`: each tool once, in first-use order, with its count past one. */
-const toolSummary = (uses: SessionMessage['toolUses']): string => {
-  const counts = new Map<string, number>()
-  for (const u of uses) {
-    const tool = clean(u.tool)
-    counts.set(tool, (counts.get(tool) ?? 0) + 1)
-  }
-  return [...counts].map(([tool, n]) => (n > 1 ? `${tool}×${n}` : tool)).join(', ')
-}
-
-/**
- * An agent's last `n` messages, one line each, for the pane's transcript peek:
- * `role: ⚙ tools · text`, whitespace collapsed, escapes and control characters
- * stripped, cut to `width`. Messages with no text and no tool use (a user row of
- * tool results alone) are left out. It reads from the end and stops once it has
- * `n` lines, so a long transcript costs only its tail; the lines come oldest first.
- */
-export const peekLines = (messages: readonly SessionMessage[], width: number, n: number): string[] => {
-  const out: string[] = []
-  for (let i = messages.length - 1; i >= 0 && out.length < n; i--) {
-    const m = messages[i]!
-    const text = clean(m.text.replace(/\s+/g, ' ')).trim()
-    const tools = m.toolUses.length ? `⚙ ${toolSummary(m.toolUses)}` : ''
-    const body = [tools, text].filter(Boolean).join(' · ')
-    if (body === '') continue
-    const line = `${m.role}: ${body}`
-    out.push(line.length > width ? cut(line, width) : line)
-  }
-  return out.reverse()
-}
-
 /** What the pane shows when an agent's transcript cannot be read. */
 export const PEEK_DENIED = 'transcript not readable (teammate in another pane, or finished)'
-
-/**
- * What the pane draws for a selected agent's cached transcript: one dim line
- * (`loading…` before the first read settles, the not-readable line, or
- * `no messages yet`), or its last `n` lines cut to `width`.
- */
-export const peekView = (peek: Peek | undefined, width: number, n: number): { dim: string } | { lines: string[] } => {
-  if (!peek) return { dim: 'loading…' }
-  if ('denied' in peek) return { dim: PEEK_DENIED }
-  if (peek.lines.length === 0) return { dim: 'no messages yet' }
-  return { lines: peek.lines.slice(-n).map(l => (l.length > width ? cut(l, width) : l)) }
-}
 
 /** Model families the mod names, and the effort levels it abbreviates. */
 const FAMILY = 'opus|sonnet|haiku|fable'

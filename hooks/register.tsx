@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, DisplayStatus, LogEntry, MainPhase, Peek } from '../types'
+import type { AgentRow, DisplayStatus, LogEntry, MainPhase, Transcript } from '../types'
 import {
   HANDOVER_CLAUSE,
   contextOf,
@@ -32,12 +32,14 @@ import {
   mainButtonShown,
   modelLabel,
   paneHeader,
-  peekLines,
-  peekView,
   seriesColors,
   statusEmoji,
   statusStyle,
+  textKey,
+  transcriptItems,
+  transcriptView,
 } from './view'
+import type { TranscriptLine } from './view'
 
 type $ = EngineInterface
 
@@ -53,8 +55,8 @@ const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
-/** Each agent's transcript tail, read off the render by refreshPeek. */
-const peeksAtom = atom({ plugin: 'orchestrator', key: 'peeks' } as const, {} as Record<string, Peek>)
+/** Each agent's last transcript items, read off the render by refreshTranscript. */
+const transcriptsAtom = atom({ plugin: 'orchestrator', key: 'transcripts' } as const, {} as Record<string, Transcript>)
 /** Mirrors `mainHandoverQueued` for drawing: the buttons say a handover waits on this turn. */
 const queuedAtom = atom({ plugin: 'orchestrator', key: 'mainQueued' } as const, false)
 
@@ -92,6 +94,13 @@ let mainHandoverStarting = false
 const peeking = new Set<string>()
 /** Agents triggered while their read was in flight: each is read once more when it settles. */
 const peekAgain = new Set<string>()
+/**
+ * When the mod saw each transcript entry, per agent: a call's `tool_use_id` or a text's
+ * `textKey` → ms. Module-level, so lost on reload; an entry it never saw draws `--:--`.
+ */
+const stamps = new Map<string, Map<string, number>>()
+/** The most stamps kept per agent; the oldest goes first. */
+const STAMPS_MAX = 500
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
 
@@ -170,19 +179,30 @@ async function toggleSelected($: $, id: string) {
 
 /** How long a transcript read may take before the pane calls it not readable. */
 export const PEEK_TIMEOUT_MS = 3_000
-/** The most lines a transcript peek keeps: the desktop's; the terminal shows fewer. */
-const PEEK_MAX = 8
-/** The longest line a peek stores: wider than any pane draws, short enough to keep state small. */
-const PEEK_CHARS = 500
+/** The most items a transcript keeps: the desktop's; the terminal shows fewer. */
+const TRANSCRIPT_MAX = 12
+/** The terminal's transcript items. */
+const TRANSCRIPT_TERMINAL = 6
+/** The longest text item stored: whole enough to expand, short enough to keep state small. */
+const STEP_CHARS = 2000
+
+/** Records when the mod saw an entry of an agent's transcript. Synchronous; never throws on good input. */
+function stamp(agentId: string, key: string, t: number) {
+  let m = stamps.get(agentId)
+  if (!m) stamps.set(agentId, (m = new Map()))
+  m.delete(key)
+  m.set(key, t)
+  if (m.size > STAMPS_MAX) m.delete(m.keys().next().value!)
+}
 
 /**
- * Reads an agent's transcript tail into `peeksAtom`, off the render (a drawing never awaits it).
- * The agent counts as in flight until the read itself settles, so a hung read never has others
- * piled behind it; a trigger meanwhile is remembered, and one reread follows once it settles.
- * A refusal, a failure or a read past PEEK_TIMEOUT_MS is stored as denied, unless lines are
- * already cached: an agent that finished, or a slow read, keeps the last lines shown.
+ * Reads an agent's transcript into `transcriptsAtom` as its last items, off the render (a drawing never
+ * awaits it). The agent counts as in flight until the read itself settles, so a hung read never has
+ * others piled behind it; a trigger meanwhile is remembered, and one reread follows once it settles.
+ * A refusal, a failure or a read past PEEK_TIMEOUT_MS is stored as denied, unless items are already
+ * cached: an agent that finished, or a slow read, keeps the last items shown.
  */
-async function refreshPeek($: $, id: string) {
+async function refreshTranscript($: $, id: string) {
   if (id === 'main') return
   if (peeking.has(id)) {
     peekAgain.add(id)
@@ -191,7 +211,7 @@ async function refreshPeek($: $, id: string) {
   peeking.add(id)
   const found = $.session
     .messages({ agentId: id })
-    .then(f => ('deny' in f ? undefined : peekLines(f, PEEK_CHARS, PEEK_MAX)))
+    .then(f => ('deny' in f ? undefined : f))
     .catch(() => undefined)
     .finally(() => {
       peeking.delete(id)
@@ -201,10 +221,14 @@ async function refreshPeek($: $, id: string) {
   const late = new Promise<undefined>(resolve => {
     timer = $.clock.after(PEEK_TIMEOUT_MS, () => resolve(undefined))
   })
-  const lines = await Promise.race([found, late])
+  const messages = await Promise.race([found, late])
   timer?.cancel()
-  await update($, peeksAtom, p =>
-    lines ? { ...p, [id]: { lines } } : p[id] && 'lines' in p[id] ? p : { ...p, [id]: { denied: true as const } },
+  const startedAt = (await read($, agentsAtom)).find(r => r.id === id)?.startedAt ?? 0
+  const items = messages
+    ? transcriptItems(messages, key => stamps.get(id)?.get(key), { n: TRANSCRIPT_MAX, chars: STEP_CHARS, startedAt })
+    : undefined
+  await update($, transcriptsAtom, p =>
+    items ? { ...p, [id]: { items } } : p[id] && 'items' in p[id] ? p : { ...p, [id]: { denied: true as const } },
   )
 }
 
@@ -215,7 +239,7 @@ function schedulePeek($: $, id: string) {
     peekAgain.add(id)
     return
   }
-  $.clock.after(0, () => void refreshPeek($, id).catch(() => undefined))
+  $.clock.after(0, () => void refreshTranscript($, id).catch(() => undefined))
 }
 
 /** Rereads the transcript of the agent an event came from, when it is the one open in the pane. Never throws. */
@@ -223,8 +247,15 @@ async function peekIfSelected($: $, id: string | undefined) {
   try {
     if (id && id === (await read($, selectedAtom))) schedulePeek($, id)
   } catch {
-    // The peek is a convenience: whatever fails here must not reach a handover or a step's record.
+    // The transcript is a convenience: whatever fails here must not reach a handover or a step's record.
   }
+}
+
+/** Opens a tool call's detail from its transcript item. A stub: the detail dialog comes later. */
+async function openTool($: $, agentId: string, toolUseId: string) {
+  void $
+  void agentId
+  void toolUseId
 }
 
 // ---- subagents -------------------------------------------------------
@@ -461,6 +492,7 @@ export const register: Register = (on, options) => {
   mainHandoverStarting = false
   peeking.clear()
   peekAgain.clear()
+  stamps.clear()
 
   // ---- events ----------------------------------------------------------
 
@@ -527,11 +559,15 @@ export const register: Register = (on, options) => {
         ])
       }
       const tokens = contextOf(res.usage)
-      await update($, agentsAtom, l => recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }))
       // The answering model wins over the requested one; an engine without effort leaves it out.
-      await update($, agentsAtom, l =>
-        patch(l, id, { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }),
-      )
+      const ran = { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }
+      await update($, agentsAtom, l => patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran))
+      try {
+        // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
+        if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now)
+      } catch {
+        // A lost stamp only leaves the item's time `--:--`.
+      }
       if (id === 'main') await checkMain($, tokens)
       else if (tokens >= cfg.agentThreshold) {
         const r = (await read($, agentsAtom)).find(a => a.id === id)
@@ -560,6 +596,26 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', async ($, e, next) => {
+    if (e.agentId !== undefined) {
+      // Stamped as the call starts, when the mod saw it, for the transcript. The call never waits on the clock,
+      // and a lost stamp only leaves the item's time `--:--`: the call and its HANDOVER go ahead.
+      const agentId = e.agentId
+      const id = e.tool_use_id
+      try {
+        void $.clock.now().then(
+          t => {
+            try {
+              stamp(agentId, id, t)
+            } catch {
+              // see above
+            }
+          },
+          () => undefined,
+        )
+      } catch {
+        // see above
+      }
+    }
     const res = await next(e)
     if (e.agentId === undefined || res.deny !== undefined) return res
     let out = res
@@ -715,7 +771,47 @@ export const register: Register = (on, options) => {
       const fits = cols - 6
       // Main is the main view already: only a subagent's transcript is shown.
       // Drawn from the cache alone: the read is refreshPeek's, never the render's.
-      const peek = selected && selected !== 'main' ? peekView((await read($, peeksAtom))[selected], fits, PEEK_MAX) : undefined
+      const peek =
+        selected && selected !== 'main' ? transcriptView((await read($, transcriptsAtom))[selected], fits, TRANSCRIPT_MAX) : undefined
+      /** One transcript item: a tool call opens its detail; a cut text expands in flow beneath itself. */
+      const item = (agentId: string, it: TranscriptLine) => {
+        const time = <Text dimColor>{it.time} </Text>
+        if (it.kind === 'tool') {
+          return (
+            <Button key={`tool:${agentId}:${it.toolUseId}`} plain onPress={() => openTool($, agentId, it.toolUseId!)}>
+              {time}
+              {it.isError && <Text color="error">✗ </Text>}
+              <Text>{it.short}</Text>
+              {it.isPending && <Text dimColor> (running)</Text>}
+            </Button>
+          )
+        }
+        const who = it.role === 'user' && <Text dimColor>» </Text>
+        if (it.full === undefined) {
+          return (
+            <Text key={it.id} wrap="truncate">
+              {time}
+              {who}
+              {it.short}
+            </Text>
+          )
+        }
+        const pin = it.id.replace(/^step-/, `step-${agentId}-`)
+        return (
+          <Box key={it.id} flexDirection="column">
+            <Button key={pin} plain onPress={() => togglePinned($, pin)}>
+              {time}
+              {who}
+              <Text>{it.short}</Text>
+            </Button>
+            {pinned === pin && (
+              <Box key={`full:${pin}`} borderStyle="round" flexDirection="column">
+                <Text wrap="wrap">{it.full}</Text>
+              </Box>
+            )}
+          </Box>
+        )
+      }
       return (
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -763,16 +859,8 @@ export const register: Register = (on, options) => {
                   )}
                 </Box>,
                 peek && selected === row.id && (
-                  <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" marginLeft={depth * 2}>
-                    {'dim' in peek ? (
-                      <Text dimColor>{peek.dim}</Text>
-                    ) : (
-                      peek.lines.map((l, j) => (
-                        <Text key={`p${j}`} wrap="truncate">
-                          {l}
-                        </Text>
-                      ))
-                    )}
+                  <Box key={`transcript:${row.id}`} borderStyle="round" flexDirection="column" marginLeft={depth * 2}>
+                    {'dim' in peek ? <Text dimColor>{peek.dim}</Text> : peek.items.map(it => item(row.id, it))}
                   </Box>
                 ),
               ]
@@ -831,8 +919,64 @@ export const register: Register = (on, options) => {
     }
     const selected = liveSelection(rows, await read($, selectedAtom))
     // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.
-    const peek = selected && selected !== 'main' ? peekView((await read($, peeksAtom))[selected], Math.max(10, cols - 4), 5) : undefined
-    const peekRows = peek ? ('lines' in peek ? peek.lines.length : 1) + 2 : 0
+    const peek =
+      selected && selected !== 'main'
+        ? transcriptView((await read($, transcriptsAtom))[selected], Math.max(10, cols - 4), TRANSCRIPT_TERMINAL)
+        : undefined
+    const peekRows = peek ? ('items' in peek ? peek.items.length : 1) + 2 : 0
+    /** One transcript row: a tool call opens its detail; a cut text shows whole in a card on hover, pinned by a press. */
+    const item = (agentId: string, it: TranscriptLine) => {
+      const time = <Text dimColor>{it.time} </Text>
+      if (it.kind === 'tool') {
+        return (
+          <Button key={`tool:${agentId}:${it.toolUseId}`} plain onPress={() => openTool($, agentId, it.toolUseId!)}>
+            {time}
+            {it.isError && <Text color="error">✗ </Text>}
+            <Text>{it.short}</Text>
+            {it.isPending && <Text dimColor> (running)</Text>}
+          </Button>
+        )
+      }
+      const who = it.role === 'user' && <Text dimColor>» </Text>
+      if (it.full === undefined) {
+        return (
+          <Text key={it.id} wrap="truncate">
+            {time}
+            {who}
+            {it.short}
+          </Text>
+        )
+      }
+      const pin = it.id.replace(/^step-/, `step-${agentId}-`)
+      // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
+      // It opens downward, over the activity (the top of the pane would clip it), with as many lines as fit there.
+      const all = wrapFill(it.full, Math.max(10, cols - 4))
+      const fit = Math.max(1, room)
+      const wrapped = all.length > fit ? [...all.slice(0, fit - 1), '…'] : all
+      return (
+        <Box key={it.id}>
+          <Button key={pin} plain onPress={() => togglePinned($, pin)}>
+            {time}
+            {who}
+            <Text>{it.short}</Text>
+          </Button>
+          <Box
+            position="absolute"
+            top={1}
+            left={-1}
+            width={cols}
+            borderStyle="round"
+            flexDirection="column"
+            display={pinned === pin ? 'flex' : 'none'}
+            hover={pinned === pin ? undefined : { display: 'flex' }}
+          >
+            {wrapped.map((w, j) => (
+              <Text key={`w${j}`} wrap="truncate">{` ${w} `}</Text>
+            ))}
+          </Box>
+        </Box>
+      )
+    }
     // The header's button can wrap onto a row of its own.
     const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0) - peekRows)
     return (
@@ -887,17 +1031,13 @@ export const register: Register = (on, options) => {
               </Text>
             </Box>,
             peek && selected === row.id && (
-              <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
+              <Box key={`transcript:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
                 {'dim' in peek ? (
                   <Text dimColor wrap="truncate">
                     {peek.dim}
                   </Text>
                 ) : (
-                  peek.lines.map((l, j) => (
-                    <Text key={`p${j}`} wrap="truncate">
-                      {l}
-                    </Text>
-                  ))
+                  peek.items.map(it => item(row.id, it))
                 )}
               </Box>
             ),

@@ -20,8 +20,6 @@ import {
   modelLabel,
   modelName,
   paneHeader,
-  peekLines,
-  peekView,
   runnerFor,
   seriesColors,
   statusEmoji,
@@ -263,77 +261,6 @@ describe('mainButtonShown', () => {
     expect(mainButtonShown('auto', 'idle')).toBe(false)
     expect(mainButtonShown('auto', 'offered')).toBe(false)
     expect(mainButtonShown('off', 'idle')).toBe(false)
-  })
-})
-
-describe('peekLines', () => {
-  const msg = (role: 'user' | 'assistant', text: string, tools: string[] = []): SessionMessage => ({
-    role,
-    text,
-    toolUses: tools.map((tool, i) => ({ tool_use_id: `t${i}`, tool, input: {} })),
-  })
-
-  test('an empty transcript gives no lines; a tool-result-only user row is dropped', () => {
-    expect(peekLines([], 80, 5)).toEqual([])
-    const results: SessionMessage = { ...msg('user', ''), toolResults: [{ tool_use_id: 't0', text: 'ok' } as never] }
-    expect(peekLines([results], 80, 5)).toEqual([])
-  })
-
-  test('keeps the last n drawable messages, oldest first', () => {
-    const all = [msg('user', 'one'), msg('assistant', 'two'), msg('user', ''), msg('assistant', 'three')]
-    expect(peekLines(all, 80, 2)).toEqual(['assistant: two', 'assistant: three'])
-  })
-
-  test('prefixes the role and collapses whitespace', () => {
-    expect(peekLines([msg('assistant', 'a\n  b\tc ')], 80, 5)).toEqual(['assistant: a b c'])
-    expect(peekLines([msg('user', 'go')], 80, 5)).toEqual(['user: go'])
-  })
-
-  test('summarises tool uses before the text, counting repeats in first-use order', () => {
-    expect(peekLines([msg('assistant', 'text', ['Bash', 'Read', 'Bash'])], 80, 5)).toEqual(['assistant: ⚙ Bash×2, Read · text'])
-    expect(peekLines([msg('assistant', '', ['Bash', 'Read', 'Bash'])], 80, 5)).toEqual(['assistant: ⚙ Bash×2, Read'])
-  })
-
-  test('reads backwards and stops once n lines are drawable, keeping them in order', () => {
-    const boom = (): SessionMessage =>
-      Object.defineProperty({ role: 'assistant', toolUses: [] }, 'text', {
-        get() {
-          throw new Error('older messages must not be read')
-        },
-      }) as unknown as SessionMessage
-    const all = [boom(), boom(), boom(), msg('user', 'four'), msg('assistant', 'five')]
-    expect(peekLines(all, 80, 2)).toEqual(['user: four', 'assistant: five'])
-  })
-
-  test('strips ANSI escapes and control characters from the text and the tool names', () => {
-    expect(peekLines([msg('assistant', '\x1b[31mred\x1b[0m done\x07')], 80, 5)).toEqual(['assistant: red done'])
-    expect(peekLines([msg('assistant', 'ok', ['\x1b[1mBash\x1b[0m\x07'])], 80, 5)).toEqual(['assistant: ⚙ Bash · ok'])
-  })
-
-  test('cuts a long line to exactly the width, ending in an ellipsis', () => {
-    const [line] = peekLines([msg('assistant', 'x'.repeat(200), ['Edit'])], 40, 5)
-    expect(line).toHaveLength(40)
-    expect(line!.endsWith('…')).toBe(true)
-    expect(line!.startsWith('assistant: ⚙ Edit · x')).toBe(true)
-    expect(peekLines([msg('user', 'short')], 40, 5)).toEqual(['user: short'])
-  })
-})
-
-describe('peekView', () => {
-  const DENIED = PEEK_DENIED
-  test('nothing read yet is loading; denied is the not-readable line; no lines is nothing yet', () => {
-    expect(peekView(undefined, 40, 5)).toEqual({ dim: 'loading…' })
-    expect(peekView({ denied: true }, 40, 5)).toEqual({ dim: DENIED })
-    expect(peekView({ lines: [] }, 40, 5)).toEqual({ dim: 'no messages yet' })
-  })
-
-  test('keeps the last n lines and cuts each to the width', () => {
-    const lines = ['user: one', 'assistant: two', `assistant: ${'x'.repeat(60)}`]
-    const v = peekView({ lines }, 20, 2) as { lines: string[] }
-    expect(v.lines).toHaveLength(2)
-    expect(v.lines[0]).toBe('assistant: two')
-    expect(v.lines[1]).toHaveLength(20)
-    expect(v.lines[1]!.endsWith('…')).toBe(true)
   })
 })
 
@@ -668,6 +595,15 @@ describe('transcriptItems', () => {
     const long = (items[1] as { text: string }).text
     expect(long).toHaveLength(20)
     expect(long.endsWith('…')).toBe(true)
+  })
+
+  test('a tool name with escapes is drawn clean', () => {
+    const [it] = transcriptItems([tmsg('assistant', '', [{ tool_use_id: 'e', tool: '\x1b[31mBash', input: { command: 'ls' } }])], () => undefined, {
+      n: 5,
+      chars: 100,
+      startedAt: 0,
+    })
+    expect(it).toMatchObject({ kind: 'tool', tool: 'Bash' })
   })
 
   test('carries isError, and isPending for a call with no result text', () => {

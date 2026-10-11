@@ -58,13 +58,6 @@ export type AgentRow = {
 export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }
 
 /**
- * An agent's transcript tail as the pane last read it, off the render: its lines
- * (cleaned, each capped), or `denied` when no read has given lines (refused,
- * failed or timed out).
- */
-export type Peek = { lines: string[] } | { denied: true }
-
-/**
  * One entry of an agent's transcript as the pane shows it: a message's text, or
  * one of its tool calls. `key` is stable across reads; `t` is when the mod saw it
  * (absent when it never did).
@@ -85,11 +78,12 @@ declare module 'claude-code' {
       log: LogEntry[]
       mainPhase: MainPhase
       runId: string
+      /** The one cut line shown whole: an activity line (`log-…`) or a transcript text (`step-<agentId>-…`); '' for none. */
       pinnedLog: string
       /** The agent a click selected: its chart line highlighted, its transcript shown beneath its row ('' for none). */
       selectedAgent: string
-      /** Each agent's transcript tail by id, read off the render; the pane draws the selected one's. */
-      peeks: Record<string, Peek>
+      /** Each agent's last transcript items by id, read off the render; the pane draws the selected one's. */
+      transcripts: Record<string, Transcript>
       /** A main handover asked for mid-turn, waiting for that turn to end. */
       mainQueued: boolean
     }
