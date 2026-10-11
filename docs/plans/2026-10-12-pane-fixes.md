@@ -700,3 +700,21 @@ on('ui.copy', ($, e) => {
   2. The pane and `/orch roster` show `orchestrator-2`.
   3. `mcp__orchestrator__checkin { agent: "orchestrator-2" }` arms, and so does the id.
   4. After main's turn ends, the new agent receives `[orchestrator mod] You are registered as \`orchestrator-2\` …`, and the activity log shows `"orchestrator" was taken…`.
+
+---
+
+## Decisions taken during the run (review these)
+
+Made by the orchestrator while the user was asleep. Most likely to be reversed first.
+
+1. **What the SendMessage check trusts.** Chose: allow only while one of the mod's own sends to that same recipient is in flight, and then only with the exact text *or* the mod's own `next.origin`. Why: the types say a plugin origin also covers "the model inside an agent it spawned" (T:11605-11608), so origin alone could allow a respawned agent's own sends. Rejected: origin OR exact match (the brief's suggestion), and dropping exact matching for origin alone. Residual: during a mod send to R (at most 10 s), a SendMessage to R with the mod's origin passes with any text.
+2. **Copy control is desktop-only, `⧉`, toasts `Copied` / `Not copied (<reason>)`.** Why: the terminal selects text natively. Today's desktop app may answer `no-clipboard` until it routes plugin copies; the control is built anyway, as decided. Rejected: also drawing it on the terminal.
+3. **Rename notice is a queued, live-only outbox message, not a line in the brief.** Why: the engine's name is known only after the prompt is sent; a direct send from the spawn hook would run the woken agent without spawn tracking; live-only stops a finished agent being woken and its "final report" forwarded twice. Wording says "you asked for `Y`", not "was taken", since the engine also rewrites `@`. Rejected: predicting the suffix in the brief.
+4. **A registered name beats a requested one, even if its holder is done.** Why: the registered name is what SendMessage and ListAgents use; `impl-2` or the id still reach the other. Rejected: live-first across all tiers. An ambiguous requested name answers "could mean …" and changes nothing.
+5. **The check-miss diagnostic line stays,** once per load, in the debug log, with the recipient and the message length only. Why: it is how to see the real engine's message shape if Hand over still fails. Rejected: removing it; logging message text.
+6. **Fold controls.** Rows that can't fold reserve a one-space `nofold:<id>` cell so columns align; `c` acts on the selected row, else main, and is hidden when that row can't fold. Rejected: hiding the cell (misaligned names).
+7. **A hung mod send's allow expires after `DRAIN_TIMEOUT_MS` (10 s).** Rejected: no expiry (a never-settling send would allow that exact message forever).
+8. **Rows record the engine's name and `teammateId`;** an unnamed agent takes the engine's name. Teammate addresses (`teammateId`, `name@team`) match the recipient. Rejected: parsing `teammateId` for the name.
+9. **Not changed (review findings rejected):** no timeout around the spawn hook's `$.agent.list()` (respawn already awaits it; nothing documents a hang); no memoisation of `canFold` (real trees are small).
+10. **Test gaps accepted:** the origin branch is tested at function level only (the test kit stamps every check `engine` and runs the hook module in its own realm); respawn's rename notice is covered only through the spawn-hook path in the harness.
+11. **Skill names the orchestrator `orch-<task-slug>`.** Rejected: random suffixes.
