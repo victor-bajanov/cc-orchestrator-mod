@@ -53,6 +53,8 @@ export type AgentRow = {
   model?: string
   /** Its last step's effort, as a string (`'medium'`, or a token budget such as `'32000'`). */
   effort?: string
+  /** When a step last revived it from done: it was resumed by a message after it ended. */
+  resumedAt?: number
 }
 
 export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }
@@ -69,6 +71,24 @@ export type TranscriptItem =
 /** An agent's transcript items as the pane last read them, off the render, or `denied`. */
 export type Transcript = { items: TranscriptItem[] } | { denied: true }
 
+/**
+ * One part of a tool call's detail, as `hooks/detail.ts` builds it. Declared here too because this
+ * contract must be self-contained; the two are structurally the same, so tsc checks they agree.
+ */
+export type DetailSection =
+  | { kind: 'code'; label: string; source: string; language?: string; path?: string; startLine?: number; diff?: true }
+  | { kind: 'markdown'; label: string; text: string }
+  | { kind: 'text'; label: string; text: string }
+
+/** A tool call laid out for the detail dialog (`toolDetail` in `hooks/detail.ts`). */
+export type ToolDetail = { tool: string; time: string; isError: boolean; isPending: boolean; sections: DetailSection[] }
+
+/**
+ * The tool call the detail dialog shows: which call, whether it is drawn inline in the
+ * main pane (no surface placed the dialog), and its detail once read, or `denied`.
+ */
+export type ToolView = { agentId: string; toolUseId: string; inline: boolean; detail?: ToolDetail; denied?: true }
+
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
 
 declare module 'claude-code' {
@@ -84,6 +104,8 @@ declare module 'claude-code' {
       selectedAgent: string
       /** Each agent's last transcript items by id, read off the render; the pane draws the selected one's. */
       transcripts: Record<string, Transcript>
+      /** The tool call open in the detail dialog, or null. */
+      toolView: ToolView | null
       /** A main handover asked for mid-turn, waiting for that turn to end. */
       mainQueued: boolean
     }

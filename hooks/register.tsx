@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, DisplayStatus, LogEntry, MainPhase, Transcript } from '../types'
+import type { AgentRow, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
+import { toolDetail } from './detail'
+import type { ToolDetail } from './detail'
 import {
   HANDOVER_CLAUSE,
   contextOf,
@@ -44,6 +46,8 @@ import type { TranscriptLine } from './view'
 type $ = EngineInterface
 
 const PANE = 'orchestrator'
+/** The tool-call detail dialog: a second pane, one at a time. */
+const TOOL_PANE = 'orchestrator-tool'
 const SYNC_MS = 30_000
 const STALL_MS = 20 * 60_000
 
@@ -55,6 +59,8 @@ const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
+/** The tool call open in the detail dialog, read off the render by refreshTool. */
+const toolViewAtom = atom({ plugin: 'orchestrator', key: 'toolView' } as const, null as ToolView | null)
 /** Each agent's last transcript items, read off the render by refreshTranscript. */
 const transcriptsAtom = atom({ plugin: 'orchestrator', key: 'transcripts' } as const, {} as Record<string, Transcript>)
 /** Mirrors `mainHandoverQueued` for drawing: the buttons say a handover waits on this turn. */
@@ -94,6 +100,9 @@ let mainHandoverStarting = false
 const peeking = new Set<string>()
 /** Agents triggered while their read was in flight: each is read once more when it settles. */
 const peekAgain = new Set<string>()
+/** Tool calls (`agentId:toolUseId`) whose detail read is in flight, and those triggered meanwhile. */
+const toolReading = new Set<string>()
+const toolAgain = new Set<string>()
 /**
  * When the mod saw each transcript entry, per agent: a call's `tool_use_id` or a text's
  * `textKey` → ms. Module-level, so lost on reload; an entry it never saw draws `--:--`.
@@ -251,11 +260,140 @@ async function peekIfSelected($: $, id: string | undefined) {
   }
 }
 
-/** Opens a tool call's detail from its transcript item. A stub: the detail dialog comes later. */
+/**
+ * Opens a tool call's detail in the dialog pane, or closes it when that call is the one open.
+ * Only state is awaited: the read is scheduled and the open is fire-and-forget, so a press never
+ * waits on either. A session that places no dialog (an older desktop) gets the detail inline.
+ */
 async function openTool($: $, agentId: string, toolUseId: string) {
-  void $
-  void agentId
-  void toolUseId
+  const open = await read($, toolViewAtom)
+  if (open?.agentId === agentId && open.toolUseId === toolUseId) return closeTool($)
+  await update($, toolViewAtom, () => ({ agentId, toolUseId, inline: false }))
+  scheduleTool($, agentId, toolUseId)
+  const r = (await read($, agentsAtom)).find(a => a.id === agentId)
+  const tr = (await read($, transcriptsAtom))[agentId]
+  const item = tr && 'items' in tr ? tr.items.find(i => i.kind === 'tool' && i.toolUseId === toolUseId) : undefined
+  const title = `${r ? label(r) : agentId} · ${item?.kind === 'tool' ? item.tool : 'tool call'}`
+  void $.ui
+    .open({ id: TOOL_PANE, title, focus: true, closeOnEscape: true, holdToasts: true, rows: 20 })
+    .then(async res => {
+      if (res.isPlaced) return
+      await update($, toolViewAtom, v => (v && v.agentId === agentId && v.toolUseId === toolUseId ? { ...v, inline: true } : v))
+    })
+    .catch(() => undefined)
+}
+
+/** Closes the detail dialog and forgets the call it showed. */
+async function closeTool($: $) {
+  await update($, toolViewAtom, () => null)
+  await $.ui.close({ id: TOOL_PANE })
+}
+
+/**
+ * Reads one tool call's detail into `toolViewAtom`, off the render, as refreshTranscript reads a
+ * transcript: one read per call in flight, one reread for triggers meanwhile, PEEK_TIMEOUT_MS at most.
+ * It writes only while that call is still the one open. A call missing from the transcript, or a
+ * read refused, failed or late, is stored as denied unless a detail is already shown.
+ */
+async function refreshTool($: $, agentId: string, toolUseId: string) {
+  const key = `${agentId}:${toolUseId}`
+  if (toolReading.has(key)) {
+    toolAgain.add(key)
+    return
+  }
+  toolReading.add(key)
+  const found = $.session
+    .messages({ agentId })
+    .then(f => {
+      if ('deny' in f) return undefined
+      for (let i = f.length - 1; i >= 0; i--) {
+        const use = f[i]!.toolUses.find(u => u.tool_use_id === toolUseId)
+        if (use) return use
+      }
+      return undefined
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      toolReading.delete(key)
+      if (toolAgain.delete(key)) scheduleTool($, agentId, toolUseId)
+    })
+  let timer: { cancel: () => void } | undefined
+  const late = new Promise<undefined>(resolve => {
+    timer = $.clock.after(PEEK_TIMEOUT_MS, () => resolve(undefined))
+  })
+  const use = await Promise.race([found, late])
+  timer?.cancel()
+  const detail = use ? toolDetail(use, stamps.get(agentId)?.get(toolUseId)) : undefined
+  await update($, toolViewAtom, v => {
+    if (!v || v.agentId !== agentId || v.toolUseId !== toolUseId) return v
+    if (detail) return { agentId, toolUseId, inline: v.inline, detail }
+    return v.detail ? v : { ...v, denied: true as const }
+  })
+}
+
+/** Starts a tool detail read outside the dispatch that asked for it. */
+function scheduleTool($: $, agentId: string, toolUseId: string) {
+  const key = `${agentId}:${toolUseId}`
+  if (toolReading.has(key)) {
+    toolAgain.add(key)
+    return
+  }
+  $.clock.after(0, () => void refreshTool($, agentId, toolUseId).catch(() => undefined))
+}
+
+/** Rereads the open tool call's detail when its own call settles. Never throws. */
+async function toolIfOpen($: $, agentId: string | undefined, toolUseId: string | undefined) {
+  try {
+    const v = await read($, toolViewAtom)
+    if (agentId && v && v.agentId === agentId && v.toolUseId === toolUseId) scheduleTool($, agentId, toolUseId)
+  } catch {
+    // The dialog is a convenience: whatever fails here must not reach a handover.
+  }
+}
+
+type Ui = ReturnType<$['ui']['resolve']>
+
+/** A tool call's detail as elements: header, then each section labelled (D11). No `$`: it only draws. */
+function detailBody(ui: Ui, d: ToolDetail) {
+  const { Box, Text, Code, Markdown } = ui
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text bold>
+        {d.time} ⚙ {d.tool}
+        {d.isError && <Text color="error"> failed</Text>}
+        {d.isPending && <Text dimColor> running…</Text>}
+      </Text>
+      {d.sections.map((sec, i) => (
+        <Box key={`s${i}`} flexDirection="column">
+          <Text dimColor bold>
+            {sec.label}
+          </Text>
+          {sec.kind === 'code' ? (
+            <Code
+              source={sec.source}
+              language={sec.language}
+              path={sec.path}
+              startLine={sec.startLine}
+              format={sec.diff ? 'diff' : 'source'}
+            />
+          ) : sec.kind === 'markdown' ? (
+            <Markdown text={sec.text} />
+          ) : (
+            <Text wrap="wrap">{sec.text}</Text>
+          )}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+/** What the dialog shows for the open call: its detail, or one dim line. */
+function toolBody(ui: Ui, v: ToolView | null) {
+  const { Text } = ui
+  if (!v) return <Text dimColor>No tool call selected.</Text>
+  if (v.detail) return detailBody(ui, v.detail)
+  if (v.denied) return <Text dimColor>tool call not readable (teammate in another pane, or finished)</Text>
+  return <Text dimColor>loading…</Text>
 }
 
 // ---- subagents -------------------------------------------------------
@@ -493,6 +631,8 @@ export const register: Register = (on, options) => {
   peeking.clear()
   peekAgain.clear()
   stamps.clear()
+  toolReading.clear()
+  toolAgain.clear()
 
   // ---- events ----------------------------------------------------------
 
@@ -630,8 +770,9 @@ export const register: Register = (on, options) => {
     } catch (err) {
       $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
     }
-    // Last, after the HANDOVER is attached: the peek can cost it nothing.
+    // Last, after the HANDOVER is attached: the peek and the open detail's reread can cost it nothing.
     await peekIfSelected($, e.agentId)
+    await toolIfOpen($, e.agentId, e.tool_use_id)
     return out
   })
 
@@ -731,6 +872,28 @@ export const register: Register = (on, options) => {
     )
   })
 
+  // The dialog closed by anyone (Close, Escape, the host): forget its call. The close always goes on.
+  on('ui.close', async ($, e, next) => {
+    try {
+      if (e.id === TOOL_PANE) await update($, toolViewAtom, () => null)
+    } catch {
+      // A stale view only shows until the next open.
+    }
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: TOOL_PANE }, async ($, e) => {
+    const ui = $.ui.resolve(e)
+    const { Box, Button } = ui
+    const v = await read($, toolViewAtom)
+    return (
+      <Box flexDirection="column" gap={1}>
+        {toolBody(ui, v)}
+        <Button key="close" role="dismiss" label="Close" onPress={() => closeTool($)} />
+      </Box>
+    )
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const rows = await read($, agentsAtom)
     const pinned = await read($, pinnedAtom)
@@ -773,17 +936,29 @@ export const register: Register = (on, options) => {
       // Drawn from the cache alone: the read is refreshPeek's, never the render's.
       const peek =
         selected && selected !== 'main' ? transcriptView((await read($, transcriptsAtom))[selected], fits, TRANSCRIPT_MAX) : undefined
+      // A session that places no dialog shows the open call's detail in flow beneath it.
+      const tv = await read($, toolViewAtom)
+      const ui = $.ui.resolve(e)
       /** One transcript item: a tool call opens its detail; a cut text expands in flow beneath itself. */
       const item = (agentId: string, it: TranscriptLine) => {
         const time = <Text dimColor>{it.time} </Text>
         if (it.kind === 'tool') {
-          return (
+          const button = (
             <Button key={`tool:${agentId}:${it.toolUseId}`} plain onPress={() => openTool($, agentId, it.toolUseId!)}>
               {time}
               {it.isError && <Text color="error">✗ </Text>}
               <Text>{it.short}</Text>
               {it.isPending && <Text dimColor> (running)</Text>}
             </Button>
+          )
+          if (!tv?.inline || tv.agentId !== agentId || tv.toolUseId !== it.toolUseId) return button
+          return (
+            <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
+              {button}
+              <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
+                {toolBody(ui, tv)}
+              </Box>
+            </Box>
           )
         }
         const who = it.role === 'user' && <Text dimColor>» </Text>

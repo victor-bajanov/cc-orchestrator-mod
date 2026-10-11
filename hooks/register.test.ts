@@ -21,6 +21,8 @@ const world = (on: On) => {
     files: new Map<string, string>(),
     toasts: [] as string[],
     opened: [] as string[],
+    /** Each `ui.open` as asked. */
+    openArgs: [] as Record<string, unknown>[],
     /** Runs while /clear is in flight, as a turn the person starts before the restart finishes. */
     duringClear: undefined as (() => Promise<unknown>) | undefined,
     /** What `$.agent.list()` answers. */
@@ -34,6 +36,8 @@ const world = (on: On) => {
     usageModel: 'claude-opus-5-5',
     /** The visible text each step answers with. */
     answer: '',
+    /** Whether the surfaces place the tool-detail dialog (false: an older desktop). */
+    placesTool: true,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -86,6 +90,8 @@ const world = (on: On) => {
   })
   on('ui.open', ($, e) => {
     w.opened.push(e.id)
+    w.openArgs.push(e as unknown as Record<string, unknown>)
+    if (e.id === 'orchestrator-tool' && !w.placesTool) return { value: { isPlaced: false, reason: 'older desktop' } as never }
     return { value: { isPlaced: true } }
   })
   on('turn.step', async function* ($, e) {
@@ -1652,5 +1658,223 @@ describe('timestamped transcript', () => {
       await ui.press({ key: 'agent:agent1' })
       await ui.unmount()
     }
+  })
+})
+
+describe('tool detail', () => {
+  const TOOL = 'orchestrator-tool'
+  const brief = { role: 'user', text: 'Implement task 1', toolUses: [] }
+  const uses = {
+    b: { tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS 3 tests' },
+    e: { tool_use_id: 'e', tool: 'Edit', input: { file_path: '/x.ts', old_string: 'a\nb', new_string: 'a\nc' }, text: 'ok' },
+    r: { tool_use_id: 'r', tool: 'Read', input: { file_path: '/x.ts', offset: 10, limit: 2 }, text: '    10→line ten\n    11→line eleven' },
+    g: { tool_use_id: 'g', tool: 'Grep', input: { pattern: 'TODO', path: 'src' }, text: 'src/a.ts' },
+  }
+  const said = (...toolUses: unknown[]) => ({ value: [brief, { role: 'assistant', text: '', toolUses }] as never })
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  const mountTool = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile' = 'desktop') =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: TOOL, props: { bodyColumns: 100 } as never })
+  /** agent1 running, its transcript open in the main pane. */
+  const opened = async ($: Engine, w: World, surface: 'terminal' | 'desktop') => {
+    await running($, w)
+    const ui = await mountPane($, surface)
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    return ui
+  }
+  const codes = async (ui: Ui) => (await ui.findAll({ type: 'Code' })).map(c => c.props as Record<string, unknown>)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`pressing a tool call opens the dialog without waiting on the read (${surface})`, async ($, on) => {
+      const w = world(on)
+      let calls = 0
+      on('session.messages', () => (calls++ === 0 ? said(uses.b) : new Promise(() => {})))
+      const ui = await opened($, w, surface)
+      await ui.press({ key: 'tool:agent1:b' })
+      expect(w.opened).toContain(TOOL)
+      if (surface === 'desktop') {
+        await ui.press({ key: 'handover:agent1' })
+        expect(row(w, 'agent1')!.status).toBe('handing-over')
+      }
+      await ui.press({ key: 'handover:main' })
+      await w.clock.advance(10)
+      expect(w.prompts.some(p => p.includes('main-1.md'))).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`the dialog draws a Bash call's command and output (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => said(uses.b))
+      const ui = await opened($, w, surface)
+      await ui.press({ key: 'tool:agent1:b' })
+      await w.clock.settle()
+      const tool = await mountTool($, surface)
+      const cs = await codes(tool)
+      expect(cs.find(c => c.language === 'bash')?.source).toBe('npm test')
+      expect(cs.some(c => String(c.source).includes('PASS 3 tests'))).toBe(true)
+      expect(await tool.find({ key: 'close' })).toBeDefined()
+      await tool.unmount()
+      await ui.unmount()
+    })
+
+    test(`Edit draws a diff, Read a path and start line, Grep its pattern (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => said(uses.e, uses.r, uses.g))
+      const ui = await opened($, w, surface)
+      await ui.press({ key: 'tool:agent1:e' })
+      await w.clock.settle()
+      let tool = await mountTool($, surface)
+      expect((await codes(tool)).some(c => c.format === 'diff')).toBe(true)
+      await tool.unmount()
+      await ui.press({ key: 'tool:agent1:r' })
+      await w.clock.settle()
+      tool = await mountTool($, surface)
+      expect((await codes(tool)).find(c => c.path === '/x.ts')?.startLine).toBe(10)
+      await tool.unmount()
+      await ui.press({ key: 'tool:agent1:g' })
+      await w.clock.settle()
+      tool = await mountTool($, surface)
+      expect(await tool.find({ text: /TODO/ })).toBeDefined()
+      await tool.unmount()
+      await ui.unmount()
+    })
+  }
+
+  test('loading… before the read settles; not readable when the call is gone', async ($, on) => {
+    const w = world(on)
+    let calls = 0
+    let release = () => {}
+    on('session.messages', () => {
+      calls++
+      if (calls === 1) return said(uses.b)
+      if (calls === 2) return new Promise(resolve => (release = () => resolve(said(uses.g))))
+      return said(uses.g)
+    })
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    let tool = await mountTool($)
+    expect(await tool.find({ text: /loading…/ })).toBeDefined()
+    await tool.unmount()
+    release()
+    await w.clock.settle()
+    tool = await mountTool($)
+    expect(await tool.find({ text: /tool call not readable/ })).toBeDefined()
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('a call in flight shows running…, then its output once the call settles', async ($, on) => {
+    const w = world(on)
+    let done = false
+    on('session.messages', () => said(done ? uses.b : { ...uses.b, text: undefined }))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    let tool = await mountTool($)
+    expect(await tool.find({ text: /running…/ })).toBeDefined()
+    await tool.unmount()
+    done = true
+    await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: 'b', agentId: 'agent1' } as never)
+    await w.clock.settle()
+    tool = await mountTool($)
+    expect((await codes(tool)).some(c => String(c.source).includes('PASS 3 tests'))).toBe(true)
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('Close closes the dialog and clears it', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    let tool = await mountTool($)
+    const close = (await tool.find({ key: 'close' }))!
+    expect(close.props.role).toBe('dismiss')
+    await tool.press({ key: 'close' })
+    expect(w.closed).toContain(TOOL)
+    await tool.unmount()
+    tool = await mountTool($)
+    expect(await tool.find({ text: /No tool call selected\./ })).toBeDefined()
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  // The test engine has no `ui.close` to raise, so the person's own close cannot be driven from here:
+  // the dialog is asked to close on Escape, and closing the Orchestrator pane is checked to leave it alone.
+  test('the dialog closes on Escape and holds toasts; closing the Orchestrator pane leaves it open', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(w.openArgs.find(a => a.id === TOOL)).toMatchObject({ focus: true, closeOnEscape: true, holdToasts: true, title: 'impl-1 · Bash' })
+    await $.command.run({ command: 'orch', args: 'close' } as never)
+    expect(w.closed).toEqual(['orchestrator'])
+    const tool = await mountTool($)
+    expect((await codes(tool)).length).toBeGreaterThan(0)
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('pressing the same tool call again closes the dialog', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(w.closed).toContain(TOOL)
+    const tool = await mountTool($)
+    expect(await tool.find({ text: /No tool call selected\./ })).toBeDefined()
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('desktop: a surface that places no dialog gets the detail inline beneath the call', async ($, on) => {
+    const w = world(on)
+    w.placesTool = false
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    const inline = (await ui.find({ key: 'tooldetail:b' }))!
+    expect(inline).toBeDefined()
+    expect(inline.text).toContain('npm test')
+    expect((await ui.findAll({ type: 'Code' })).length).toBeGreaterThan(0)
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(await ui.find({ key: 'tooldetail:b' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('the dialog mounts on vscode and mobile', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    for (const surface of ['vscode', 'mobile'] as const) {
+      const tool = await mountTool($, surface)
+      expect(await tool.find({ key: 'close' })).toBeDefined()
+      await tool.unmount()
+    }
+    await ui.unmount()
+  })
+
+  test('a huge output stays within the Code limit', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said({ ...uses.b, text: 'z'.repeat(200_000) }))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    const tool = await mountTool($)
+    const total = (await codes(tool)).reduce((n, c) => n + String(c.source).length, 0)
+    expect(total).toBeGreaterThan(1000)
+    expect(total).toBeLessThanOrEqual(100_000)
+    await tool.unmount()
+    await ui.unmount()
   })
 })
