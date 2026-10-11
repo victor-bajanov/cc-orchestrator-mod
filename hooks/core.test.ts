@@ -68,6 +68,19 @@ describe('recordStep', () => {
   test('wakes an idle agent back to running', () => {
     const rows = recordStep([row({ id: 'x', status: 'idle' })], { id: 'x', tokens: 1, t: 1, tools: 0 })
     expect(rows[0]!.status).toBe('running')
+    expect(rows[0]!.resumedAt).toBeUndefined()
+  })
+  test('revives a done agent resumed by a message, noting when', () => {
+    const rows = recordStep([row({ id: 'x', status: 'done' })], { id: 'x', tokens: 1, t: 42, tools: 0 })
+    expect(rows[0]!.status).toBe('running')
+    expect(rows[0]!.resumedAt).toBe(42)
+  })
+  test('leaves replaced, handing-over and stalled rows as they are', () => {
+    for (const status of ['replaced', 'handing-over', 'stalled'] as const) {
+      const rows = recordStep([row({ id: 'x', status })], { id: 'x', tokens: 1, t: 42, tools: 0 })
+      expect(rows[0]!.status).toBe(status)
+      expect(rows[0]!.resumedAt).toBeUndefined()
+    }
   })
   test('keeps at most MAX_SAMPLES samples, first and last kept', () => {
     let rows: AgentRow[] = []

@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, AgentStatus, LogEntry, MainPhase, Peek } from '../types'
+import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
+import { toolDetail } from './detail'
+import type { ToolDetail } from './detail'
 import {
   HANDOVER_CLAUSE,
   contextOf,
@@ -26,19 +28,39 @@ import {
   chartWidthPx,
   contextChart,
   cut,
+  displayStatus,
   hhmm,
   logId,
   mainButtonShown,
+  modelLabel,
   paneHeader,
-  peekLines,
-  peekView,
+  checkinDue,
+  childrenOf,
+  collapseHidden,
+  forwardTarget,
+  hiddenCount,
+  isDoublePress,
+  latest,
+  namesAgent,
   seriesColors,
+  statusEmoji,
+  statusStyle,
+  textKey,
+  transcriptItems,
+  transcriptView,
 } from './view'
+import type { TranscriptLine } from './view'
 
 type $ = EngineInterface
 
 const PANE = 'orchestrator'
+/** The tool-call detail dialog: a second pane, one at a time. */
+const TOOL_PANE = 'orchestrator-tool'
 const SYNC_MS = 30_000
+/** The check-in tool as the model calls it. */
+const CHECKIN_TOOL = 'mcp__orchestrator__checkin'
+/** A check-in cleared: no deadline, no length, no one who armed it. */
+const DISARMED = { checkinAt: undefined, checkinMins: undefined, checkinBy: undefined } as const
 const STALL_MS = 20 * 60_000
 
 const agentsAtom = atom({ plugin: 'orchestrator', key: 'agents' } as const, [] as AgentRow[])
@@ -49,8 +71,14 @@ const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
-/** Each agent's transcript tail, read off the render by refreshPeek. */
-const peeksAtom = atom({ plugin: 'orchestrator', key: 'peeks' } as const, {} as Record<string, Peek>)
+/** Messages timers queued for the next hook to deliver (a send from a timer wakes a run without hooks). */
+const outboxAtom = atom({ plugin: 'orchestrator', key: 'outbox' } as const, [] as Delivery[])
+/** Rows collapsed by a double-click, their finished descendants hidden; display only. */
+const collapsedAtom = atom({ plugin: 'orchestrator', key: 'collapsed' } as const, [] as string[])
+/** The tool call open in the detail dialog, read off the render by refreshTool. */
+const toolViewAtom = atom({ plugin: 'orchestrator', key: 'toolView' } as const, null as ToolView | null)
+/** Each agent's last transcript items, read off the render by refreshTranscript. */
+const transcriptsAtom = atom({ plugin: 'orchestrator', key: 'transcripts' } as const, {} as Record<string, Transcript>)
 /** Mirrors `mainHandoverQueued` for drawing: the buttons say a handover waits on this turn. */
 const queuedAtom = atom({ plugin: 'orchestrator', key: 'mainQueued' } as const, false)
 
@@ -84,13 +112,49 @@ let mainBusy = false
 let mainHandoverQueued = false
 /** A main handover is being set up: a second press in the meantime does nothing. */
 let mainHandoverStarting = false
-/** Agents whose transcript read is in flight: one read per agent at a time. */
-const peeking = new Set<string>()
-/** Agents triggered while their read was in flight: each is read once more when it settles. */
-const peekAgain = new Set<string>()
+/**
+ * One kind of read done off the render: the keys whose read is in flight (one per key at a time), and
+ * the keys triggered meanwhile (each read once more when its read settles).
+ */
+type ReadSlot = { busy: Set<string>; again: Set<string> }
+/** Transcript reads, keyed by agent id. */
+const transcriptReads: ReadSlot = { busy: new Set(), again: new Set() }
+/** Tool detail reads, keyed by `agentId:toolUseId`. */
+const toolReads: ReadSlot = { busy: new Set(), again: new Set() }
+/** What guardedRead gives when the key's read was already in flight (the trigger is remembered instead). */
+const IN_FLIGHT = Symbol('in flight')
+/**
+ * Ids of queued messages already delivered, newest last: a restore skips them, even from a state.json
+ * written by a persist that read the queue before the drain. Kept in memory (a /clear does not reset
+ * it) and in state.json (for a reload).
+ */
+const delivered: string[] = []
+/** How many delivered ids are kept. */
+const DELIVERED_MAX = 200
+/** Numbers queued messages within this module's life. */
+let deliverySeq = 0
+/** How long a drain waits for its respawns and HANDOVERs before letting the turn end go on. */
+const DRAIN_TIMEOUT_MS = 10_000
+/** A drain is under way: another hook does not start a second. */
+let draining = false
+/** Main was prompted to run a hooked turn for the outbox, and nothing has drained since: no second prompt. */
+let nudgedSinceDrain = false
+/** The last row press, to tell a double-click (two presses within 400 ms) and undo its first click. */
+let lastPress: { key: string; t: number; prevSelected: string } | undefined
+/** Row presses, one at a time in the order they came. */
+let pressQueue: Promise<void> = Promise.resolve()
+/**
+ * When the mod saw each transcript entry, per agent: a call's `tool_use_id` → ms, or a text's
+ * `textKey` → each time it was seen, oldest first (a repeated text takes its own). Module-level,
+ * so lost on reload; an entry it never saw draws `--:--`.
+ */
+const stamps = new Map<string, Map<string, number | number[]>>()
+/** The most times kept for one repeated text. */
+const TEXT_STAMPS_MAX = 50
+/** The most stamps kept per agent; the oldest goes first. */
+const STAMPS_MAX = 500
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
-
 
 async function runDir($: $) {
   let id = await read($, runAtom)
@@ -118,10 +182,19 @@ async function restore($: $) {
   if (!runDirCache || (await read($, runAtom))) return
   const path = `${runDirCache}/state.json`
   if (!(await $.fs.exists(path))) return
-  const saved = JSON.parse(await $.fs.read(path)) as { agents: AgentRow[]; mainPhase: MainPhase; runId: string }
+  const saved = JSON.parse(await $.fs.read(path)) as {
+    agents: AgentRow[]
+    mainPhase: MainPhase
+    runId: string
+    outbox?: Delivery[]
+    delivered?: string[]
+  }
   await update($, runAtom, () => saved.runId)
   await update($, agentsAtom, () => saved.agents)
   await update($, phaseAtom, () => saved.mainPhase)
+  // Undelivered messages outlive a /clear too; anything queued since is kept after them.
+  const done = new Set([...delivered, ...(saved.delivered ?? [])])
+  await update($, outboxAtom, q => [...(saved.outbox ?? []).filter(d => !done.has(d.id)), ...q])
 }
 
 async function log($: $, text: string, lvl: LogEntry['level'] = 'info') {
@@ -135,7 +208,8 @@ async function persist($: $) {
   const agents = await read($, agentsAtom)
   const mainPhase = await read($, phaseAtom)
   const runId = await read($, runAtom)
-  await $.fs.write(`${dir}/state.json`, JSON.stringify({ runId, mainPhase, agents }))
+  const outbox = await read($, outboxAtom)
+  await $.fs.write(`${dir}/state.json`, JSON.stringify({ runId, mainPhase, agents, outbox, delivered }))
   await $.fs.write(`${dir}/roster.md`, rosterMarkdown(agents))
   const subs = agents.filter(a => a.id !== 'main')
   const live = subs.filter(a => LIVE.includes(a.status))
@@ -164,54 +238,128 @@ async function toggleSelected($: $, id: string) {
   if ((await read($, selectedAtom)) === id) schedulePeek($, id)
 }
 
-/** How long a transcript read may take before the pane calls it not readable. */
-export const PEEK_TIMEOUT_MS = 3_000
-/** The most lines a transcript peek keeps: the desktop's; the terminal shows fewer. */
-const PEEK_MAX = 8
-/** The longest line a peek stores: wider than any pane draws, short enough to keep state small. */
-const PEEK_CHARS = 500
-
 /**
- * Reads an agent's transcript tail into `peeksAtom`, off the render (a drawing never awaits it).
- * The agent counts as in flight until the read itself settles, so a hung read never has others
- * piled behind it; a trigger meanwhile is remembered, and one reread follows once it settles.
- * A refusal, a failure or a read past PEEK_TIMEOUT_MS is stored as denied, unless lines are
- * already cached: an agent that finished, or a slow read, keeps the last lines shown.
+ * A press on an agent's row. A single press opens or closes its transcript at once. The second press
+ * of a double-click restores the selection from before the first, then collapses or expands the
+ * row's finished descendants (a row with no children: nothing), so a double-click nets to that alone.
  */
-async function refreshPeek($: $, id: string) {
-  if (id === 'main') return
-  if (peeking.has(id)) {
-    peekAgain.add(id)
+function pressAgent($: $, id: string): Promise<void> {
+  // Queued synchronously, before any await: presses dispatched together are still seen in order.
+  const run = pressQueue.then(() => pressOnce($, id))
+  pressQueue = run.catch(() => undefined)
+  return run
+}
+
+async function pressOnce($: $, id: string) {
+  const now = await $.clock.now()
+  if (isDoublePress(lastPress, id, now)) {
+    const prev = lastPress!.prevSelected
+    lastPress = undefined
+    await update($, selectedAtom, () => prev)
+    if (childrenOf(await read($, agentsAtom), id).length > 0) {
+      await update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
+    }
     return
   }
-  peeking.add(id)
-  const found = $.session
-    .messages({ agentId: id })
-    .then(f => ('deny' in f ? undefined : peekLines(f, PEEK_CHARS, PEEK_MAX)))
+  const prevSelected = await read($, selectedAtom)
+  lastPress = { key: id, t: now, prevSelected }
+  await toggleSelected($, id)
+}
+
+/** How long a transcript read may take before the pane calls it not readable. */
+export const PEEK_TIMEOUT_MS = 3_000
+/** The most items a transcript keeps: the desktop's; the terminal shows fewer. */
+const TRANSCRIPT_MAX = 12
+/** The terminal's transcript items. */
+const TRANSCRIPT_TERMINAL = 6
+/** The longest text item stored: whole enough to expand, short enough to keep state small. */
+const STEP_CHARS = 2000
+
+/**
+ * Records when the mod saw an entry of an agent's transcript: a call once, a text once per time it
+ * was said (`repeat`). Synchronous; never throws on good input.
+ */
+function stamp(agentId: string, key: string, t: number, repeat = false) {
+  let m = stamps.get(agentId)
+  if (!m) stamps.set(agentId, (m = new Map()))
+  const had = m.get(key)
+  m.delete(key)
+  m.set(key, repeat ? [...(Array.isArray(had) ? had : []), t].slice(-TEXT_STAMPS_MAX) : t)
+  if (m.size > STAMPS_MAX) m.delete(m.keys().next().value!)
+}
+
+/**
+ * Reads an agent's transcript into `transcriptsAtom` as its last items, off the render (a drawing never
+ * awaits it). The agent counts as in flight until the read itself settles, so a hung read never has
+ * others piled behind it; a trigger meanwhile is remembered, and one reread follows once it settles.
+ * A refusal, a failure or a read past PEEK_TIMEOUT_MS is stored as denied, unless items are already
+ * cached: an agent that finished, or a slow read, keeps the last items shown.
+ */
+async function refreshTranscript($: $, id: string) {
+  if (id === 'main') return
+  const messages = await guardedRead(
+    $,
+    transcriptReads,
+    id,
+    () => $.session.messages({ agentId: id }).then(f => ('deny' in f ? undefined : f)),
+    () => schedulePeek($, id),
+  )
+  if (messages === IN_FLIGHT) return
+  const startedAt = (await read($, agentsAtom)).find(r => r.id === id)?.startedAt ?? 0
+  const items = messages
+    ? transcriptItems(messages, key => stamps.get(id)?.get(key), { n: TRANSCRIPT_MAX, chars: STEP_CHARS, startedAt })
+    : undefined
+  await update($, transcriptsAtom, p =>
+    items ? { ...p, [id]: { items } } : p[id] && 'items' in p[id] ? p : { ...p, [id]: { denied: true as const } },
+  )
+}
+
+/**
+ * Runs `fetch` for `key` under the slot's guard. The key counts as in flight until the read itself
+ * settles, so a hung read never has others piled behind it; a trigger meanwhile is remembered and
+ * `rerun` follows once it settles. Resolves `undefined` on a failure or past PEEK_TIMEOUT_MS, and
+ * IN_FLIGHT (having remembered the trigger) when that key's read is already under way.
+ */
+async function guardedRead<T>(
+  $: $,
+  slot: ReadSlot,
+  key: string,
+  fetch: () => Promise<T | undefined>,
+  rerun: () => void,
+): Promise<T | undefined | typeof IN_FLIGHT> {
+  if (slot.busy.has(key)) {
+    slot.again.add(key)
+    return IN_FLIGHT
+  }
+  slot.busy.add(key)
+  const found = fetch()
     .catch(() => undefined)
     .finally(() => {
-      peeking.delete(id)
-      if (peekAgain.delete(id)) schedulePeek($, id)
+      slot.busy.delete(key)
+      if (slot.again.delete(key)) rerun()
     })
   let timer: { cancel: () => void } | undefined
   const late = new Promise<undefined>(resolve => {
     timer = $.clock.after(PEEK_TIMEOUT_MS, () => resolve(undefined))
   })
-  const lines = await Promise.race([found, late])
+  const value = await Promise.race([found, late])
   timer?.cancel()
-  await update($, peeksAtom, p =>
-    lines ? { ...p, [id]: { lines } } : p[id] && 'lines' in p[id] ? p : { ...p, [id]: { denied: true as const } },
-  )
+  return value
+}
+
+/** Starts `run` outside the dispatch that asked for it, unless the key's read is in flight: then it is remembered. */
+function scheduleRead($: $, slot: ReadSlot, key: string, run: () => Promise<unknown>) {
+  if (slot.busy.has(key)) {
+    slot.again.add(key)
+    return
+  }
+  $.clock.after(0, () => void run().catch(() => undefined))
 }
 
 /** Starts a transcript read outside the dispatch that asked for it, so no hook or press waits on it. */
 function schedulePeek($: $, id: string) {
   if (id === 'main') return
-  if (peeking.has(id)) {
-    peekAgain.add(id)
-    return
-  }
-  $.clock.after(0, () => void refreshPeek($, id).catch(() => undefined))
+  scheduleRead($, transcriptReads, id, () => refreshTranscript($, id))
 }
 
 /** Rereads the transcript of the agent an event came from, when it is the one open in the pane. Never throws. */
@@ -219,8 +367,143 @@ async function peekIfSelected($: $, id: string | undefined) {
   try {
     if (id && id === (await read($, selectedAtom))) schedulePeek($, id)
   } catch {
-    // The peek is a convenience: whatever fails here must not reach a handover or a step's record.
+    // The transcript is a convenience: whatever fails here must not reach a handover or a step's record.
   }
+}
+
+/**
+ * Opens a tool call's detail in the dialog pane, or closes it when that call is the one open.
+ * Only state is awaited: the read is scheduled and the open is fire-and-forget, so a press never
+ * waits on either. A session that places no dialog (an older desktop) gets the detail inline.
+ */
+async function openTool($: $, agentId: string, toolUseId: string) {
+  const open = await read($, toolViewAtom)
+  if (open?.agentId === agentId && open.toolUseId === toolUseId) return closeTool($)
+  await update($, toolViewAtom, () => ({ agentId, toolUseId, inline: false }))
+  scheduleTool($, agentId, toolUseId)
+  const r = (await read($, agentsAtom)).find(a => a.id === agentId)
+  const tr = (await read($, transcriptsAtom))[agentId]
+  const item = tr && 'items' in tr ? tr.items.find(i => i.kind === 'tool' && i.toolUseId === toolUseId) : undefined
+  const title = `${r ? label(r) : agentId} · ${item?.kind === 'tool' ? item.tool : 'tool call'}`
+  void $.ui
+    .open({ id: TOOL_PANE, title, focus: true, closeOnEscape: true, holdToasts: true, rows: 20 })
+    .then(async res => {
+      if (res.isPlaced) return
+      await update($, toolViewAtom, v => (v && v.agentId === agentId && v.toolUseId === toolUseId ? { ...v, inline: true } : v))
+    })
+    .catch(() => undefined)
+}
+
+/** Closes the detail dialog and forgets the call it showed. */
+async function closeTool($: $) {
+  await update($, toolViewAtom, () => null)
+  await $.ui.close({ id: TOOL_PANE })
+}
+
+/**
+ * Reads one tool call's detail into `toolViewAtom`, off the render, as refreshTranscript reads a
+ * transcript: one read per call in flight, one reread for triggers meanwhile, PEEK_TIMEOUT_MS at most.
+ * It writes only while that call is still the one open. A call missing from the transcript, or a
+ * read refused, failed or late, is stored as denied unless a detail is already shown.
+ */
+async function refreshTool($: $, agentId: string, toolUseId: string) {
+  const use = await guardedRead(
+    $,
+    toolReads,
+    `${agentId}:${toolUseId}`,
+    () =>
+      $.session.messages({ agentId }).then(f => {
+        if ('deny' in f) return undefined
+        for (let i = f.length - 1; i >= 0; i--) {
+          const found = f[i]!.toolUses.find(u => u.tool_use_id === toolUseId)
+          if (found) return found
+        }
+        return undefined
+      }),
+    () => scheduleTool($, agentId, toolUseId),
+  )
+  if (use === IN_FLIGHT) return
+  const seen = stamps.get(agentId)?.get(toolUseId)
+  const detail = use ? toolDetail(use, typeof seen === 'number' ? seen : undefined) : undefined
+  await update($, toolViewAtom, v => {
+    if (!v || v.agentId !== agentId || v.toolUseId !== toolUseId) return v
+    if (detail) return { agentId, toolUseId, inline: v.inline, detail }
+    return v.detail ? v : { ...v, denied: true as const }
+  })
+}
+
+/** Starts a tool detail read outside the dispatch that asked for it. */
+function scheduleTool($: $, agentId: string, toolUseId: string) {
+  scheduleRead($, toolReads, `${agentId}:${toolUseId}`, () => refreshTool($, agentId, toolUseId))
+}
+
+/**
+ * Rereads the open tool call's detail while it is still loading or in flight: from its agent's steps
+ * (`agentId`) and from sync (no `agentId`). Off the render, through scheduleTool's guard. Never throws.
+ */
+async function toolIfPending($: $, agentId?: string) {
+  try {
+    const v = await read($, toolViewAtom)
+    if (!v || (agentId !== undefined && v.agentId !== agentId)) return
+    if (!v.detail || v.detail.isPending) scheduleTool($, v.agentId, v.toolUseId)
+  } catch {
+    // The dialog is a convenience: whatever fails here must not reach a step or a handover.
+  }
+}
+
+/** Rereads the open tool call's detail when its own call settles. Never throws. */
+async function toolIfOpen($: $, agentId: string | undefined, toolUseId: string | undefined) {
+  try {
+    const v = await read($, toolViewAtom)
+    if (agentId && v && v.agentId === agentId && v.toolUseId === toolUseId) scheduleTool($, agentId, toolUseId)
+  } catch {
+    // The dialog is a convenience: whatever fails here must not reach a handover.
+  }
+}
+
+type Ui = ReturnType<$['ui']['resolve']>
+
+/** A tool call's detail as elements: header, then each section labelled (D11). No `$`: it only draws. */
+function detailBody(ui: Ui, d: ToolDetail) {
+  const { Box, Text, Code, Markdown } = ui
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text bold>
+        {d.time} ⚙ {d.tool}
+        {d.isError && <Text color="error"> failed</Text>}
+        {d.isPending && <Text dimColor> running…</Text>}
+      </Text>
+      {d.sections.map((sec, i) => (
+        <Box key={`s${i}`} flexDirection="column">
+          <Text dimColor bold>
+            {sec.label}
+          </Text>
+          {sec.kind === 'code' ? (
+            <Code
+              source={sec.source}
+              language={sec.language}
+              path={sec.path}
+              startLine={sec.startLine}
+              format={sec.diff ? 'diff' : 'source'}
+            />
+          ) : sec.kind === 'markdown' ? (
+            <Markdown text={sec.text} />
+          ) : (
+            <Text wrap="wrap">{sec.text}</Text>
+          )}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+/** What the dialog shows for the open call: its detail, or one dim line. */
+function toolBody(ui: Ui, v: ToolView | null) {
+  const { Text } = ui
+  if (!v) return <Text dimColor>No tool call selected.</Text>
+  if (v.detail) return detailBody(ui, v.detail)
+  if (v.denied) return <Text dimColor>tool call not readable (teammate in another pane, or finished)</Text>
+  return <Text dimColor>loading…</Text>
 }
 
 // ---- subagents -------------------------------------------------------
@@ -241,11 +524,29 @@ async function startHandover($: $, id: string, why: string) {
   return true
 }
 
-/** Sends HANDOVER as a message, which wakes an idle teammate or resumes a finished subagent. */
-async function sendHandover($: $, id: string, why: string) {
+/**
+ * Sends HANDOVER as a message, which wakes an idle teammate or resumes a finished subagent. From inside a
+ * turn.complete registration it is queued (`queue`), and its stall clock is stopped until it is sent.
+ */
+async function sendHandover($: $, id: string, why: string, queue = false) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   if (!r?.notePath) return false
-  const sent = await $.session.send({ to: { agentId: id }, text: handoverMessage(r.notePath, cfg.autoRespawn) })
+  const text = handoverMessage(r.notePath, cfg.autoRespawn)
+  if (queue) {
+    // Unset, so a tool result that carries it before delivery marks it, and the queued send is skipped.
+    await update($, agentsAtom, l => patch(l, id, { handoverAt: undefined, handoverVia: undefined }))
+    await enqueue($, { kind: 'handover', agentId: id, text, what: `${label(r)} ${why}: HANDOVER not delivered` })
+    return true
+  }
+  return deliverHandover($, id, why, text)
+}
+
+/** Sends a HANDOVER now and starts its stall clock; one that cannot be delivered marks the agent stalled. */
+async function deliverHandover($: $, id: string, why: string, text: string) {
+  const r = (await read($, agentsAtom)).find(a => a.id === id)
+  // Rechecked at delivery: a tool result may have carried it since it was queued, or the agent been replaced.
+  if (r?.status !== 'handing-over' || r.handoverVia !== undefined) return false
+  const sent = await $.session.send({ to: { agentId: id }, text })
   if (sent.isDelivered) {
     const now = await $.clock.now()
     await update($, agentsAtom, l => patch(l, id, { handoverVia: 'message', handoverAt: now }))
@@ -294,7 +595,7 @@ async function respawn($: $, old: AgentRow) {
     const known = l.some(a => a.id === newId) ? l : [...l, newRow(newId, now)]
     return known.map(a =>
       a.id === old.id
-        ? { ...a, replacedBy: newId }
+        ? { ...a, replacedBy: newId, ...DISARMED }
         : a.id === newId
           ? {
               ...a,
@@ -306,6 +607,10 @@ async function respawn($: $, old: AgentRow) {
               parentId: old.parentId,
               isOurs: true,
               isTeammate,
+              background: old.background,
+              checkinAt: old.checkinAt,
+              checkinMins: old.checkinMins,
+              checkinBy: old.checkinBy,
             }
           : a,
     )
@@ -320,32 +625,271 @@ async function respawn($: $, old: AgentRow) {
   )
 }
 
-async function onAgentEnd($: $, id: string, answer: string) {
+// ---- check-in and reports ---------------------------------------------
+
+/** A tool call's own arguments: beside the envelope keys on `e`, or under `e.input` on an engine that nests them. */
+const argsOf = (e: object): Record<string, unknown> => {
+  const raw = e as Record<string, unknown>
+  const nested = raw.input && typeof raw.input === 'object' ? (raw.input as Record<string, unknown>) : {}
+  return { ...nested, ...raw }
+}
+
+/**
+ * Serves the `checkin` tool: the calling loop (`agentId`, else main) arms, re-arms or (minutes <= 0)
+ * cancels a check-in on one of its own children (a child of a loop it replaced counts), named by id
+ * or name. Every answer is one line of result text starting `checkin:`; an unknown child or a bad
+ * length stores nothing.
+ */
+async function checkin($: $, agentId: string | undefined, args: Record<string, unknown>) {
+  const parent = agentId ?? 'main'
+  const target = String(args.agent ?? '').trim()
+  const minutes = Number(args.minutes)
+  if (args.minutes === undefined || args.minutes === null || args.minutes === '' || !Number.isFinite(minutes)) {
+    return { result: 'checkin: minutes must be a number (0 cancels); nothing changed.' }
+  }
+  try {
+    await restore($)
+    const rows = await read($, agentsAtom)
+    const kids = rows.filter(r => r.id !== 'main' && latest(rows, r.parentId ?? 'main') === parent)
+    const named = kids.filter(r => r.name === target)
+    const r = kids.find(k => k.id === target) ?? named.filter(k => LIVE.includes(k.status)).at(-1) ?? named.at(-1)
+    if (!r) return { result: `checkin: no agent "${target}" among the agents you spawned; nothing changed.` }
+    if (minutes <= 0) {
+      await update($, agentsAtom, l => patch(l, r.id, DISARMED))
+      await persist($)
+      return { result: `checkin: check-in for ${label(r)} (id ${r.id}) cancelled.` }
+    }
+    const at = (await $.clock.now()) + minutes * 60_000
+    await update($, agentsAtom, l => patch(l, r.id, { checkinAt: at, checkinMins: minutes, checkinBy: parent }))
+    await persist($)
+    return {
+      result: `checkin: armed; if ${label(r)} (id ${r.id}) has not reported to you by ${hhmm(at)} UTC (${minutes} min), you will get a message.`,
+    }
+  } catch (err) {
+    return { result: `checkin: failed (${String(err)}); nothing changed.` }
+  }
+}
+
+/**
+ * After a subagent's tool call: a `SendMessage` naming its parent (or the parent's replacement) is this
+ * run's report (kept with whether it succeeded) and disarms its check-in; any later call means the
+ * report was not its last act. Called inside a `try`, after the HANDOVER is attached.
+ */
+async function noteReport($: $, id: string, tool: string, args: Record<string, unknown>, res: object) {
+  const rows = await read($, agentsAtom)
+  const c = rows.find(r => r.id === id)
+  if (!c) return
+  const parentId = c.parentId ?? 'main'
+  // Its parent as spawned, or the replacement now carrying that parent's work.
+  const parents = [parentId, latest(rows, parentId)].map(p => rows.find(r => r.id === p) ?? { id: p })
+  // A SubagentHandback may reach main rather than the parent: it is no report to the parent (never ok), but
+  // it is noted, so the forward that follows is flagged as a possible duplicate.
+  const isReport = tool === 'SendMessage' && parents.some(p => namesAgent(args.to, p))
+  if (isReport) {
+    const out = res as { deny?: unknown; isError?: unknown; result?: unknown }
+    const result = out.result && typeof out.result === 'object' ? (out.result as { success?: unknown }) : {}
+    const ok = out.deny === undefined && !out.isError && result.success !== false
+    const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok, final: true }
+    await update($, agentsAtom, l => patch(l, id, { report, ...DISARMED }))
+    await persist($)
+  } else if (tool === 'SubagentHandback' && c.report === undefined) {
+    const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok: false, final: false }
+    await update($, agentsAtom, l => patch(l, id, { report }))
+    await persist($)
+  } else if (c.report?.final) {
+    await update($, agentsAtom, l => patch(l, id, { report: { ...c.report!, final: false } }))
+    await persist($)
+  }
+}
+
+// ---- delivery from timers ---------------------------------------------
+//
+// A run woken by `$.session.send` (or started by `$.agent.spawn`) from a `$.clock` callback runs
+// without the mod's hooks: no tool.call, no turn.step, so no HANDOVER and no tracking. One woken from
+// inside a hook registration runs without that registration alone. So timers never send, and the main
+// turn.complete registration never sends or spawns: both queue, and a drain-only turn.complete
+// registration (and /orch) deliver, so a woken run loses only a registration it never needs.
+
+/** Queues a message for the next turn end (or /orch) to deliver, and writes it to state.json so a /clear keeps it. */
+async function enqueue($: $, d: Omit<Delivery, 't' | 'id'>) {
+  const t = await $.clock.now()
+  const id = `${t}-${++deliverySeq}`
+  await update($, outboxAtom, q => [...q, { ...d, t, id }])
+  await persist($)
+}
+
+/**
+ * Delivers every queued message from the hook that awaits it. It waits for one state update only:
+ * the queue is taken and emptied at once (so two hooks never deliver one message twice), then every
+ * send is started before it returns, still inside the hook, and none is awaited, so a send that never
+ * answers holds up neither the hook nor a later drain. A failed send is warned and dropped. Never throws.
+ */
+async function drain($: $) {
+  if (draining) return
+  draining = true
+  let taken: Delivery[] = []
+  try {
+    await update($, outboxAtom, q => {
+      taken = q
+      return []
+    })
+  } catch (err) {
+    $.ui.log(`orchestrator: outbox not drained: ${String(err)}`)
+  } finally {
+    draining = false
+  }
+  if (taken.length === 0) return
+  nudgedSinceDrain = false
+  // Recorded as delivered before any send starts: a restore never brings one back.
+  delivered.push(...taken.map(d => d.id))
+  delivered.splice(0, Math.max(0, delivered.length - DELIVERED_MAX))
+  // A respawn or a HANDOVER changes rows: those are awaited (in a turn.complete, not a handover path).
+  const changes: Promise<unknown>[] = []
+  for (const d of taken) {
+    if (d.kind === 'respawn') {
+      changes.push(
+        (d.row ? respawn($, d.row) : Promise.resolve()).catch(err => log($, `${d.what}: ${String(err)}`, 'warn')),
+      )
+      continue
+    }
+    if (d.kind === 'handover') {
+      changes.push(
+        deliverHandover($, d.agentId, 'ended before seeing it', d.text).catch(err =>
+          log($, `${d.what}: ${String(err)}`, 'warn'),
+        ),
+      )
+      continue
+    }
+    try {
+      void $.session
+        .send({ to: { agentId: d.agentId }, text: d.text })
+        .then(
+          sent => (sent.isDelivered ? undefined : log($, `${d.what} (${sent.reason})`, 'warn')),
+          err => log($, `${d.what}: ${String(err)}`, 'warn'),
+        )
+        .catch(() => undefined)
+    } catch (err) {
+      void log($, `${d.what}: ${String(err)}`, 'warn').catch(() => undefined)
+    }
+  }
+  if (changes.length > 0) {
+    // Bounded: a spawn or send that never answers holds this turn's end no longer than DRAIN_TIMEOUT_MS.
+    let timer: { cancel: () => void } | undefined
+    const late = new Promise<'late'>(resolve => {
+      timer = $.clock.after(DRAIN_TIMEOUT_MS, () => resolve('late'))
+    })
+    const settled = await Promise.race([Promise.all(changes).then(() => 'done' as const), late]).catch(() => 'done' as const)
+    timer?.cancel()
+    if (settled === 'late') {
+      await log($, `outbox: a respawn or HANDOVER still running after ${DRAIN_TIMEOUT_MS / 1000} s; not waiting`, 'warn').catch(
+        () => undefined,
+      )
+    }
+    await persist($).catch(() => undefined)
+  } else {
+    // The emptied queue reaches state.json too, off the hook's path.
+    void persist($).catch(() => undefined)
+  }
+}
+
+/**
+ * From sync: when messages have waited a whole sync with no turn end to deliver them, prompts main once
+ * (marked as the mod's), whose turn end drains them. Not while main is mid-turn (that turn's end drains),
+ * and not again until a drain has happened.
+ */
+async function nudgeIfStuck($: $) {
+  if (mainBusy || nudgedSinceDrain || (await read($, outboxAtom)).length === 0) return
+  nudgedSinceDrain = true
+  await $.prompt.submit({
+    text: '[orchestrator mod] queued messages are waiting for delivery to your agents; this turn delivers them. Nothing to do: reply "ok".',
+  })
+}
+
+/** Sends each due check-in to whoever armed it, once: the deadline is cleared before the message goes. */
+async function fireCheckins($: $, now: number) {
+  for (const r of checkinDue(await read($, agentsAtom), now)) {
+    await update($, agentsAtom, l => patch(l, r.id, DISARMED))
+    await persist($)
+    const shows = displayStatus(r, await read($, agentsAtom))
+    const text =
+      `[orchestrator mod] check-in: ${label(r)} (id ${r.id}) has not reported after ${r.checkinMins ?? '?'} min; ` +
+      `status ${shows}, last active ${hhmm(r.lastActive)}. Check on it, or call checkin again to re-arm.`
+    try {
+      // An orchestrator that handed over since arming it is carried on by its replacement.
+      const by = latest(await read($, agentsAtom), r.checkinBy ?? 'main')
+      if (by === 'main') {
+        // Submitted, as a replacement's report is: an appended message would not wake main.
+        $.clock.after(0, () => void $.prompt.submit({ text }))
+        $.ui.toast(`orchestrator: check-in: ${label(r)} has not reported after ${r.checkinMins ?? '?'} min`)
+      } else {
+        // From sync, a timer: queued for the next hook to deliver, so the woken parent keeps its hooks.
+        await enqueue($, { agentId: by, text, what: `check-in for ${label(r)} not delivered` })
+      }
+    } catch (err) {
+      await log($, `check-in for ${label(r)} not delivered: ${String(err)}`, 'warn')
+    }
+  }
+}
+
+/**
+ * Forwards a child's final answer to its parent agent when `forwardTarget` says so, which wakes or
+ * resumes that parent. A failure is warned, never thrown.
+ */
+async function forwardAnswer($: $, r: AgentRow, answer: string, reason: string) {
+  const to = forwardTarget(r, answer, reason, await read($, agentsAtom))
+  if (to === 'skip') return
+  const text =
+    `[orchestrator mod] final report of ${label(r)} (id ${r.id}${r.replaces ? `, replacement for ${r.replaces}` : ''})` +
+    `${to.mayDuplicate ? ' (may duplicate a message it sent you)' : ''}, auto-forwarded:\n\n${answer}`
+  // Queued: sent from inside this turn.complete registration, the woken parent would run without it.
+  try {
+    await enqueue($, { agentId: to.agentId, text, what: `${label(r)}: final report not forwarded to ${to.agentId}` })
+  } catch (err) {
+    await log($, `${label(r)}: final report not forwarded to ${to.agentId}: ${String(err)}`, 'warn')
+  }
+}
+
+async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   if (!r) return
-  if (r.status === 'handing-over') {
+  // Its run is over: its next run reports afresh. Its check-in is spent only when it truly ends below; a
+  // handover keeps it, for the replacement to inherit (or for the note-writing run it is woken for).
+  await update($, agentsAtom, l => patch(l, id, { report: undefined }))
+  // A stalled handover is settled by its end like any other: by the note, if it wrote one late.
+  if (r.status === 'handing-over' || r.status === 'stalled') {
     if (r.notePath && (await $.fs.exists(r.notePath))) {
-      await update($, agentsAtom, l => patch(l, id, { status: 'replaced' }))
+      // Disarmed here too, so no check-in fires about it when nothing respawns it; respawn reads `r`, still armed.
+      await update($, agentsAtom, l => patch(l, id, { status: 'replaced', ...DISARMED }))
       await log($, `${label(r)} handed over (${r.notePath})`)
-      if (cfg.autoRespawn) await respawn($, { ...r, status: 'replaced' })
-    } else if (r.handoverVia !== 'message') {
+      // Queued: started from inside this registration, the replacement's run would end unseen by it.
+      if (cfg.autoRespawn) {
+        await enqueue($, { kind: 'respawn', agentId: id, text: '', what: `${label(r)}: respawn failed`, row: { ...r, status: 'replaced' } })
+      }
+    } else if (r.status === 'handing-over' && r.handoverVia !== 'message') {
       // It finished before a tool result could carry the HANDOVER: the message wakes it to write the note.
-      await sendHandover($, id, 'ended before seeing it')
+      await sendHandover($, id, 'ended before seeing it', true)
       return
     } else {
-      await update($, agentsAtom, l => patch(l, id, { status: 'done' }))
+      await update($, agentsAtom, l => patch(l, id, { status: 'done', ...DISARMED }))
       await log($, `${label(r)} ended without writing its handover note`, 'warn')
     }
   } else if (isActive(r)) {
-    await update($, agentsAtom, l => patch(l, id, { status: 'idle' }))
-    if (r.isOurs && !r.isTeammate && r.parentId !== undefined) {
+    await update($, agentsAtom, l => patch(l, id, { status: 'idle', ...DISARMED }))
+    if (r.isOurs && !r.isTeammate && r.parentId === 'main') {
+      // The engine does not tell main of an agent the mod spawned: its replacement's report is submitted.
       const text = `[orchestrator mod] ${label(r)} (id ${id}, replacement for ${r.replaces}) reports:\n\n${answer}`
-      if (r.parentId === 'main') $.clock.after(0, () => void $.prompt.submit({ text }))
-      else await $.session.send({ to: { agentId: r.parentId }, text })
-    }
+      $.clock.after(0, () => void $.prompt.submit({ text }))
+    } else await forwardAnswer($, r, answer, reason)
   }
   await persist($)
 }
+
+/**
+ * A resumed run not yet ended (its end sets idle) that stepped within STALL_MS: the engine may leave it
+ * out of its list while it runs, so only its end, or that long a silence, settles it.
+ */
+const resumedRunning = (r: AgentRow, now: number) =>
+  r.status === 'running' && r.resumedAt !== undefined && now - r.lastActive <= STALL_MS
 
 /** Marks agents the engine no longer lists as done, and handovers that hang as stalled. */
 async function sync($: $) {
@@ -360,15 +904,27 @@ async function sync($: $) {
       await log($, `${label(r)} has not handed over after ${Math.round(STALL_MS / 60_000)} min`, 'warn')
       void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' })
       changed = true
-    } else if (isActive(r) && !listed.has(r.id)) {
+    } else if (isActive(r) && !listed.has(r.id) && !resumedRunning(r, now)) {
       await update($, agentsAtom, l => patch(l, r.id, { status: 'done' }))
       changed = true
     }
   }
   if (changed) await persist($)
+  try {
+    // Messages queued by an earlier sync and still undelivered get main to run a hooked turn.
+    await nudgeIfStuck($)
+  } catch (err) {
+    $.ui.log(`orchestrator: outbox nudge failed: ${String(err)}`)
+  }
+  try {
+    await fireCheckins($, now)
+  } catch (err) {
+    $.ui.log(`orchestrator: check-ins not fired: ${String(err)}`)
+  }
   // The open transcript is read again now and then, so one left loading (a reload, a lost read) settles.
   const selected = liveSelection(await read($, agentsAtom), await read($, selectedAtom))
   if (selected) schedulePeek($, selected)
+  await toolIfPending($)
 }
 
 // ---- main thread -----------------------------------------------------
@@ -455,8 +1011,15 @@ export const register: Register = (on, options) => {
   mainBusy = false
   mainHandoverQueued = false
   mainHandoverStarting = false
-  peeking.clear()
-  peekAgain.clear()
+  transcriptReads.busy.clear()
+  transcriptReads.again.clear()
+  stamps.clear()
+  toolReads.busy.clear()
+  toolReads.again.clear()
+  lastPress = undefined
+  pressQueue = Promise.resolve()
+  draining = false
+  nudgedSinceDrain = false
 
   // ---- events ----------------------------------------------------------
 
@@ -468,6 +1031,25 @@ export const register: Register = (on, options) => {
     })
     await runDir($)
     await excludeFromGit($).catch(() => undefined)
+    try {
+      await $.tool.register({
+        name: 'checkin',
+        description:
+          'Arm a one-shot check-in on an agent you spawned: if it has not reported to you (SendMessage) within `minutes`, ' +
+          'the orchestrator mod messages you, which wakes you. Calling again re-arms; minutes 0 cancels.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            agent: { type: 'string', description: 'The agent you spawned: its name or id' },
+            minutes: { type: 'number', description: 'Minutes from now; 0 cancels' },
+          },
+          required: ['agent', 'minutes'],
+        },
+        isDeferred: false,
+      })
+    } catch (err) {
+      $.ui.log(`orchestrator: checkin tool not registered: ${String(err)}`)
+    }
     // A (re)load starts with no handover queued: the state must not say otherwise.
     await update($, queuedAtom, () => false)
     $.clock.every(SYNC_MS, () => void sync($))
@@ -489,6 +1071,8 @@ export const register: Register = (on, options) => {
         description: e.description,
         type,
         parentId: e.parentAgentId ?? 'main',
+        background: e.background,
+        ...(e.isTeammate && { isTeammate: true }),
         brief: {
           prompt: e.prompt,
           subagentType: type,
@@ -517,13 +1101,23 @@ export const register: Register = (on, options) => {
       if (id !== 'main' && !(await read($, agentsAtom)).some(a => a.id === id)) {
         const info = (await $.agent.list()).find(a => a.id === id)
         if (!info) return res // an engine fork (compaction, memory): not an agent of the run
+        // Adopted from the engine's list, which says nothing of background: `background` stays absent, and
+        // `forwardTarget` treats absent as background on purpose (only a known foreground child is skipped).
         await update($, agentsAtom, l => [
           ...l,
           { ...newRow(id, now), name: info.name, description: info.description, type: info.type, parentId: info.parentId ?? 'main' },
         ])
       }
       const tokens = contextOf(res.usage)
-      await update($, agentsAtom, l => recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }))
+      // The answering model wins over the requested one; an engine without effort leaves it out.
+      const ran = { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }
+      await update($, agentsAtom, l => patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran))
+      try {
+        // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
+        if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now, true)
+      } catch {
+        // A lost stamp only leaves the item's time `--:--`.
+      }
       if (id === 'main') await checkMain($, tokens)
       else if (tokens >= cfg.agentThreshold) {
         const r = (await read($, agentsAtom)).find(a => a.id === id)
@@ -548,12 +1142,45 @@ export const register: Register = (on, options) => {
     }
     // Last, after the step is recorded and any handover started: the peek can cost them nothing.
     await peekIfSelected($, e.agentId)
+    if (e.agentId !== undefined) await toolIfPending($, e.agentId)
     return res
   })
 
   on('tool.call', async ($, e, next) => {
+    // The mod's own tool: answered here, never passed on (a call no hook answers fails).
+    if (e.tool === CHECKIN_TOOL) {
+      const answer = await checkin($, e.agentId, argsOf(e))
+      // Still an action of the caller's run: a report before it was not its last.
+      if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, {}, answer).catch(() => undefined)
+      return answer as never
+    }
+    if (e.agentId !== undefined) {
+      // Stamped as the call starts, when the mod saw it, for the transcript. The call never waits on the clock,
+      // and a lost stamp only leaves the item's time `--:--`: the call and its HANDOVER go ahead.
+      const agentId = e.agentId
+      const id = e.tool_use_id
+      try {
+        void $.clock.now().then(
+          t => {
+            try {
+              stamp(agentId, id, t)
+            } catch {
+              // see above
+            }
+          },
+          () => undefined,
+        )
+      } catch {
+        // see above
+      }
+    }
     const res = await next(e)
-    if (e.agentId === undefined || res.deny !== undefined) return res
+    if (e.agentId === undefined) return res
+    if (res.deny !== undefined) {
+      // A refused call is still an action: a report before it was not the run's last (a refused report is not ok).
+      await noteReport($, e.agentId, e.tool, argsOf(e), res).catch(() => undefined)
+      return res
+    }
     let out = res
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
@@ -566,8 +1193,15 @@ export const register: Register = (on, options) => {
     } catch (err) {
       $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
     }
-    // Last, after the HANDOVER is attached: the peek can cost it nothing.
+    try {
+      // After the HANDOVER is attached, and it never alters `out`: a report to the parent disarms the check-in.
+      await noteReport($, e.agentId, e.tool, argsOf(e), res)
+    } catch (err) {
+      $.ui.log(`orchestrator: report not noted: ${String(err)}`)
+    }
+    // Last, after the HANDOVER is attached: the peek and the open detail's reread can cost it nothing.
     await peekIfSelected($, e.agentId)
+    await toolIfOpen($, e.agentId, e.tool_use_id)
     return out
   })
 
@@ -575,6 +1209,19 @@ export const register: Register = (on, options) => {
   on('turn.start', ($, e, next) => {
     mainBusy = true
     return next(e)
+  })
+
+  // Drain-only: delivers what was queued. A run woken (or spawned) by a call made inside a hook
+  // registration runs without that registration, so deliveries come from this one, which does nothing
+  // else: a woken run keeps the turn.complete registration below, and with it its end's tracking.
+  // (Registered first, so it wraps the one below and drains after it. A second registration of an event
+  // needs a matcher; every turn end has a reason, so this matches all.)
+  on('turn.complete', { reason: /./ }, async ($, e, next) => {
+    try {
+      return await next(e)
+    } finally {
+      await drain($)
+    }
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -596,7 +1243,7 @@ export const register: Register = (on, options) => {
       throw err
     }
     try {
-      if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer)
+      if (e.agentId !== undefined) await onAgentEnd($, e.agentId, e.answer, e.reason)
       else {
         if (queued) await update($, queuedAtom, () => false)
         const phase = await read($, phaseAtom)
@@ -616,30 +1263,36 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'orch' }, async ($, e) => {
-    const [verb, ...rest] = e.args.trim().split(/\s+/)
-    const target = rest.join(' ')
-    if (!verb) {
-      await $.ui.open({ id: PANE, title: 'Orchestrator' })
-      return { text: 'Orchestrator pane opened.' }
+    try {
+      const [verb, ...rest] = e.args.trim().split(/\s+/)
+      const target = rest.join(' ')
+      if (!verb) {
+        await $.ui.open({ id: PANE, title: 'Orchestrator' })
+        return { text: 'Orchestrator pane opened.' }
+      }
+      if (verb === 'close') {
+        await $.ui.close({ id: PANE })
+        return { text: 'Orchestrator pane closed; /orch opens it again.' }
+      }
+      if (verb === 'roster') return { text: rosterMarkdown(await read($, agentsAtom)) }
+      if (verb === 'handover' && (!target || target === 'main')) {
+        $.clock.after(0, () => void startMainHandover($))
+        return { text: 'Main thread handover started: it writes a note, then is cleared and resumed.' }
+      }
+      if (verb === 'handover') {
+        const rows = await read($, agentsAtom)
+        const live = rows.filter(canHandOver)
+        const r = live.find(a => a.id === target) ?? live.filter(a => a.name === target).at(-1)
+        if (!r) return { text: `No live agent named or with id "${target}".` }
+        const ok = await startHandover($, r.id, 'by /orch')
+        return { text: ok ? `HANDOVER sent to ${label(r)} (${r.id}).` : `Could not hand ${label(r)} over.` }
+      }
+      return { text: 'Usage: /orch [close | roster | handover [name|id|main]]' }
+    } finally {
+      // Last: delivers what timers queued. A run woken from inside a hook runs without that hook kind, and
+      // none needs turn.complete (or command.run) to be tracked, so only these two deliver.
+      await drain($)
     }
-    if (verb === 'close') {
-      await $.ui.close({ id: PANE })
-      return { text: 'Orchestrator pane closed; /orch opens it again.' }
-    }
-    if (verb === 'roster') return { text: rosterMarkdown(await read($, agentsAtom)) }
-    if (verb === 'handover' && (!target || target === 'main')) {
-      $.clock.after(0, () => void startMainHandover($))
-      return { text: 'Main thread handover started: it writes a note, then is cleared and resumed.' }
-    }
-    if (verb === 'handover') {
-      const rows = await read($, agentsAtom)
-      const live = rows.filter(canHandOver)
-      const r = live.find(a => a.id === target) ?? live.filter(a => a.name === target).at(-1)
-      if (!r) return { text: `No live agent named or with id "${target}".` }
-      const ok = await startHandover($, r.id, 'by /orch')
-      return { text: ok ? `HANDOVER sent to ${label(r)} (${r.id}).` : `Could not hand ${label(r)} over.` }
-    }
-    return { text: 'Usage: /orch [close | roster | handover [name|id|main]]' }
   })
 
   // ---- drawing ---------------------------------------------------------
@@ -667,6 +1320,41 @@ export const register: Register = (on, options) => {
     )
   })
 
+  // A pane Hand over press is handled here, in hook context: a send from the button's own closure runs in
+  // the plugin's environment like a timer's, and could wake the agent without the mod's hooks.
+  on('ui.press', async ($, e, next) => {
+    const id = e.element.startsWith('handover:') ? e.element.slice('handover:'.length) : ''
+    if (e.plugin !== 'orchestrator' || e.requestId !== PANE || id === '' || id === 'main') return next(e)
+    try {
+      await startHandover($, id, 'from the pane')
+    } catch (err) {
+      $.ui.log(`orchestrator: hand over from the pane failed: ${String(err)}`)
+    }
+    return { element: e.element }
+  })
+
+  // The dialog closed by anyone (Close, Escape, the host): forget its call. The close always goes on.
+  on('ui.close', async ($, e, next) => {
+    try {
+      if (e.id === TOOL_PANE) await update($, toolViewAtom, () => null)
+    } catch {
+      // A stale view only shows until the next open.
+    }
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: TOOL_PANE }, async ($, e) => {
+    const ui = $.ui.resolve(e)
+    const { Box, Button } = ui
+    const v = await read($, toolViewAtom)
+    return (
+      <Box flexDirection="column" gap={1}>
+        {toolBody(ui, v)}
+        <Button key="close" role="dismiss" label="Close" onPress={() => closeTool($)} />
+      </Box>
+    )
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const rows = await read($, agentsAtom)
     const pinned = await read($, pinnedAtom)
@@ -684,18 +1372,28 @@ export const register: Register = (on, options) => {
     const shown = mainButtonShown(cfg.mainMode, phase)
     // A press while queued does nothing: startMainHandover returns on the queued flag.
     const queued = await read($, queuedAtom)
+    // Collapsed rows hide their finished descendants from the tree and the chart; all else reads every row.
+    const collapsed = await read($, collapsedAtom)
+    const hidden = collapseHidden(rows, collapsed)
+    const visible = rows.filter(r => !hidden.has(r.id))
+    const doneMark = (id: string) => {
+      const n = collapsed.includes(id) ? hiddenCount(rows, id, hidden) : 0
+      return n > 0 ? `+${n} done` : ''
+    }
     // The transcript the host has open beside the pane (read-only; absent on older hosts and kit mounts). Main is never marked.
-    const viewed = liveSelection(rows, e.props.view?.agentId ?? '')
+    const viewed = liveSelection(visible, e.props.view?.agentId ?? '')
 
     if (e.surface !== 'terminal') {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
       const { Box, Button, Text, Svg } = $.ui.resolve(e)
-      const selected = liveSelection(rows, await read($, selectedAtom))
+      const selected = liveSelection(visible, await read($, selectedAtom))
+      // Colours and the time axis come from every row, so collapsing neither recolours nor rescales.
       const colors = seriesColors(rows)
       // A click selection wins; with none, the agent in view stands out.
       const hl = selected || viewed
       const chart = contextChart({
-        rows,
+        rows: visible,
+        t0: rows.reduce((m, r) => Math.min(m, r.startedAt), now),
         now,
         width: chartWidthPx(cols),
         height: 180,
@@ -707,7 +1405,59 @@ export const register: Register = (on, options) => {
       const fits = cols - 6
       // Main is the main view already: only a subagent's transcript is shown.
       // Drawn from the cache alone: the read is refreshPeek's, never the render's.
-      const peek = selected && selected !== 'main' ? peekView((await read($, peeksAtom))[selected], fits, PEEK_MAX) : undefined
+      const peek =
+        selected && selected !== 'main' ? transcriptView((await read($, transcriptsAtom))[selected], fits, TRANSCRIPT_MAX) : undefined
+      // A session that places no dialog shows the open call's detail in flow beneath it.
+      const tv = await read($, toolViewAtom)
+      const ui = $.ui.resolve(e)
+      /** One transcript item: a tool call opens its detail; a cut text expands in flow beneath itself. */
+      const item = (agentId: string, it: TranscriptLine) => {
+        const time = <Text dimColor>{it.time} </Text>
+        if (it.kind === 'tool') {
+          const button = (
+            <Button key={`tool:${agentId}:${it.toolUseId}`} plain onPress={() => openTool($, agentId, it.toolUseId!)}>
+              {time}
+              {it.isError && <Text color="error">✗ </Text>}
+              <Text>{it.short}</Text>
+              {it.isPending && <Text dimColor> (running)</Text>}
+            </Button>
+          )
+          if (!tv?.inline || tv.agentId !== agentId || tv.toolUseId !== it.toolUseId) return button
+          return (
+            <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
+              {button}
+              <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
+                {toolBody(ui, tv)}
+              </Box>
+            </Box>
+          )
+        }
+        const who = it.role === 'user' && <Text dimColor>» </Text>
+        if (it.full === undefined) {
+          return (
+            <Text key={it.id} wrap="truncate">
+              {time}
+              {who}
+              {it.short}
+            </Text>
+          )
+        }
+        const pin = it.id.replace(/^step-/, `step-${agentId}-`)
+        return (
+          <Box key={it.id} flexDirection="column">
+            <Button key={pin} plain onPress={() => togglePinned($, pin)}>
+              {time}
+              {who}
+              <Text>{it.short}</Text>
+            </Button>
+            {pinned === pin && (
+              <Box key={`full:${pin}`} borderStyle="round" flexDirection="column">
+                <Text wrap="wrap">{it.full}</Text>
+              </Box>
+            )}
+          </Box>
+        )
+      }
       return (
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -727,18 +1477,25 @@ export const register: Register = (on, options) => {
             <Svg key="chart" isInteractive source={chart.source} alt={chart.alt} width={chart.width} height={chart.height} />
           )}
           <Box flexDirection="column">
-            {orderRows(rows).flatMap(({ row, depth }) => {
+            {orderRows(visible).flatMap(({ row, depth }) => {
               const ceiling = ceilingOf(row, cfg)
               const pct = Math.round((row.tokens / ceiling) * 100)
+              const shows = displayStatus(row, rows)
+              const model = modelLabel(row.model ?? row.brief?.model, row.effort)
+              const folded = doneMark(row.id)
               return [
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
-                  <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
+                  <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
                     <Text bold={hl === row.id}>{label(row)} </Text>
+                    {row.resumedAt !== undefined && <Text dimColor>↻ </Text>}
+                    {folded !== '' && <Text dimColor>{folded} </Text>}
+                    {model !== '' && <Text dimColor>{model} </Text>}
                     <Text color={tone[level(row.tokens, ceiling)]}>
                       {fmtTokens(row.tokens)}/{fmtTokens(ceiling)} {pct}%{' '}
                     </Text>
-                    <Text dimColor>{row.status}</Text>
+                    <Text>{statusEmoji(shows, row.id)} </Text>
+                    <Text dimColor>{shows}</Text>
                     {viewed === row.id && <Text dimColor> · in view</Text>}
                   </Button>
                   {canHandOver(row) && (
@@ -746,21 +1503,14 @@ export const register: Register = (on, options) => {
                       key={`handover:${row.id}`}
                       variant="secondary"
                       label="Hand over"
-                      onPress={() => startHandover($, row.id, 'from the pane')}
+                      // The send is made in the ui.press hook (real hook context); this closure only marks the press.
+                      onPress={() => undefined}
                     />
                   )}
                 </Box>,
                 peek && selected === row.id && (
-                  <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" marginLeft={depth * 2}>
-                    {'dim' in peek ? (
-                      <Text dimColor>{peek.dim}</Text>
-                    ) : (
-                      peek.lines.map((l, j) => (
-                        <Text key={`p${j}`} wrap="truncate">
-                          {l}
-                        </Text>
-                      ))
-                    )}
+                  <Box key={`transcript:${row.id}`} borderStyle="round" flexDirection="column" marginLeft={depth * 2}>
+                    {'dim' in peek ? <Text dimColor>{peek.dim}</Text> : peek.items.map(it => item(row.id, it))}
                   </Box>
                 ),
               ]
@@ -803,21 +1553,92 @@ export const register: Register = (on, options) => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const NAME = Math.min(24, Math.max(12, Math.floor(cols * 0.25)))
-    const width = Math.max(8, cols - NAME - 7 - 14)
+    // The model cell: 16 columns padded, plus a space.
+    const MODEL = 17
+    const width = Math.max(8, cols - NAME - 7 - 14 - MODEL)
     const t0 = rows.reduce((m, r) => Math.min(m, r.startedAt), now)
-    const ordered = orderRows(rows)
-    const glyph: Record<AgentStatus, string> = {
+    const ordered = orderRows(visible)
+    const glyph: Record<DisplayStatus, string> = {
       running: '●',
+      waiting: '◐',
       idle: '○',
       'handing-over': '↻',
       replaced: '⤳',
       done: '✓',
       stalled: '!',
     }
-    const selected = liveSelection(rows, await read($, selectedAtom))
+    const selected = liveSelection(visible, await read($, selectedAtom))
     // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.
-    const peek = selected && selected !== 'main' ? peekView((await read($, peeksAtom))[selected], Math.max(10, cols - 4), 5) : undefined
-    const peekRows = peek ? ('lines' in peek ? peek.lines.length : 1) + 2 : 0
+    const peek =
+      selected && selected !== 'main'
+        ? transcriptView((await read($, transcriptsAtom))[selected], Math.max(10, cols - 4), TRANSCRIPT_TERMINAL)
+        : undefined
+    const peekRows = peek ? ('items' in peek ? peek.items.length : 1) + 2 : 0
+    // A session that places no dialog (too narrow, or no surface places panes) shows the open call's detail in flow.
+    const tv = await read($, toolViewAtom)
+    const ui = $.ui.resolve(e)
+    /** One transcript row: a tool call opens its detail; a cut text shows whole in a card on hover, pinned by a press. */
+    const item = (agentId: string, it: TranscriptLine) => {
+      const time = <Text dimColor>{it.time} </Text>
+      if (it.kind === 'tool') {
+        const button = (
+          <Button key={`tool:${agentId}:${it.toolUseId}`} plain onPress={() => openTool($, agentId, it.toolUseId!)}>
+            {time}
+            {it.isError && <Text color="error">✗ </Text>}
+            <Text>{it.short}</Text>
+            {it.isPending && <Text dimColor> (running)</Text>}
+          </Button>
+        )
+        if (!tv?.inline || tv.agentId !== agentId || tv.toolUseId !== it.toolUseId) return button
+        return (
+          <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
+            {button}
+            <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
+              {toolBody(ui, tv)}
+            </Box>
+          </Box>
+        )
+      }
+      const who = it.role === 'user' && <Text dimColor>» </Text>
+      if (it.full === undefined) {
+        return (
+          <Text key={it.id} wrap="truncate">
+            {time}
+            {who}
+            {it.short}
+          </Text>
+        )
+      }
+      const pin = it.id.replace(/^step-/, `step-${agentId}-`)
+      // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
+      // It opens downward, over the activity (the top of the pane would clip it), with as many lines as fit there.
+      const all = wrapFill(it.full, Math.max(10, cols - 4))
+      const fit = Math.max(1, room)
+      const wrapped = all.length > fit ? [...all.slice(0, fit - 1), '…'] : all
+      return (
+        <Box key={it.id}>
+          <Button key={pin} plain onPress={() => togglePinned($, pin)}>
+            {time}
+            {who}
+            <Text>{it.short}</Text>
+          </Button>
+          <Box
+            position="absolute"
+            top={1}
+            left={-1}
+            width={cols}
+            borderStyle="round"
+            flexDirection="column"
+            display={pinned === pin ? 'flex' : 'none'}
+            hover={pinned === pin ? undefined : { display: 'flex' }}
+          >
+            {wrapped.map((w, j) => (
+              <Text key={`w${j}`} wrap="truncate">{` ${w} `}</Text>
+            ))}
+          </Box>
+        </Box>
+      )
+    }
     // The header's button can wrap onto a row of its own.
     const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0) - peekRows)
     return (
@@ -836,46 +1657,66 @@ export const register: Register = (on, options) => {
         {ordered.flatMap(({ row, depth }) => {
           const ceiling = ceilingOf(row, cfg)
           const live = LIVE.includes(row.status)
-          const name = `${'  '.repeat(depth)}${glyph[row.status]} ${label(row)}`
-          const cell = (
-            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
-              {name.slice(0, NAME).padEnd(NAME)}
+          const shows = displayStatus(row, rows)
+          const style = statusStyle(shows)
+          // The glyph takes the status colour; the name keeps its own marks. Together they fill NAME columns.
+          const lead = `${'  '.repeat(depth)}${glyph[shows]} `.slice(0, NAME)
+          const glyphCell = (
+            <Text color={style.color} dimColor={style.dimColor} bold={style.bold} wrap="truncate">
+              {lead}
             </Text>
           )
+          // A resumed agent's dim ↻ and a collapsed row's `+N done` sit inside the name cell, which keeps its width.
+          const room = NAME - lead.length
+          const folded = doneMark(row.id)
+          // The name keeps at least 4 columns (or its whole self); the marks shrink first: `+3 done` to `+3`, then the ↻ goes.
+          const spare = room - Math.min(label(row).length, 4)
+          const turn = row.resumedAt === undefined ? '' : ' ↻'
+          const short = folded.replace(/ done$/, '')
+          const mark =
+            [`${turn}${folded ? ` ${folded}` : ''}`, `${turn}${short ? ` ${short}` : ''}`, short ? ` ${short}` : '', ''].find(
+              m => m.length <= spare,
+            ) ?? ''
+          const name = label(row).slice(0, room - mark.length)
+          const nameCell = (
+            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
+              {name}
+              {mark !== '' && <Text dimColor>{mark}</Text>}
+              {' '.repeat(room - name.length - mark.length)}
+            </Text>
+          )
+          const model = modelLabel(row.model ?? row.brief?.model, row.effort)
           return [
             <Box key={row.id}>
-              {row.id === 'main' ? (
-                cell
-              ) : (
-                <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
-                  {cell}
-                </Button>
-              )}
+              {/* Main too is pressable, so a double-click can collapse it; a single press only bolds it. */}
+              <Button key={`agent:${row.id}`} plain onPress={() => pressAgent($, row.id)}>
+                {glyphCell}
+                {nameCell}
+              </Button>
               <Text dimColor={!live}>{fmtTokens(row.tokens).padStart(6)} </Text>
+              <Text dimColor>{model.slice(0, MODEL - 1).padEnd(MODEL - 1)} </Text>
               <Text color={live ? tone[level(row.tokens, ceiling)] : 'subtle'}>
                 {timeline(row.samples, width, t0, now, ceiling, live)}
               </Text>
-              <Text dimColor> {row.status.padEnd(12)}</Text>
+              <Text color={style.color} dimColor={style.dimColor} bold={style.bold}>
+                {` ${shows.padEnd(12)}`}
+              </Text>
             </Box>,
             peek && selected === row.id && (
-              <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
+              <Box key={`transcript:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
                 {'dim' in peek ? (
                   <Text dimColor wrap="truncate">
                     {peek.dim}
                   </Text>
                 ) : (
-                  peek.lines.map((l, j) => (
-                    <Text key={`p${j}`} wrap="truncate">
-                      {l}
-                    </Text>
-                  ))
+                  peek.items.map(it => item(row.id, it))
                 )}
               </Box>
             ),
           ]
         })}
         <Text dimColor>
-          {' '.repeat(NAME + 7)}
+          {' '.repeat(NAME + 7 + MODEL)}
           {hhmm(t0).padEnd(Math.max(0, width - 5))}
           {hhmm(now)}
         </Text>

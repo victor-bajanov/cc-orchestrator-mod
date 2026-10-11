@@ -12,6 +12,9 @@ export type Brief = {
 
 export type AgentStatus = 'running' | 'idle' | 'handing-over' | 'replaced' | 'done' | 'stalled'
 
+/** What the pane shows for a row: its status, or `waiting` for an idle row with live descendants. Never stored. */
+export type DisplayStatus = AgentStatus | 'waiting'
+
 /** One agent loop as the mod tracks it; the main thread is the row with id `main`. */
 export type AgentRow = {
   id: string
@@ -46,16 +49,76 @@ export type AgentRow = {
   handovers?: number
   /** A replacement that started too full for another handover to help: left to run. */
   noHandover?: boolean
+  /** Spawned in the background (false: its answer is its parent's tool result). Absent when unknown. */
+  background?: boolean
+  /**
+   * This run's report to its parent, as last seen: a `SendMessage` naming the parent. A handback may reach
+   * main rather than the parent, so it is kept as never `ok`, only to flag a forward as a possible duplicate.
+   * `ok` when it succeeded; `final` while it is still the run's last tool call.
+   * Cleared when the run ends, so each run is judged on its own.
+   */
+  report?: { t: number; text: string; ok: boolean; final: boolean }
+  /** A check-in deadline its parent armed through the `checkin` tool, its length, and who armed it. */
+  checkinAt?: number
+  checkinMins?: number
+  checkinBy?: string
+  /** The model its last step ran on (the answering id, else the requested one). */
+  model?: string
+  /** Its last step's effort, as a string (`'medium'`, or a token budget such as `'32000'`). */
+  effort?: string
+  /** When a step last revived it from done: it was resumed by a message after it ended. */
+  resumedAt?: number
 }
 
 export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }
 
 /**
- * An agent's transcript tail as the pane last read it, off the render: its lines
- * (cleaned, each capped), or `denied` when no read has given lines (refused,
- * failed or timed out).
+ * One entry of an agent's transcript as the pane shows it: a message's text, or
+ * one of its tool calls. `key` is stable across reads; `t` is when the mod saw it
+ * (absent when it never did).
  */
-export type Peek = { lines: string[] } | { denied: true }
+export type TranscriptItem =
+  | { kind: 'text'; key: string; t?: number; role: 'user' | 'assistant'; text: string }
+  | { kind: 'tool'; key: string; t?: number; toolUseId: string; tool: string; brief: string; isError?: true; isPending?: true }
+
+/** An agent's transcript items as the pane last read them, off the render, or `denied`. */
+export type Transcript = { items: TranscriptItem[] } | { denied: true }
+
+/**
+ * One part of a tool call's detail, as `hooks/detail.ts` builds it. Declared here too because this
+ * contract must be self-contained; the two are structurally the same, so tsc checks they agree.
+ */
+export type DetailSection =
+  | { kind: 'code'; label: string; source: string; language?: string; path?: string; startLine?: number; diff?: true }
+  | { kind: 'markdown'; label: string; text: string }
+  | { kind: 'text'; label: string; text: string }
+
+/** A tool call laid out for the detail dialog (`toolDetail` in `hooks/detail.ts`). */
+export type ToolDetail = { tool: string; time: string; isError: boolean; isPending: boolean; sections: DetailSection[] }
+
+/**
+ * The tool call the detail dialog shows: which call, whether it is drawn inline in the
+ * main pane (no surface placed the dialog), and its detail once read, or `denied`.
+ */
+export type ToolView = { agentId: string; toolUseId: string; inline: boolean; detail?: ToolDetail; denied?: true }
+
+/**
+ * A message or spawn the mod could not safely make where it decided to. A run woken (or started) from
+ * a timer runs without the mod's hooks, and one woken from inside a hook registration runs without that
+ * registration; so such work is queued and a drain-only turn.complete registration (or /orch) does it.
+ */
+export type Delivery = {
+  id: string
+  /** A message (`send`, the default), a HANDOVER (its stall clock starts once sent), or a respawn of `agentId`. */
+  kind?: 'send' | 'handover' | 'respawn'
+  agentId: string
+  text: string
+  /** What the warning says if it fails, e.g. `check-in for impl-2 not delivered`. */
+  what: string
+  t: number
+  /** For a respawn: the replaced row as it ended, check-in included, for the replacement to inherit. */
+  row?: AgentRow
+}
 
 export type MainPhase = 'idle' | 'offered' | 'writing' | 'clearing' | 'cooldown'
 
@@ -66,11 +129,18 @@ declare module 'claude-code' {
       log: LogEntry[]
       mainPhase: MainPhase
       runId: string
+      /** The one cut line shown whole: an activity line (`log-…`) or a transcript text (`step-<agentId>-…`); '' for none. */
       pinnedLog: string
       /** The agent a click selected: its chart line highlighted, its transcript shown beneath its row ('' for none). */
       selectedAgent: string
-      /** Each agent's transcript tail by id, read off the render; the pane draws the selected one's. */
-      peeks: Record<string, Peek>
+      /** Each agent's last transcript items by id, read off the render; the pane draws the selected one's. */
+      transcripts: Record<string, Transcript>
+      /** Messages queued by timers, delivered by the next hook to run. */
+      outbox: Delivery[]
+      /** Rows collapsed by a double-click: their finished descendants are hidden from the pane (display only). */
+      collapsed: string[]
+      /** The tool call open in the detail dialog, or null. */
+      toolView: ToolView | null
       /** A main handover asked for mid-turn, waiting for that turn to end. */
       mainQueued: boolean
     }

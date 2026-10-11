@@ -3,7 +3,8 @@ import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
 import { PEEK_TIMEOUT_MS, liveSelection } from './register'
-import { PEEK_DENIED as DENIED } from './view'
+import { hhmm } from './view'
+import { PEEK_DENIED as DENIED, runnerFor } from './view'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
 const STATE = `${RUN_DIR}/state.json`
@@ -20,6 +21,8 @@ const world = (on: On) => {
     files: new Map<string, string>(),
     toasts: [] as string[],
     opened: [] as string[],
+    /** Each `ui.open` as asked. */
+    openArgs: [] as Record<string, unknown>[],
     /** Runs while /clear is in flight, as a turn the person starts before the restart finishes. */
     duringClear: undefined as (() => Promise<unknown>) | undefined,
     /** What `$.agent.list()` answers. */
@@ -29,6 +32,30 @@ const world = (on: On) => {
     status: undefined as string | undefined,
     /** Makes the next main turn end fail beneath the plugin, once. */
     failMainEnd: false,
+    /** The model each step's usage reports as answering. */
+    usageModel: 'claude-opus-5-5',
+    /** The visible text each step answers with. */
+    answer: '',
+    /** Whether the surfaces place the tool-detail dialog (false: an older desktop). */
+    placesTool: true,
+    /** Each tool the plugin registered. */
+    tools: [] as { name: string; isDeferred?: unknown; inputSchema?: unknown }[],
+    /** Answers a tool call beneath the plugin; undefined gives `{ result: 'ok' }`. */
+    toolAnswer: undefined as ((e: Record<string, unknown>) => unknown) | undefined,
+    /** How `session.send` fails: not at all, by throwing, or undelivered. */
+    sendFails: '' as '' | 'throw' | 'undelivered',
+    /** The next `session.send` is recorded, then never answers. */
+    hangNext: false,
+    /** The next `agent.spawn` is recorded, then never answers. */
+    hangSpawn: false,
+    /** Set while a test moves the clock: a send seen then came from a timer callback. */
+    inTimer: false,
+    /** Sends made while `inTimer`. */
+    timerSends: [] as string[],
+    /** Every state.json the plugin wrote, in order. */
+    writes: [] as string[],
+    /** While set, the engine's turn.step and tool.call beneath the plugin wait on it. */
+    holdNext: undefined as Promise<void> | undefined,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -39,8 +66,20 @@ const world = (on: On) => {
   on('agent.list', () => ({ value: w.agents as never }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.send', ($, e) => {
+    if (w.inTimer) w.timerSends.push(e.text)
+    if (w.hangNext) {
+      w.hangNext = false
+      w.sent.push({ to: e.to, text: e.text })
+      return new Promise(() => {}) as never
+    }
+    if (w.sendFails === 'throw') throw new Error('send broke')
+    if (w.sendFails === 'undelivered') return { isDelivered: false, reason: 'gone' } as never
     w.sent.push({ to: e.to, text: e.text })
     return { isDelivered: true }
+  })
+  on('tool.register', ($, e) => {
+    w.tools.push(e as never)
+    return { value: { tool: `mcp__orchestrator__${e.name}` } }
   })
   on('prompt.submit', ($, e) => {
     w.prompts.push(e.text)
@@ -54,9 +93,14 @@ const world = (on: On) => {
   on('agent.spawn', ($, e) => {
     const raw = e as typeof e & { subagent_type?: string }
     w.spawns.push({ ...e, subagentType: e.subagentType ?? raw.subagent_type ?? '' })
+    if (w.hangSpawn) {
+      w.hangSpawn = false
+      return new Promise(() => {}) as never
+    }
     return { model: 'opus', agentId: `agent${w.spawns.length}` }
   })
   on('fs.write', ($, e) => {
+    if (e.path === STATE) w.writes.push(e.text)
     w.files.set(e.path, e.text)
     return { value: undefined }
   })
@@ -81,14 +125,17 @@ const world = (on: On) => {
   })
   on('ui.open', ($, e) => {
     w.opened.push(e.id)
+    w.openArgs.push(e as unknown as Record<string, unknown>)
+    if (e.id === 'orchestrator-tool' && !w.placesTool) return { value: { isPlaced: false, reason: 'older desktop' } as never }
     return { value: { isPlaced: true } }
   })
   on('turn.step', async function* ($, e) {
+    if (w.holdNext) await w.holdNext
     const tokens = w.tokens.get(e.agentId ?? 'main') ?? 1000
     return {
       turnId: e.turnId,
       index: e.index,
-      answer: '',
+      answer: w.answer,
       toolUses: [],
       stopReason: 'tool_use',
       usage: {
@@ -96,7 +143,7 @@ const world = (on: On) => {
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: tokens - 10,
         output_tokens: 50,
-        model: 'claude-opus-5-5',
+        model: w.usageModel,
       },
     }
   })
@@ -107,7 +154,10 @@ const world = (on: On) => {
     }
     return { text: e.answer }
   })
-  on('tool.call', () => ({ result: 'ok' }) as never)
+  on('tool.call', async ($, e) => {
+    if (w.holdNext) await w.holdNext
+    return (w.toolAnswer?.(e as never) ?? { result: 'ok' }) as never
+  })
   return Object.assign(w, { session })
 }
 
@@ -115,7 +165,10 @@ import type { Engine } from 'claude-code/testing'
 
 const start = ($: Engine) => $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
 
-const spawn = ($: Engine, o: { prompt: string; name?: string; parentAgentId?: string }) =>
+const spawn = (
+  $: Engine,
+  o: { prompt: string; name?: string; parentAgentId?: string; model?: string; background?: boolean; isTeammate?: boolean },
+) =>
   $.agent.spawn({
     tool_use_id: 'tu1',
     prompt: o.prompt,
@@ -124,13 +177,15 @@ const spawn = ($: Engine, o: { prompt: string; name?: string; parentAgentId?: st
     provider: { plugin: 'engine', tier: 'core' },
     parentModel: 'claude-opus-5-5',
     name: o.name,
+    model: o.model,
     parentAgentId: o.parentAgentId,
-    background: true,
+    background: o.background ?? true,
+    ...(o.isTeammate && { isTeammate: true }),
     fork: false,
   } as never)
 
-const step = async ($: Engine, agentId?: string) => {
-  const s = $.turn.step({ turnId: 'T', index: 0, model: 'claude-opus-5-5', messageCount: 3, agentId })
+const step = async ($: Engine, agentId?: string, o: { model?: string; effort?: string } = {}) => {
+  const s = $.turn.step({ turnId: 'T', index: 0, model: o.model ?? 'claude-opus-5-5', effort: o.effort, messageCount: 3, agentId } as never)
   for await (const _ of s) void _
   return s.result
 }
@@ -850,15 +905,15 @@ describe('agent in view', () => {
   type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
   const walk = (n: unknown): Drawn[] =>
     n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
-  /** Each terminal row's name cell (a Text keeps no key, so it is found as the first child of the row's Box). */
+  /** Each terminal row's name Text (a Text keeps no key, so it is found after the glyph Text that opens the row's Box). */
   const names = async (ui: Awaited<ReturnType<typeof mountViewed>>) =>
     new Map(
       walk(await ui.drawn())
         .filter(b => b.type === 'Box' && typeof b.props?.key === 'string' && /^(main|agent\d+)$/.test(b.props.key as string))
         .map(b => {
-          // A subagent's name cell sits inside its pressable Button; main's is the bare Text.
+          // A subagent's glyph and name sit inside its pressable Button; main's are bare Texts.
           const first = b.children![0] as Drawn
-          const cell = first.type === 'Button' ? (first.children![0] as Drawn) : first
+          const cell = first.type === 'Button' ? (first.children![1] as Drawn) : (b.children![1] as Drawn)
           return [b.props!.key as string, cell.props ?? {}]
         }),
     )
@@ -965,17 +1020,21 @@ describe('agent transcript', () => {
       })
       await running($, w)
       const ui = await mountPane($, surface)
-      expect(await ui.find({ key: 'peek:agent1' })).toBeUndefined()
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle() // the read runs off the render
-      const peek = (await ui.find({ key: 'peek:agent1' }))!
+      const peek = (await ui.find({ key: 'transcript:agent1' }))!
       expect(peek).toBeDefined()
       expect(peek.text).toContain('Tests are red, as expected')
-      expect(peek.text).toContain('⚙ Read, Bash×2 · Reading the plan')
+      // One item per message text and per tool call, no summary line.
+      expect(peek.text).toContain('Reading the plan')
+      expect(peek.text).toContain('⚙ Read')
+      expect(peek.text.match(/⚙ Bash/g)).toHaveLength(2)
+      expect(peek.text).not.toContain('Bash×2')
       expect(asked).toContain('agent1')
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle() // the read runs off the render
-      expect(await ui.find({ key: 'peek:agent1' })).toBeUndefined()
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
       await ui.unmount()
     })
 
@@ -986,7 +1045,7 @@ describe('agent transcript', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle() // the read runs off the render
-      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+      expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain(DENIED)
       await ui.unmount()
     })
 
@@ -997,7 +1056,7 @@ describe('agent transcript', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle() // the read runs off the render
-      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('no messages yet')
+      expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain('no messages yet')
       await ui.unmount()
     })
 
@@ -1010,7 +1069,7 @@ describe('agent transcript', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle() // the read runs off the render
-      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+      expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain(DENIED)
       expect(await ui.find({ text: /impl-1/ })).toBeDefined()
       await ui.unmount()
     })
@@ -1031,7 +1090,7 @@ describe('agent transcript', () => {
       type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
       const walk = (n: unknown): Drawn[] =>
         n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
-      const box = walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === 'peek:agent1')!
+      const box = walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === 'transcript:agent1')!
       const lines = walk(box).filter(b => b.type === 'Text')
       expect(lines).toHaveLength(1)
       expect(lines[0]!.props?.wrap).toBe('truncate')
@@ -1039,13 +1098,21 @@ describe('agent transcript', () => {
     })
   }
 
-  test('terminal: main has no transcript button', async ($, on) => {
+  test('terminal: main is pressable (to collapse it) but opens no transcript', async ($, on) => {
     const w = world(on)
+    let asked = 0
+    on('session.messages', () => {
+      asked++
+      return { value: transcript as never }
+    })
     await running($, w)
     await step($)
     const ui = await mountPane($, 'terminal')
     expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
-    expect(await ui.find({ key: 'agent:main' })).toBeUndefined()
+    await ui.press({ key: 'agent:main' })
+    await w.clock.settle()
+    expect(await ui.find({ key: 'transcript:main' })).toBeUndefined()
+    expect(asked).toBe(0)
     await ui.unmount()
   })
 
@@ -1060,14 +1127,16 @@ describe('agent transcript', () => {
     await step($)
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:main' })
-    expect(await ui.find({ key: 'peek:main' })).toBeUndefined()
+    expect(await ui.find({ key: 'transcript:main' })).toBeUndefined()
     expect(asked).toBe(0)
     await ui.unmount()
   })
 
   test('terminal: an open transcript takes its rows from the activity', async ($, on) => {
     const w = world(on)
-    on('session.messages', () => ({ value: transcript as never }))
+    // Three items: the brief, then a text and its one tool call.
+    const three = [transcript[0], { role: 'assistant', text: 'Reading the plan', toolUses: [{ tool_use_id: 'a', tool: 'Read', input: {} }] }]
+    on('session.messages', () => ({ value: three as never }))
     await start($)
     for (let i = 1; i <= 12; i++) await spawn($, { prompt: 'P', name: `impl-${i}` })
     const ui = await mountPane($, 'terminal', 80)
@@ -1082,7 +1151,7 @@ describe('agent transcript', () => {
     expect(await activity()).toBe(ROOM)
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle() // the read runs off the render
-    expect(await activity()).toBe(ROOM - (3 + 2)) // three message lines inside a border
+    expect(await activity()).toBe(ROOM - (3 + 2)) // three transcript items inside a border
     await ui.unmount()
   })
 })
@@ -1109,7 +1178,7 @@ describe('transcript read off the render', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       expect(await ui.find({ text: /impl-1/ })).toBeDefined()
-      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('loading…')
+      expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain('loading…')
       if (surface === 'desktop') {
         await ui.press({ key: 'handover:agent1' })
         expect(row(w, 'agent1')!.status).toBe('handing-over')
@@ -1127,10 +1196,10 @@ describe('transcript read off the render', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle()
-      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('loading…')
+      expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain('loading…')
       h.release()
       await w.clock.settle()
-      const peek = (await ui.find({ key: 'peek:agent1' }))!.text
+      const peek = (await ui.find({ key: 'transcript:agent1' }))!.text
       expect(peek).toContain('Tests are red, as expected')
       expect(peek).not.toContain('loading…')
       await ui.unmount()
@@ -1143,7 +1212,7 @@ describe('transcript read off the render', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.advance(PEEK_TIMEOUT_MS + 10)
-      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+      expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain(DENIED)
       await ui.unmount()
     })
   }
@@ -1155,7 +1224,7 @@ describe('transcript read off the render', () => {
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:agent1' })
     await w.clock.advance(PEEK_TIMEOUT_MS + 10)
-    expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+    expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain(DENIED)
     await step($, 'agent1')
     await w.clock.settle()
     expect(h.calls).toBe(1)
@@ -1170,9 +1239,12 @@ describe('transcript read off the render', () => {
     const ui = await mountPane($, 'desktop', 4000)
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
-    const text = (await ui.find({ key: 'peek:agent1' }))!.text
+    const text = (await ui.find({ key: 'transcript:agent1' }))!.text
     expect(text).toContain('yyy')
-    expect(text.length).toBeLessThanOrEqual(500)
+    // Kept whole up to STEP_CHARS (2000) so it can be expanded, and cut there.
+    expect(text).toContain('…')
+    expect(text.match(/y+/)![0].length).toBeLessThan(2000)
+    expect(text.match(/y+/)![0].length).toBeGreaterThan(500)
     await ui.unmount()
   })
 
@@ -1244,7 +1316,7 @@ describe('transcript reads under load', () => {
     expect(q).toHaveLength(2)
     q[1]!(said('second'))
     await w.clock.settle()
-    expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('second')
+    expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain('second')
     await ui.unmount()
   })
 
@@ -1259,7 +1331,7 @@ describe('transcript reads under load', () => {
     await w.clock.settle()
     await step($, 'agent1')
     await w.clock.advance(PEEK_TIMEOUT_MS + 10)
-    const text = (await ui.find({ key: 'peek:agent1' }))!.text
+    const text = (await ui.find({ key: 'transcript:agent1' }))!.text
     expect(text).toContain('first')
     expect(text).not.toContain(DENIED)
     await ui.unmount()
@@ -1277,7 +1349,7 @@ describe('transcript reads under load', () => {
     await w.clock.advance(30_000)
     await w.clock.settle()
     expect(calls).toBeGreaterThan(1)
-    const text = (await ui.find({ key: 'peek:agent1' }))!.text
+    const text = (await ui.find({ key: 'transcript:agent1' }))!.text
     expect(text).toContain('last words')
     expect(text).not.toContain(DENIED)
     await ui.unmount()
@@ -1309,5 +1381,1671 @@ describe('terminal pane header', () => {
   test('the Hand over main button costs the activity one line', async ($, on) => {
     world(on)
     expect(await crowded($)).toBe(ROOM - 1)
+  })
+})
+
+describe('model and status', () => {
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const own = (n: Drawn): string => (n.children ?? []).filter(c => typeof c === 'string').join('')
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  /** The terminal row Box keyed by the agent's id. */
+  const termRow = async (ui: Ui, id: string) =>
+    walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === id)!
+  /** The row text: the desktop's `agent:<id>` Button, the terminal's row Box. */
+  const rowText = async (ui: Ui, surface: 'terminal' | 'desktop', id: string) =>
+    surface === 'desktop' ? (await ui.find({ key: `agent:${id}` }))!.text : textOf(await termRow(ui, id))
+  const glyphOf = async (ui: Ui, id: string) => walk(await termRow(ui, id)).find(b => b.type === 'Text' && /[●○✓◐]/.test(own(b)))!
+  const wordOf = async (ui: Ui, id: string, word: string) =>
+    walk(await termRow(ui, id)).find(b => b.type === 'Text' && own(b).trim() === word)!
+  const styleOf = (n: Drawn) => ({ color: n.props?.color, dimColor: n.props?.dimColor, bold: n.props?.bold })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a step's model and effort show on the row and persist (${surface})`, async ($, on) => {
+      const w = world(on)
+      w.usageModel = 'claude-sonnet-5-5'
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1' })
+      await step($, 'agent1', { model: 'claude-sonnet-5-5', effort: 'medium' })
+      const ui = await mountPane($, surface)
+      expect(await rowText(ui, surface, 'agent1')).toContain('Sonnet 5.5 med')
+      expect(row(w, 'agent1')!.model).toBe('claude-sonnet-5-5')
+      expect(row(w, 'agent1')!.effort).toBe('medium')
+      await ui.unmount()
+    })
+
+    test(`with no effort the row shows the answering model alone (${surface})`, async ($, on) => {
+      const w = world(on)
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1' })
+      await step($, 'agent1', { model: 'claude-sonnet-5-5' })
+      const ui = await mountPane($, surface)
+      const text = await rowText(ui, surface, 'agent1')
+      expect(text).toContain('Opus 5.5')
+      expect(text).not.toContain('Sonnet')
+      expect(text).not.toMatch(/Opus 5\.5 (low|med|high|xhigh|max)/)
+      await ui.unmount()
+    })
+
+    test(`before any step the spawn's model shows (${surface})`, async ($, on) => {
+      world(on)
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1', model: 'haiku' })
+      const ui = await mountPane($, surface)
+      expect(await rowText(ui, surface, 'agent1')).toContain('Haiku')
+      await ui.unmount()
+    })
+
+    test(`an idle agent with a running child draws waiting (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+      await step($, 'agent2')
+      await complete($, 'agent1')
+      expect(row(w, 'agent1')!.status).toBe('idle')
+      const ui = await mountPane($, surface)
+      if (surface === 'desktop') {
+        const text = await rowText(ui, surface, 'agent1')
+        expect(text).toContain('⏳')
+        expect(text).toContain('waiting')
+      } else {
+        const glyph = await glyphOf(ui, 'agent1')
+        expect(own(glyph)).toContain('◐')
+        expect(glyph.props?.color).toBe('planMode')
+        expect(glyph.props?.dimColor).toBeFalsy()
+        expect((await wordOf(ui, 'agent1', 'waiting')).props?.color).toBe('planMode')
+      }
+      await ui.unmount()
+    })
+
+    test(`a waiting agent still gets its HANDOVER as a message (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+      await step($, 'agent2')
+      await complete($, 'agent1')
+      const ui = await mountPane($, surface)
+      expect(await rowText(ui, surface, 'agent1')).toContain('waiting')
+      if (surface === 'desktop') {
+        expect(await ui.find({ key: 'handover:agent1' })).toBeDefined()
+        await ui.press({ key: 'handover:agent1' })
+      } else {
+        await $.command.run({ command: 'orch', args: 'handover impl-1' } as never)
+      }
+      expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('HANDOVER'))).toBe(true)
+      expect(row(w, 'agent1')!.handoverVia).toBe('message')
+      await ui.unmount()
+    })
+  }
+
+  test('terminal: the glyph and status word take the status colours', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'terminal')
+    expect(styleOf(await glyphOf(ui, 'agent1'))).toEqual({ color: 'success', dimColor: undefined, bold: true })
+    expect(own(await glyphOf(ui, 'agent1'))).toContain('●')
+    expect(styleOf(await wordOf(ui, 'agent1', 'running'))).toEqual({ color: 'success', dimColor: undefined, bold: true })
+    await complete($, 'agent1')
+    expect(own(await glyphOf(ui, 'agent1'))).toContain('○')
+    expect(styleOf(await glyphOf(ui, 'agent1'))).toEqual({ color: 'warning', dimColor: true, bold: undefined })
+    expect(styleOf(await wordOf(ui, 'agent1', 'idle'))).toEqual({ color: 'warning', dimColor: true, bold: undefined })
+    await w.clock.advance(30_000)
+    expect(row(w, 'agent1')!.status).toBe('done')
+    expect(styleOf(await glyphOf(ui, 'agent1'))).toEqual({ color: 'success', dimColor: true, bold: undefined })
+    expect(styleOf(await wordOf(ui, 'agent1', 'done'))).toEqual({ color: 'success', dimColor: true, bold: undefined })
+    await ui.unmount()
+  })
+
+  test('desktop: the status emoji is the agent own runner, then sleep, then done', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    let ui = await mountPane($, 'desktop')
+    const runner = runnerFor('agent1')
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain(runner)
+    await ui.unmount()
+    ui = await mountPane($, 'desktop')
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain(runner)
+    await complete($, 'agent1')
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain('😴')
+    await w.clock.advance(30_000)
+    expect(await rowText(ui, 'desktop', 'agent1')).toContain('✅')
+    await ui.unmount()
+  })
+
+  test('terminal: the model cell narrows the timeline by 17 columns', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'terminal', 100)
+    const NAME = Math.min(24, Math.max(12, Math.floor(100 * 0.25)))
+    const kids = (await termRow(ui, 'agent1')).children as Drawn[]
+    const timeline = kids[kids.length - 2]!
+    expect(own(timeline)).toHaveLength(Math.max(8, 100 - NAME - 7 - 14 - 17))
+    await ui.unmount()
+  })
+})
+
+describe('timestamped transcript', () => {
+  type Drawn = { type: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const T0 = 1_000_000 // the world clock's start: agent1's startedAt in `running`
+  const brief = { role: 'user', text: 'Implement task 1', toolUses: [] }
+  const LONG = `Long thoughts: ${'the plan has many parts and each needs care. '.repeat(12)}END`
+  /** One Bash call from agent1's loop, as the engine raises it. */
+  const bash = ($: Engine, id: string) =>
+    $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: id, agentId: 'agent1' } as never)
+  const open = async ($: Engine, w: World, surface: 'terminal' | 'desktop', cols = 100) => {
+    const ui = await mountPane($, surface, cols)
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    return ui
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a tool call shows the time the mod saw it (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({
+        value: [brief, { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'ok' }] }] as never,
+      }))
+      await running($, w)
+      await w.clock.advance(7 * 60_000)
+      const t = w.clock.now()
+      await bash($, 'b')
+      await w.clock.advance(5 * 60_000)
+      const ui = await open($, w, surface)
+      const item = (await ui.find({ key: 'tool:agent1:b' }))!
+      expect(item).toBeDefined()
+      expect(item.text.startsWith(hhmm(t))).toBe(true)
+      expect(item.text).toContain('⚙ Bash npm test')
+      await ui.unmount()
+    })
+
+    test(`an answer shows the time its step was seen (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [brief, { role: 'assistant', text: 'Tests are red', toolUses: [] }] as never }))
+      await running($, w)
+      await w.clock.advance(9 * 60_000)
+      const t2 = w.clock.now()
+      w.answer = 'Tests are red'
+      await step($, 'agent1')
+      await w.clock.advance(5 * 60_000)
+      const ui = await open($, w, surface)
+      const text = (await ui.find({ key: 'transcript:agent1' }))!.text
+      expect(text).toContain(`${hhmm(t2)} Tests are red`)
+      await ui.unmount()
+    })
+
+    test(`the brief shows the agent's start; an unseen message shows --:-- (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [brief, { role: 'assistant', text: 'Never stamped', toolUses: [] }] as never }))
+      await running($, w)
+      await w.clock.advance(9 * 60_000)
+      const ui = await open($, w, surface)
+      const text = (await ui.find({ key: 'transcript:agent1' }))!.text
+      expect(text).toContain(`${hhmm(T0)} » Implement task 1`)
+      expect(text).toContain('--:-- Never stamped')
+      await ui.unmount()
+    })
+
+    test(`a failed call draws ✗ and a call in flight draws (running) (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({
+        value: [
+          brief,
+          {
+            role: 'assistant',
+            text: '',
+            toolUses: [
+              { tool_use_id: 'x', tool: 'Bash', input: { command: 'false' }, text: 'exit 1', isError: true },
+              { tool_use_id: 'y', tool: 'Bash', input: { command: 'sleep 9' } },
+            ],
+          },
+        ] as never,
+      }))
+      await running($, w)
+      const ui = await open($, w, surface)
+      const failed = (await ui.find({ key: 'tool:agent1:x' }))!.text
+      expect(failed).toContain('✗')
+      expect(failed).not.toContain('(running)')
+      const pending = (await ui.find({ key: 'tool:agent1:y' }))!.text
+      expect(pending).toContain('(running)')
+      expect(pending).not.toContain('✗')
+      // The cross is drawn in the error colour.
+      const cross = walk(await ui.drawn()).find(b => b.type === 'Text' && (b.children ?? []).some(c => typeof c === 'string' && c.includes('✗')))!
+      expect(cross.props?.color).toBe('error')
+      await ui.unmount()
+    })
+
+    test(`pressing a tool item touches no handover or state it should not (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({
+        value: [brief, { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'ok' }] }] as never,
+      }))
+      await running($, w)
+      const ui = await open($, w, surface)
+      await ui.press({ key: 'tool:agent1:b' })
+      await w.clock.settle()
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeDefined()
+      expect(row(w, 'agent1')!.status).toBe('running')
+      await ui.unmount()
+    })
+  }
+
+  const longStub = (on: Parameters<typeof world>[0]) =>
+    on('session.messages', () => ({ value: [brief, { role: 'assistant', text: LONG, toolUses: [] }] as never }))
+  const stepButton = async (ui: Awaited<ReturnType<typeof mountPane>>) =>
+    (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
+
+  test('terminal: a long text is cut, and its card shows on hover, pinned by a press', async ($, on) => {
+    const w = world(on)
+    longStub(on)
+    await running($, w)
+    const ui = await open($, w, 'terminal', 80)
+    const button = await stepButton(ui)
+    expect(button).toBeDefined()
+    expect(button.text).toContain('…')
+    expect(button.text).not.toContain('END')
+    const card = async () =>
+      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('END'))!
+    expect((await card()).props!.display).toBe('none')
+    expect((await card()).hover).toMatchObject({ display: 'flex' })
+    await ui.press({ key: button.key! })
+    expect((await card()).props!.display).toBe('flex')
+    await ui.press({ key: button.key! })
+    expect((await card()).props!.display).toBe('none')
+    await ui.unmount()
+  })
+
+  test('terminal: a long text card opens downward inside the border, its lines capped to the room', async ($, on) => {
+    const w = world(on)
+    const HUGE = `${'word '.repeat(390)}END`
+    on('session.messages', () => ({ value: [brief, { role: 'assistant', text: HUGE, toolUses: [] }] as never }))
+    await running($, w)
+    const ui = await open($, w, 'terminal', 40)
+    const card = walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('word'))!
+    expect(card.props!.top as number).toBeGreaterThanOrEqual(0)
+    expect(card.props!.left).toBe(-1)
+    const lines = (card.children as Drawn[]).filter(c => c.type === 'Text')
+    // 30 rows (no viewport given): far fewer than the ~55 lines the text wraps to.
+    expect(lines.length).toBeLessThan(30)
+    expect(JSON.stringify(lines[lines.length - 1]!.children)).toContain('…')
+    expect(JSON.stringify(card.children)).not.toContain('END')
+    await ui.unmount()
+  })
+
+  test('desktop: a long text is cut, and a press shows its full text in flow', async ($, on) => {
+    const w = world(on)
+    longStub(on)
+    await running($, w)
+    const ui = await open($, w, 'desktop', 80)
+    const button = await stepButton(ui)
+    expect(button.text).toContain('…')
+    expect(button.text).not.toContain('END')
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
+    await ui.press({ key: button.key! })
+    const full = (await ui.find({ key: `full:${button.key}` }))!
+    expect(full.text).toContain('END')
+    expect(full.text).toContain('Long thoughts:')
+    expect(walk(await ui.drawn()).some(b => b.type === 'Box' && b.props?.position === 'absolute')).toBe(false)
+    await ui.press({ key: button.key! })
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('the terminal shows the last 6 items, the desktop the last 12', async ($, on) => {
+    const w = world(on)
+    const many = Array.from({ length: 20 }, (_, i) => ({ role: 'assistant', text: `item ${i}`, toolUses: [] }))
+    on('session.messages', () => ({ value: [brief, ...many] as never }))
+    await running($, w)
+    for (const [surface, n] of [['terminal', 6], ['desktop', 12]] as const) {
+      const ui = await open($, w, surface)
+      const text = (await ui.find({ key: 'transcript:agent1' }))!.text
+      expect(text).toContain('item 19')
+      expect(text).toContain(`item ${20 - n}`)
+      expect(text).not.toContain(`item ${19 - n}`)
+      await ui.press({ key: 'agent:agent1' })
+      await ui.unmount()
+    }
+  })
+})
+
+describe('tool detail', () => {
+  const TOOL = 'orchestrator-tool'
+  const brief = { role: 'user', text: 'Implement task 1', toolUses: [] }
+  const uses = {
+    b: { tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS 3 tests' },
+    e: { tool_use_id: 'e', tool: 'Edit', input: { file_path: '/x.ts', old_string: 'a\nb', new_string: 'a\nc' }, text: 'ok' },
+    r: { tool_use_id: 'r', tool: 'Read', input: { file_path: '/x.ts', offset: 10, limit: 2 }, text: '    10→line ten\n    11→line eleven' },
+    g: { tool_use_id: 'g', tool: 'Grep', input: { pattern: 'TODO', path: 'src' }, text: 'src/a.ts' },
+  }
+  const said = (...toolUses: unknown[]) => ({ value: [brief, { role: 'assistant', text: '', toolUses }] as never })
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  const mountTool = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile' = 'desktop') =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: TOOL, props: { bodyColumns: 100 } as never })
+  /** agent1 running, its transcript open in the main pane. */
+  const opened = async ($: Engine, w: World, surface: 'terminal' | 'desktop') => {
+    await running($, w)
+    const ui = await mountPane($, surface)
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    return ui
+  }
+  const codes = async (ui: Ui) => (await ui.findAll({ type: 'Code' })).map(c => c.props as Record<string, unknown>)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`pressing a tool call opens the dialog without waiting on the read (${surface})`, async ($, on) => {
+      const w = world(on)
+      let calls = 0
+      on('session.messages', () => (calls++ === 0 ? said(uses.b) : new Promise(() => {})))
+      const ui = await opened($, w, surface)
+      await ui.press({ key: 'tool:agent1:b' })
+      expect(w.opened).toContain(TOOL)
+      if (surface === 'desktop') {
+        await ui.press({ key: 'handover:agent1' })
+        expect(row(w, 'agent1')!.status).toBe('handing-over')
+      }
+      await ui.press({ key: 'handover:main' })
+      await w.clock.advance(10)
+      expect(w.prompts.some(p => p.includes('main-1.md'))).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`the dialog draws a Bash call's command and output (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => said(uses.b))
+      const ui = await opened($, w, surface)
+      await ui.press({ key: 'tool:agent1:b' })
+      await w.clock.settle()
+      const tool = await mountTool($, surface)
+      const cs = await codes(tool)
+      expect(cs.find(c => c.language === 'bash')?.source).toBe('npm test')
+      expect(cs.some(c => String(c.source).includes('PASS 3 tests'))).toBe(true)
+      expect(await tool.find({ key: 'close' })).toBeDefined()
+      await tool.unmount()
+      await ui.unmount()
+    })
+
+    test(`Edit draws a diff, Read a path and start line, Grep its pattern (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => said(uses.e, uses.r, uses.g))
+      const ui = await opened($, w, surface)
+      await ui.press({ key: 'tool:agent1:e' })
+      await w.clock.settle()
+      let tool = await mountTool($, surface)
+      expect((await codes(tool)).some(c => c.format === 'diff')).toBe(true)
+      await tool.unmount()
+      await ui.press({ key: 'tool:agent1:r' })
+      await w.clock.settle()
+      tool = await mountTool($, surface)
+      expect((await codes(tool)).find(c => c.path === '/x.ts')?.startLine).toBe(10)
+      await tool.unmount()
+      await ui.press({ key: 'tool:agent1:g' })
+      await w.clock.settle()
+      tool = await mountTool($, surface)
+      expect(await tool.find({ text: /TODO/ })).toBeDefined()
+      await tool.unmount()
+      await ui.unmount()
+    })
+  }
+
+  test('loading… before the read settles; not readable when the call is gone', async ($, on) => {
+    const w = world(on)
+    let calls = 0
+    let release = () => {}
+    on('session.messages', () => {
+      calls++
+      if (calls === 1) return said(uses.b)
+      if (calls === 2) return new Promise(resolve => (release = () => resolve(said(uses.g))))
+      return said(uses.g)
+    })
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    let tool = await mountTool($)
+    expect(await tool.find({ text: /loading…/ })).toBeDefined()
+    await tool.unmount()
+    release()
+    await w.clock.settle()
+    tool = await mountTool($)
+    expect(await tool.find({ text: /tool call not readable/ })).toBeDefined()
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('a call in flight shows running…, then its output once the call settles', async ($, on) => {
+    const w = world(on)
+    let done = false
+    on('session.messages', () => said(done ? uses.b : { ...uses.b, text: undefined }))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    let tool = await mountTool($)
+    expect(await tool.find({ text: /running…/ })).toBeDefined()
+    await tool.unmount()
+    done = true
+    await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: 'b', agentId: 'agent1' } as never)
+    await w.clock.settle()
+    tool = await mountTool($)
+    expect((await codes(tool)).some(c => String(c.source).includes('PASS 3 tests'))).toBe(true)
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('Close closes the dialog and clears it', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    let tool = await mountTool($)
+    const close = (await tool.find({ key: 'close' }))!
+    expect(close.props.role).toBe('dismiss')
+    await tool.press({ key: 'close' })
+    expect(w.closed).toContain(TOOL)
+    await tool.unmount()
+    tool = await mountTool($)
+    expect(await tool.find({ text: /No tool call selected\./ })).toBeDefined()
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  // The test engine has no `ui.close` to raise, so the person's own close cannot be driven from here:
+  // the dialog is asked to close on Escape, and closing the Orchestrator pane is checked to leave it alone.
+  test('the dialog closes on Escape and holds toasts; closing the Orchestrator pane leaves it open', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(w.openArgs.find(a => a.id === TOOL)).toMatchObject({ focus: true, closeOnEscape: true, holdToasts: true, title: 'impl-1 · Bash' })
+    await $.command.run({ command: 'orch', args: 'close' } as never)
+    expect(w.closed).toEqual(['orchestrator'])
+    const tool = await mountTool($)
+    expect((await codes(tool)).length).toBeGreaterThan(0)
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test('pressing the same tool call again closes the dialog', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(w.closed).toContain(TOOL)
+    const tool = await mountTool($)
+    expect(await tool.find({ text: /No tool call selected\./ })).toBeDefined()
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  for (const how of ['step', 'sync'] as const) {
+    test(`an open call in flight is read again on each ${how} until it settles`, async ($, on) => {
+      const w = world(on)
+      let done = false
+      on('session.messages', () => said(done ? uses.b : { ...uses.b, text: undefined }))
+      const ui = await opened($, w, 'desktop')
+      await ui.press({ key: 'tool:agent1:b' })
+      await w.clock.settle()
+      done = true
+      if (how === 'step') await step($, 'agent1')
+      else {
+        w.agents = [{ id: 'agent1', name: 'impl-1' }]
+        await w.clock.advance(30_000)
+      }
+      await w.clock.settle()
+      const tool = await mountTool($)
+      expect((await codes(tool)).some(c => String(c.source).includes('PASS 3 tests'))).toBe(true)
+      await tool.unmount()
+      await ui.unmount()
+    })
+  }
+
+  test('terminal: a session that places no dialog gets the detail inline beneath the call', async ($, on) => {
+    const w = world(on)
+    w.placesTool = false
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'terminal')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    const inline = (await ui.find({ key: 'tooldetail:b' }))!
+    expect(inline).toBeDefined()
+    expect(inline.text).toContain('npm test')
+    await ui.unmount()
+  })
+
+  test('desktop: a surface that places no dialog gets the detail inline beneath the call', async ($, on) => {
+    const w = world(on)
+    w.placesTool = false
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    const inline = (await ui.find({ key: 'tooldetail:b' }))!
+    expect(inline).toBeDefined()
+    expect(inline.text).toContain('npm test')
+    expect((await ui.findAll({ type: 'Code' })).length).toBeGreaterThan(0)
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    expect(await ui.find({ key: 'tooldetail:b' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('the dialog mounts on vscode and mobile', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said(uses.b))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    for (const surface of ['vscode', 'mobile'] as const) {
+      const tool = await mountTool($, surface)
+      expect(await tool.find({ key: 'close' })).toBeDefined()
+      await tool.unmount()
+    }
+    await ui.unmount()
+  })
+
+  test('a huge output stays within the Code limit', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said({ ...uses.b, text: 'z'.repeat(200_000) }))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:b' })
+    await w.clock.settle()
+    const tool = await mountTool($)
+    const total = (await codes(tool)).reduce((n, c) => n + String(c.source).length, 0)
+    expect(total).toBeGreaterThan(1000)
+    expect(total).toBeLessThanOrEqual(100_000)
+    await tool.unmount()
+    await ui.unmount()
+  })
+})
+
+describe('stalled handovers and resumed agents', () => {
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const own = (n: Drawn): string => (n.children ?? []).filter(c => typeof c === 'string').join('')
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+  const STALL = 20 * 60_000 + 30_000
+
+  /** impl-1 past the threshold, its HANDOVER carried by a tool result, then left past the stall time. */
+  const stalled = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    await w.clock.advance(STALL)
+    expect(row(w, 'agent1')!.status).toBe('stalled')
+  }
+
+  test('a stalled agent that ends having written its note is replaced and respawned', async ($, on) => {
+    const w = world(on)
+    await stalled($, w)
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    expect(row(w, 'agent1')!.status).toBe('replaced')
+    expect(w.spawns).toHaveLength(2)
+  })
+
+  test('a stalled agent that ends without a note is done, and is sent nothing more', async ($, on) => {
+    const w = world(on)
+    await stalled($, w)
+    const sent = w.sent.length
+    await complete($, 'agent1', 'gave up')
+    expect(row(w, 'agent1')!.status).toBe('done')
+    expect(w.sent).toHaveLength(sent)
+    expect(w.spawns).toHaveLength(1)
+  })
+
+  /** A replacement (agent2, ours, reporting to main) that ran once, ended and was settled done by sync. */
+  const finishedReplacement = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'Orchestrate.', name: 'orchestrator' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/orchestrator-agent1-1.md`, 'x')
+    await complete($, 'agent1')
+    await step($, 'agent2')
+    await complete($, 'agent2', 'FIRST REPORT')
+    await w.clock.advance(30_000)
+    expect(w.prompts.some(p => p.includes('FIRST REPORT'))).toBe(true)
+    expect(row(w, 'agent2')!.status).toBe('done')
+  }
+
+  test('an agent resumed after it ended runs again, reports again, and ends done', async ($, on) => {
+    const w = world(on)
+    await finishedReplacement($, w)
+    const now = await w.clock.now()
+    await step($, 'agent2')
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ status: 'running', resumedAt: now }))
+    // the engine may leave a resumed agent out of its list while it runs: sync must not settle it mid-run
+    await w.clock.advance(30_000)
+    expect(row(w, 'agent2')!.status).toBe('running')
+    await complete($, 'agent2', 'SECOND REPORT')
+    expect(row(w, 'agent2')!.status).toBe('idle')
+    await w.clock.advance(30_000)
+    expect(w.prompts.some(p => p.includes('SECOND REPORT'))).toBe(true)
+    expect(row(w, 'agent2')!.status).toBe('done')
+  })
+
+  test('a resumed agent silent past the stall time is settled done by sync', async ($, on) => {
+    const w = world(on)
+    await finishedReplacement($, w)
+    await step($, 'agent2')
+    await w.clock.advance(STALL)
+    expect(row(w, 'agent2')!.status).toBe('done')
+  })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a resumed agent shows a dim ↻ after its label (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      await complete($, 'agent1')
+      await w.clock.advance(30_000)
+      const ui = await mountPane($, surface, 100)
+      const marks = async () => walk(await ui.drawn()).filter(b => b.type === 'Text' && own(b).includes('↻'))
+      expect(await marks()).toHaveLength(0)
+      await step($, 'agent1')
+      const found = await marks()
+      expect(found).toHaveLength(1)
+      expect(own(found[0]!).trim()).toBe('↻')
+      expect(found[0]!.props?.dimColor).toBe(true)
+      if (surface === 'desktop') {
+        expect((await ui.find({ key: 'agent:agent1' }))!.text).toMatch(/impl-1\s*↻/)
+      } else {
+        // glyph and name, mark included, still fill exactly the NAME columns
+        const NAME = Math.min(24, Math.max(12, Math.floor(100 * 0.25)))
+        const button = walk(await ui.drawn()).find(b => b.props?.key === 'agent:agent1')!
+        expect(textOf(button)).toHaveLength(NAME)
+        expect(textOf(button)).toMatch(/impl-1\s*↻/)
+      }
+      await ui.unmount()
+    })
+  }
+})
+
+/** A tool call from an agent's loop with the tool's own arguments beside the envelope, as the engine raises it. */
+const call = ($: Engine, agentId: string | undefined, tool: string, args: Record<string, unknown>) =>
+  $.tool.call({ tool, tool_use_id: `tu-${tool}-${Math.random()}`, ...(agentId && { agentId }), ...args } as never) as Promise<{
+    result?: unknown
+    deny?: string
+  }>
+
+/** agent1 (impl-1) under main, with agent2 (impl-2) its background child; both listed by the engine. */
+const family = async ($: Engine, w: World) => {
+  await running($, w)
+  await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+  await step($, 'agent2')
+  w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+}
+
+describe('check-in', () => {
+  const MIN = 60_000
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  /** Time passes, then a turn ends (main's), which delivers what the timers queued. */
+  const later = async ($: Engine, w: World, ms: number) => {
+    await w.clock.advance(ms)
+    await complete($, undefined)
+    await w.clock.settle()
+  }
+  const checkins = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes('check-in'))
+
+  test('session.start registers the checkin tool, not deferred', async ($, on) => {
+    const w = world(on)
+    await start($)
+    const t = w.tools.find(t => t.name === 'checkin')
+    expect(t).toBeDefined()
+    expect(t!.isDeferred).toBe(false)
+    expect(JSON.stringify(t!.inputSchema)).toContain('minutes')
+  })
+
+  test('a parent arms a check-in on its child: stored, and fired once after the deadline', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    const now = w.clock.now()
+    const res = await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    expect(String(res.result)).toContain('impl-2')
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ checkinAt: now + 30 * MIN, checkinMins: 30, checkinBy: 'agent1' }))
+    await later($, w, 29 * MIN)
+    expect(checkins(w)).toHaveLength(0)
+    await later($, w, MIN + 30_000)
+    expect(checkins(w)).toHaveLength(1)
+    expect(checkins(w)[0]!.text).toContain('impl-2')
+    expect(checkins(w)[0]!.text).toContain('30 min')
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    await later($, w, 30_000)
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  for (const to of ['agent1', 'impl-1']) {
+    test(`the child's SendMessage to its parent (${to}) disarms it and records the report`, async ($, on) => {
+      const w = world(on)
+      await family($, w)
+      await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+      await call($, 'agent2', 'SendMessage', { to, message: 'done: all green' })
+      expect(row(w, 'agent2')!.report).toEqual(expect.objectContaining({ text: 'done: all green', ok: true, final: true }))
+      await later($, w, 31 * MIN)
+      expect(checkins(w)).toHaveLength(0)
+    })
+  }
+
+  test('a handback alone does not disarm it', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+    await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
+    expect(row(w, 'agent2')!.checkinAt).toBeDefined()
+    await later($, w, 31 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  test("a SendMessage to someone else leaves it armed", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+    await call($, 'agent2', 'SendMessage', { to: 'impl-9', message: 'hi' })
+    expect(row(w, 'agent2')!.report).toBeUndefined()
+    await later($, w, 31 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  test("the child's turn ending disarms it", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
+    await complete($, 'agent2', 'R')
+    await later($, w, 31 * MIN)
+    expect(checkins(w)).toHaveLength(0)
+  })
+
+  test('calling again re-arms; minutes 0 cancels; an unknown agent is refused and changes nothing', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 10 })
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 40 })
+    await later($, w, 11 * MIN)
+    expect(checkins(w)).toHaveLength(0)
+    await later($, w, 30 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    const cancel = await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 0 })
+    expect(String(cancel.result)).toContain('cancel')
+    await later($, w, 6 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+    const before = w.files.get(STATE)
+    const bad = await call($, 'agent1', CHECKIN, { agent: 'nobody', minutes: 5 })
+    expect(bad.deny).toBeUndefined()
+    expect(String(bad.result)).toMatch(/^checkin: .*nobody/)
+    expect(w.files.get(STATE)).toBe(before)
+  })
+
+  test("only the child's own parent can arm it", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    const res = await call($, undefined, CHECKIN, { agent: 'impl-2', minutes: 5 })
+    expect(res.deny).toBeUndefined()
+    expect(String(res.result)).toMatch(/^checkin: no agent/)
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    const bad = await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 'soon' })
+    expect(bad.deny).toBeUndefined()
+    expect(String(bad.result)).toMatch(/^checkin: minutes/)
+  })
+
+  test('a check-in armed by main is submitted as a prompt, which wakes main, and toasts', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, undefined, CHECKIN, { agent: 'impl-1', minutes: 5 })
+    expect(row(w, 'agent1')!.checkinBy).toBe('main')
+    await later($, w, 6 * MIN)
+    expect(w.sent.filter(m => m.text.includes('check-in'))).toHaveLength(0)
+    expect(w.prompts.filter(p => p.includes('check-in') && p.includes('impl-1'))).toHaveLength(1)
+    expect(w.toasts.some(t => t.includes('check-in'))).toBe(true)
+  })
+
+  test('with autoRespawn off, a child that hands over is not checked in on', { options: { autoRespawn: false } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent2')!.status).toBe('replaced')
+    expect(w.spawns).toHaveLength(2)
+    await later($, w, 31 * 60_000)
+    expect(w.sent.filter(m => m.text.includes('check-in'))).toHaveLength(0)
+  })
+
+  test('a check-in survives a handover that needed a second end to write its note', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    // It ends before any tool result carried the HANDOVER: the message wakes it to write the note.
+    await complete($, 'agent2', 'stopped')
+    expect(w.sent.some(m => m.to.includes('agent2') && m.text.includes('HANDOVER'))).toBe(true)
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent3')).toEqual(expect.objectContaining({ replaces: 'agent2', checkinBy: 'agent1', checkinMins: 30 }))
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+  })
+
+  test('a replacement inherits its predecessor check-in, and it still fires', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent3')).toEqual(expect.objectContaining({ replaces: 'agent2', checkinBy: 'agent1', checkinMins: 30 }))
+    w.agents.push({ id: 'agent3', name: 'impl-2' })
+    await later($, w, 31 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+    expect(checkins(w)[0]!.text).toContain('agent3')
+  })
+
+  test('a replacement orchestrator can check in on its predecessor children, and the check-in reaches it', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    w.agents.push({ id: 'agent3', name: 'impl-1' })
+    const res = await call($, 'agent3', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    expect(String(res.result)).toContain('armed')
+    expect(row(w, 'agent2')!.checkinBy).toBe('agent3')
+    await later($, w, 6 * MIN)
+    expect(checkins(w, 'agent3')).toHaveLength(1)
+  })
+
+  test('a check-in armed by an orchestrator that was then replaced goes to its replacement', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    w.agents.push({ id: 'agent3', name: 'impl-1' })
+    await later($, w, 31 * MIN)
+    expect(checkins(w, 'agent1')).toHaveLength(0)
+    expect(checkins(w, 'agent3')).toHaveLength(1)
+  })
+
+  test('the check-in tool never touches a handover under way', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await $.command.run({ command: 'orch', args: 'handover impl-2' } as never)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
+    expect((await tool($, 'agent2')).context?.[0]).toContain('HANDOVER')
+  })
+})
+
+describe('auto-forward', () => {
+  const end = ($: Engine, agentId: string, answer: string, reason: 'answer' | 'aborted' | 'error' = 'answer') =>
+    $.turn.complete({ answer, durationMs: 5, isAborted: reason === 'aborted', turnId: 'T', agentId, reason })
+  const forwards = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes('auto-forwarded'))
+  /** agent1 (impl-1) under main, with agent2 (impl-2) its child, spawned as asked. */
+  const kin = async ($: Engine, w: World, o: { background?: boolean; isTeammate?: boolean } = {}) => {
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1', ...o })
+    await step($, 'agent2')
+  }
+
+  test("a child's final answer goes to its parent agent", async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await end($, 'agent2', 'R: all green')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('R: all green')
+    expect(forwards(w)[0]!.text).toContain('impl-2')
+    expect(forwards(w)[0]!.text).not.toContain('may duplicate')
+  })
+
+  test('a delivered SendMessage to the parent as the run last act is not forwarded again', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'Report: done' })
+    await end($, 'agent2', 'Sent my report.')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('a SendMessage early, then a different final answer, is still forwarded, flagged', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'starting now' })
+    await tool($, 'agent2')
+    await end($, 'agent2', 'FINAL: tests pass')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('FINAL: tests pass')
+    expect(forwards(w)[0]!.text).toContain('may duplicate a message it sent you')
+  })
+
+  test('an early SendMessage saying the same as the final answer is enough', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'FINAL: tests pass' })
+    await tool($, 'agent2')
+    await end($, 'agent2', 'FINAL:  tests pass')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('a SendMessage that failed does not count as a report', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SendMessage' ? { result: { success: false }, isError: true } : undefined)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'Report' })
+    await end($, 'agent2', 'Report')
+    expect(forwards(w)).toHaveLength(1)
+  })
+
+  // A handback goes to the main session, not to the parent agent: it is no report to the parent.
+  test('a child that hands back, then ends with an answer, is still forwarded to its parent', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    await kin($, w)
+    await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
+    await end($, 'agent2', 'Report')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('Report')
+    // It may have reached main already: flagged as a possible duplicate.
+    expect(forwards(w)[0]!.text).toContain('may duplicate a message it sent you')
+  })
+
+  test('each run is judged on its own: a resumed child that does not report is forwarded', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'first report' })
+    await end($, 'agent2', 'first report')
+    expect(forwards(w)).toHaveLength(0)
+    await call($, 'agent1', 'SendMessage', { to: 'impl-2', message: 'one more thing' })
+    await step($, 'agent2')
+    await end($, 'agent2', 'second answer')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('second answer')
+  })
+
+  test('nothing is forwarded to main, nor for a teammate or a foreground child', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const prompts = w.prompts.length
+    await end($, 'agent1', 'R')
+    expect(w.sent).toHaveLength(0)
+    await w.clock.advance(10)
+    expect(w.prompts).toHaveLength(prompts)
+    await spawn($, { prompt: 'T', name: 'mate', parentAgentId: 'agent1', isTeammate: true })
+    await end($, 'agent2', 'R')
+    await spawn($, { prompt: 'F', name: 'fg', parentAgentId: 'agent1', background: false })
+    await end($, 'agent3', 'R')
+    expect(forwards(w)).toHaveLength(0)
+    expect(row(w, 'agent2')!.isTeammate).toBe(true)
+    expect(row(w, 'agent3')!.background).toBe(false)
+  })
+
+  test('an empty, aborted or failed end is not forwarded', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await end($, 'agent2', '   ')
+    await step($, 'agent2')
+    await end($, 'agent2', 'partial', 'aborted')
+    await step($, 'agent2')
+    await end($, 'agent2', 'partial', 'error')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('a child handing over is not forwarded; the handover goes on as before', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await $.command.run({ command: 'orch', args: 'handover impl-2' } as never)
+    await end($, 'agent2', 'ended early')
+    expect(forwards(w)).toHaveLength(0)
+    expect(w.sent.some(m => m.to.includes('agent2') && m.text.includes('HANDOVER'))).toBe(true)
+  })
+
+  test('a replacement under a subagent is forwarded exactly once', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await end($, 'agent2', 'HANDED OVER: note at x')
+    expect(forwards(w)).toHaveLength(0)
+    w.tokens.set('agent3', 1000)
+    await step($, 'agent3')
+    await end($, 'agent3', 'REPLACEMENT DONE')
+    expect(w.sent.filter(m => m.to.includes('agent1') && m.text.includes('REPLACEMENT DONE'))).toHaveLength(1)
+  })
+
+  test("a child's final answer goes to its parent's replacement, not the handed-over parent", async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await end($, 'agent1', 'HANDED OVER')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    await end($, 'agent2', 'R: all green')
+    expect(forwards(w, 'agent1')).toHaveLength(0)
+    expect(forwards(w, 'agent3')).toHaveLength(1)
+  })
+
+  test("a foreground child's replacement has its answer forwarded to the parent agent", async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1', background: false })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await end($, 'agent2', 'HANDED OVER')
+    expect(row(w, 'agent3')!.replaces).toBe('agent2')
+    w.tokens.set('agent3', 1000)
+    await step($, 'agent3')
+    await end($, 'agent3', 'REAL RESULT')
+    expect(w.sent.filter(m => m.to.includes('agent1') && m.text.includes('REAL RESULT'))).toHaveLength(1)
+  })
+
+  test('a report followed by a refused call is no longer the last act', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'Bash' ? { deny: 'not allowed' } : undefined)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'early' })
+    await call($, 'agent2', 'Bash', { command: 'rm -rf x' })
+    expect(row(w, 'agent2')!.report?.final).toBe(false)
+    await end($, 'agent2', 'FINAL different')
+    expect(forwards(w)).toHaveLength(1)
+  })
+
+  test('a report followed by a checkin call is no longer the last act', async ($, on) => {
+    const w = world(on)
+    await kin($, w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'early' })
+    await call($, 'agent2', 'mcp__orchestrator__checkin', { agent: 'nobody', minutes: 5 })
+    expect(row(w, 'agent2')!.report?.final).toBe(false)
+  })
+
+  for (const fails of ['throw', 'undelivered'] as const) {
+    test(`a forward that fails (${fails}) is warned, never thrown`, async ($, on) => {
+      const w = world(on)
+      await kin($, w)
+      w.sendFails = fails
+      await end($, 'agent2', 'R')
+      // the forward goes out from the turn end's drain, unawaited: its warning lands once it settles
+      await w.clock.settle()
+      expect(w.toasts.some(t => t.includes('not forwarded'))).toBe(true)
+      expect(row(w, 'agent2')!.status).toBe('idle')
+    })
+  }
+})
+
+describe('collapse', () => {
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  /** agent1 orchestrating under main: agent2 and agent3 done, agent4 running. */
+  const crew = async ($: Engine, w: World) => {
+    await running($, w)
+    for (const n of [2, 3, 4]) {
+      await spawn($, { prompt: `P${n}`, name: `impl-${n}`, parentAgentId: 'agent1' })
+      await step($, `agent${n}`)
+    }
+    await complete($, 'agent2', 'R2')
+    await complete($, 'agent3', 'R3')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent4', name: 'impl-4' }]
+    await w.clock.advance(30_000)
+    expect([2, 3].map(n => row(w, `agent${n}`)!.status)).toEqual(['done', 'done'])
+  }
+  /** Whether a row is drawn: the desktop's row Button, the terminal's row Box. */
+  const drawn = async (ui: Ui, surface: 'terminal' | 'desktop', id: string) =>
+    surface === 'desktop'
+      ? (await ui.find({ key: `agent:${id}` })) !== undefined
+      : walk(await ui.drawn()).some(b => b.type === 'Box' && b.props?.key === id)
+  const rowText = async (ui: Ui, surface: 'terminal' | 'desktop', id: string) =>
+    surface === 'desktop'
+      ? (await ui.find({ key: `agent:${id}` }))!.text
+      : textOf(walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === id))
+  const double = async (ui: Ui, id: string) => {
+    await ui.press({ key: `agent:${id}` })
+    await ui.press({ key: `agent:${id}` })
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a double-click collapses finished descendants, and another expands them (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await double(ui, 'agent1')
+      await w.clock.settle()
+      expect(await drawn(ui, surface, 'agent2')).toBe(false)
+      expect(await drawn(ui, surface, 'agent3')).toBe(false)
+      expect(await drawn(ui, surface, 'agent4')).toBe(true)
+      expect(await rowText(ui, surface, 'agent1')).toContain('+2 done')
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+      if (surface === 'desktop') {
+        const src = String((await ui.find({ type: 'Svg' }))!.props.source)
+        expect(src).not.toContain('stroke="#E69F00"')
+        expect(src).not.toContain('stroke="#009E73"')
+        expect(src).toContain('stroke="#CC79A7"')
+      }
+      await double(ui, 'agent1')
+      expect(await drawn(ui, surface, 'agent2')).toBe(true)
+      expect(await drawn(ui, surface, 'agent3')).toBe(true)
+      expect(await rowText(ui, surface, 'agent1')).not.toContain('+2 done')
+      await ui.unmount()
+    })
+
+    test(`two presses 500 ms apart are two single clicks (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeDefined()
+      await w.clock.advance(500)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+      expect(await drawn(ui, surface, 'agent2')).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`a double-click keeps the transcript that was open; on a childless row it does nothing (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent4' })
+      await w.clock.advance(1000)
+      await double(ui, 'agent1')
+      await w.clock.settle()
+      expect(await drawn(ui, surface, 'agent2')).toBe(false)
+      expect(await ui.find({ key: 'transcript:agent4' })).toBeDefined()
+      await w.clock.advance(1000)
+      await double(ui, 'agent4')
+      await w.clock.settle()
+      expect(await ui.find({ key: 'transcript:agent4' })).toBeDefined()
+      expect(await drawn(ui, surface, 'agent4')).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`main collapses its finished top-level agents and keeps a running one (${surface})`, async ($, on) => {
+      const w = world(on)
+      await crew($, w)
+      await step($)
+      await complete($, 'agent4', 'R4')
+      await complete($, 'agent1', 'R1')
+      await spawn($, { prompt: 'P5', name: 'impl-5' })
+      await step($, 'agent5')
+      w.agents = [{ id: 'agent5', name: 'impl-5' }]
+      await w.clock.advance(30_000)
+      const ui = await mountPane($, surface)
+      expect(await ui.find({ key: 'agent:main' })).toBeDefined()
+      await double(ui, 'main')
+      for (const n of [1, 2, 3, 4]) expect(await drawn(ui, surface, `agent${n}`)).toBe(false)
+      expect(await drawn(ui, surface, 'agent5')).toBe(true)
+      expect(await rowText(ui, surface, 'main')).toContain('+4 done')
+      await ui.unmount()
+    })
+
+    test(`a collapsed row counts a child that finishes later (${surface})`, async ($, on) => {
+      const w = world(on)
+      await crew($, w)
+      const ui = await mountPane($, surface)
+      await double(ui, 'agent1')
+      await complete($, 'agent4', 'R4')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }]
+      await w.clock.advance(30_000)
+      expect(await rowText(ui, surface, 'agent1')).toContain('+3 done')
+      expect(await drawn(ui, surface, 'agent4')).toBe(false)
+      await ui.unmount()
+    })
+  }
+
+  test('terminal: a narrow, nested, resumed, collapsed row keeps its name visible', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await spawn($, { prompt: 'P3', name: 'impl-3', parentAgentId: 'agent2' })
+    await spawn($, { prompt: 'P4', name: 'impl-4', parentAgentId: 'agent3' })
+    for (const n of [2, 3, 4]) await step($, `agent${n}`)
+    await complete($, 'agent4', 'R4')
+    await complete($, 'agent3', 'R3')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+    await w.clock.advance(30_000)
+    await step($, 'agent3') // resumed: running again, with its ↻
+    expect(row(w, 'agent3')!.resumedAt).toBeDefined()
+    const ui = await mountPane($, 'terminal', 40)
+    await double(ui, 'agent3')
+    expect(await drawn(ui, 'terminal', 'agent4')).toBe(false)
+    const button = walk(await ui.drawn()).find(b => b.props?.key === 'agent:agent3')!
+    const name = textOf((button.children as Drawn[])[1])
+    expect(name).toContain('impl')
+    // glyph and name still fill exactly the NAME columns
+    expect(textOf(button)).toHaveLength(12)
+    await ui.unmount()
+  })
+
+  test('two presses dispatched together still count as a double-click', async ($, on) => {
+    const w = world(on)
+    await crew($, w)
+    const ui = await mountPane($, 'desktop')
+    await Promise.all([ui.press({ key: 'agent:agent1' }), ui.press({ key: 'agent:agent1' })])
+    await w.clock.settle()
+    expect(await ui.find({ key: 'agent:agent2' })).toBeUndefined()
+    expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('collapse is display only and persists across a remount', async ($, on) => {
+    const w = world(on)
+    await crew($, w)
+    let ui = await mountPane($, 'desktop')
+    const header = (await ui.findAll({ type: 'Text' })).find(t => t.text.includes('live'))!.text
+    await double(ui, 'agent1')
+    expect((await ui.findAll({ type: 'Text' })).find(t => t.text.includes('live'))!.text).toBe(header)
+    const roster = w.files.get(`${RUN_DIR}/roster.md`) ?? ''
+    expect(roster).toContain('agent2')
+    expect(snapshot(w).agents.map(a => a.id)).toEqual(expect.arrayContaining(['agent2', 'agent3']))
+    await ui.unmount()
+    ui = await mountPane($, 'desktop')
+    expect(await ui.find({ key: 'agent:agent2' })).toBeUndefined()
+    await ui.press({ key: 'handover:agent4' })
+    expect(row(w, 'agent4')!.status).toBe('handing-over')
+    await ui.unmount()
+  })
+})
+
+describe('repeated answers', () => {
+  test('two identical answers show the times each was seen', async ($, on) => {
+    const w = world(on)
+    const said = { role: 'assistant', text: 'Still working', toolUses: [] }
+    on('session.messages', () => ({ value: [{ role: 'user', text: 'go', toolUses: [] }, said, said] as never }))
+    await running($, w)
+    w.answer = 'Still working'
+    await w.clock.advance(5 * 60_000)
+    const t1 = w.clock.now()
+    await step($, 'agent1')
+    await w.clock.advance(5 * 60_000)
+    const t2 = w.clock.now()
+    await step($, 'agent1')
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    const text = (await ui.find({ key: 'transcript:agent1' }))!.text
+    expect(text).toContain(`${hhmm(t1)} Still working`)
+    expect(text).toContain(`${hhmm(t2)} Still working`)
+    await ui.unmount()
+  })
+})
+
+describe('delivery from timers', () => {
+  const MIN = 60_000
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  const checkins = (w: World) => w.sent.filter(m => m.to.includes('agent1') && m.text.includes('check-in'))
+  const nudges = (w: World) => w.prompts.filter(p => p.startsWith('[orchestrator mod]') && p.includes('queued'))
+
+  test('a check-in fired by sync is queued, not sent, until a turn ends', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(6 * MIN)
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    expect(checkins(w)).toHaveLength(0)
+    // a step or a tool call does not deliver: a run woken from inside one would lose that hook
+    await tool($, 'agent2')
+    await step($, 'agent2')
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(0)
+    await complete($, 'agent2', 'R')
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  test('with no hook to deliver it, the next sync submits one marked prompt to main, and only once', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    // the sync at exactly 5 min fires it: queued, nothing submitted yet
+    await w.clock.advance(5 * MIN)
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    expect(nudges(w)).toHaveLength(0)
+    await w.clock.advance(30_000)
+    expect(nudges(w)).toHaveLength(1)
+    await w.clock.advance(90_000)
+    expect(nudges(w)).toHaveLength(1)
+    expect(checkins(w)).toHaveLength(0)
+    // main's hooked turn delivers it as it ends
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+    await w.clock.advance(90_000)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('hooks running together deliver a queued message once', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(6 * MIN)
+    await Promise.all([complete($, undefined), complete($, undefined), step($, 'agent1')])
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  test('a delivery that fails is warned, not retried forever, and never thrown into the hook', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(6 * MIN)
+    w.sendFails = 'throw'
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(w.toasts.some(t => t.includes('check-in') && t.includes('not delivered'))).toBe(true)
+    w.sendFails = ''
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(0)
+  })
+})
+
+describe('delivery from timers: hardening', () => {
+  const MIN = 60_000
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  const checkins = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes('check-in'))
+  /** Moves the clock with the spy on: any send meanwhile came from a timer callback. */
+  const tick = async (w: World, ms: number) => {
+    w.inTimer = true
+    try {
+      await w.clock.advance(ms)
+    } finally {
+      w.inTimer = false
+    }
+  }
+
+  test('the pane Hand over press sends from the ui.press hook, not the button closure', async ($, on) => {
+    const w = world(on)
+    // Beneath the plugin, this answers every press: a button's own closure never runs.
+    on('ui.press', ($, e) => ({ element: e.element }) as never)
+    await running($, w)
+    await complete($, 'agent1')
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'handover:agent1' })
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('HANDOVER'))).toBe(true)
+    await ui.unmount()
+  })
+
+  test('no send is ever made from a timer callback', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await tick(w, 6 * MIN)
+    await complete($, undefined)
+    await tick(w, 30_000)
+    await complete($, undefined)
+    await tick(w, 2 * MIN)
+    expect(checkins(w)).toHaveLength(1)
+    expect(w.timerSends).toEqual([])
+  })
+
+  test('no nudge while main is mid-turn', async ($, on) => {
+    const w = world(on)
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await $.turn.start({ text: 'go', turnId: 'T' })
+    await w.clock.advance(7 * MIN)
+    expect(w.prompts.filter(p => p.includes('queued messages'))).toHaveLength(0)
+  })
+
+  test('a send that never answers does not stop later deliveries', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * MIN)
+    w.hangNext = true
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * MIN)
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(2)
+  })
+
+  /**
+   * Stands in for /clear's wipe of the session's state, which the kit does not do: once `wipe()` is
+   * called, every orchestrator key reads as unset until the plugin writes it again.
+   */
+  const wipeable = (on: Parameters<typeof world>[0]) => {
+    let wiped: Set<string> | undefined
+    on('state.get', async ($, e, next) => {
+      const res = (await next(e)) as { value?: { value: unknown; version: number } }
+      const k = (e as unknown as { key: string }).key
+      if (!wiped?.has(k) || !res.value) return res as never
+      return { value: { value: undefined, version: res.value.version } } as never
+    })
+    on('state.set', async ($, e, next) => {
+      const res = await next(e)
+      wiped?.delete((e as unknown as { key: string }).key)
+      return res
+    })
+    return () => {
+      wiped = new Set(['agents', 'log', 'mainPhase', 'runId', 'outbox', 'selectedAgent', 'transcripts', 'collapsed', 'toolView', 'pinnedLog', 'mainQueued'])
+    }
+  }
+
+  test('a queued message survives a /clear: restore brings it back and it is delivered exactly once', async ($, on) => {
+    const w = world(on)
+    const wipe = wipeable(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * MIN)
+    expect(checkins(w)).toHaveLength(0)
+    wipe()
+    await step($) // restores from state.json
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(row(w, 'agent2')).toBeDefined()
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  test('a delivered message is not delivered again by a restore that finds it in an older state.json', async ($, on) => {
+    const w = world(on)
+    const wipe = wipeable(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * MIN)
+    const stale = w.files.get(STATE)!
+    expect(stale).toContain('check-in')
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+    // a persist that read the queue before the drain lands last
+    w.files.set(STATE, stale)
+    wipe()
+    await step($)
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+  })
+
+  test('the outbox is written to state.json, so a restore after /clear keeps it', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * MIN)
+    const saved = JSON.parse(w.files.get(STATE)!) as { outbox?: { agentId: string; text: string }[] }
+    expect(saved.outbox).toHaveLength(1)
+    expect(saved.outbox![0]!.agentId).toBe('agent1')
+    await complete($, undefined)
+    await w.clock.settle()
+    expect((JSON.parse(w.files.get(STATE)!) as { outbox?: unknown[] }).outbox ?? []).toHaveLength(0)
+  })
+
+  for (const [what, change, sends] of [
+    ['is sent while the row still waits for it', {}, 1],
+    ['is not sent once a tool result carried it', { handoverVia: 'tool' }, 0],
+    ['is not sent once the agent was replaced', { status: 'replaced' }, 0],
+  ] as const) {
+    test(`a queued HANDOVER ${what}`, async ($, on) => {
+      const w = world(on)
+      const wipe = wipeable(on)
+      await start($)
+      await spawn($, { prompt: 'P', name: 'impl-1' })
+      w.tokens.set('agent1', 460_000)
+      await step($, 'agent1')
+      const saved = JSON.parse(w.files.get(STATE)!) as { agents: AgentRow[]; outbox?: unknown[] }
+      expect(saved.agents.find(a => a.id === 'agent1')).toEqual(expect.objectContaining({ status: 'handing-over' }))
+      saved.agents = saved.agents.map(a => (a.id === 'agent1' ? { ...a, ...change } : a))
+      saved.outbox = [{ kind: 'handover', agentId: 'agent1', text: 'HANDOVER queued', what: 'impl-1: HANDOVER not delivered', t: 1, id: 'q-1' }]
+      w.files.set(STATE, JSON.stringify(saved))
+      wipe()
+      await step($) // restores from state.json
+      await complete($, undefined)
+      await w.clock.settle()
+      expect(w.sent.filter(m => m.text === 'HANDOVER queued')).toHaveLength(sends)
+    })
+  }
+})
+
+describe('delivery waits for the engine', () => {
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  const checkins = (w: World) => w.sent.filter(m => m.to.includes('agent1') && m.text.includes('check-in'))
+
+  for (const hook of ['turn.step', 'tool.call'] as const) {
+    test(`${hook} never delivers; the next turn end does`, async ($, on) => {
+      const w = world(on)
+      await family($, w)
+      await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+      await w.clock.advance(5 * 60_000)
+      if (hook === 'turn.step') await step($, 'agent2')
+      else await tool($, 'agent2')
+      await w.clock.settle()
+      expect(checkins(w)).toHaveLength(0)
+      await complete($, undefined)
+      await w.clock.settle()
+      expect(checkins(w)).toHaveLength(1)
+    })
+  }
+
+  test('/orch delivers what is queued', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 5 })
+    await w.clock.advance(5 * 60_000)
+    await $.command.run({ command: 'orch', args: 'roster' } as never)
+    await w.clock.settle()
+    expect(checkins(w)).toHaveLength(1)
+  })
+})
+
+describe('deliveries from a turn end go through the outbox', () => {
+  /** The outboxes state.json held over time, flattened. */
+  const queued = (w: World) =>
+    w.writes.flatMap(t => ((JSON.parse(t) as { outbox?: Record<string, unknown>[] }).outbox ?? []) as Record<string, unknown>[])
+
+  test("a child's final answer is queued, then delivered once by the same turn end", async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await step($, 'agent2')
+    await complete($, 'agent2', 'R: green')
+    await w.clock.settle()
+    expect(queued(w).some(d => String(d.text).includes('R: green'))).toBe(true)
+    expect(w.sent.filter(m => m.text.includes('R: green'))).toHaveLength(1)
+  })
+
+  test('a respawn is queued, then spawned once by the same turn end', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(queued(w).some(d => d.kind === 'respawn' && d.agentId === 'agent1')).toBe(true)
+    expect(w.spawns).toHaveLength(2)
+    expect(row(w, 'agent2')!.replaces).toBe('agent1')
+  })
+
+  test('a respawn from the drain carries the check-in over and tells the parent', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent1', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 30 })
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    await w.clock.settle()
+    expect(queued(w).some(d => d.kind === 'respawn' && d.agentId === 'agent2')).toBe(true)
+    expect(row(w, 'agent3')).toEqual(expect.objectContaining({ replaces: 'agent2', checkinBy: 'agent1', checkinMins: 30 }))
+    expect(row(w, 'agent3')!.checkinAt).toBeDefined()
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('agent3') && m.text.includes('handed over'))).toBe(true)
+  })
+
+  test('a respawn that never answers does not hold the turn end past the timeout', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    w.hangSpawn = true
+    let done = false
+    const end = complete($, 'agent1', 'HANDED OVER').then(() => {
+      done = true
+    })
+    await w.clock.advance(9_000)
+    expect(done).toBe(false)
+    await w.clock.advance(2_000)
+    await end
+    expect(done).toBe(true)
+    expect(w.spawns).toHaveLength(2)
+    expect(w.toasts.some(t => t.includes('outbox') && t.includes('still running'))).toBe(true)
+  })
+
+  test('a HANDOVER sent after the run ended is queued, and its stall clock starts at delivery', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1') // handing over; it ends before any tool result carries it
+    await w.clock.advance(10 * 60_000)
+    const ended = w.clock.now()
+    await complete($, 'agent1', 'stopped')
+    await w.clock.settle()
+    const write = w.writes.find(t => ((JSON.parse(t) as { outbox?: { kind?: string }[] }).outbox ?? []).some(d => d.kind === 'handover'))
+    expect(write).toBeDefined()
+    // while queued, no stall clock runs
+    expect((JSON.parse(write!) as { agents: AgentRow[] }).agents.find(a => a.id === 'agent1')!.handoverAt).toBeUndefined()
+    expect(w.sent.filter(m => m.to.includes('agent1') && m.text.includes('HANDOVER'))).toHaveLength(1)
+    expect(row(w, 'agent1')).toEqual(expect.objectContaining({ handoverVia: 'message', handoverAt: ended }))
   })
 })

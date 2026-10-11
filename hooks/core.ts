@@ -45,7 +45,11 @@ export const recordStep = (rows: AgentRow[], step: Step): AgentRow[] => {
       ? r
       : {
           ...r,
-          status: r.status === 'idle' ? 'running' : r.status,
+          // A step proves it alive: idle wakes, and done was resumed by a message. A stalled
+          // handover stays stalled: its run's end checks for the note it may still be writing and
+          // marks it replaced or done, which running would skip (its end would only set idle).
+          status: r.status === 'idle' || r.status === 'done' ? 'running' : r.status,
+          ...(r.status === 'done' ? { resumedAt: step.t } : {}),
           tokens: step.tokens,
           peak: Math.max(r.peak, step.tokens),
           steps: r.steps + 1,
