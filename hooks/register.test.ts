@@ -854,7 +854,12 @@ describe('agent in view', () => {
     new Map(
       walk(await ui.drawn())
         .filter(b => b.type === 'Box' && typeof b.props?.key === 'string' && /^(main|agent\d+)$/.test(b.props.key as string))
-        .map(b => [b.props!.key as string, (b.children![0] as Drawn).props ?? {}]),
+        .map(b => {
+          // A subagent's name cell sits inside its pressable Button; main's is the bare Text.
+          const first = b.children![0] as Drawn
+          const cell = first.type === 'Button' ? (first.children![0] as Drawn) : first
+          return [b.props!.key as string, cell.props ?? {}]
+        }),
     )
 
   test('desktop: the agent in view is marked and its line highlighted', async ($, on) => {
@@ -932,6 +937,147 @@ describe('agent in view', () => {
       })
     }
   }
+})
+
+describe('agent transcript', () => {
+  const DENIED = 'transcript not readable (teammate in another pane, or finished)'
+  const transcript = [
+    { role: 'user', text: 'Implement task 1', toolUses: [] },
+    {
+      role: 'assistant',
+      text: 'Reading the plan',
+      toolUses: [
+        { tool_use_id: 'a', tool: 'Read', input: {} },
+        { tool_use_id: 'b', tool: 'Bash', input: {} },
+        { tool_use_id: 'c', tool: 'Bash', input: {} },
+      ],
+    },
+    { role: 'assistant', text: 'Tests are red, as expected', toolUses: [] },
+  ]
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`pressing an agent opens its transcript beneath it; pressing again closes it (${surface})`, async ($, on) => {
+      const w = world(on)
+      const asked: (string | undefined)[] = []
+      on('session.messages', ($, e) => {
+        asked.push(e.agentId)
+        return { value: transcript as never }
+      })
+      await running($, w)
+      const ui = await mountPane($, surface)
+      expect(await ui.find({ key: 'peek:agent1' })).toBeUndefined()
+      await ui.press({ key: 'agent:agent1' })
+      const peek = (await ui.find({ key: 'peek:agent1' }))!
+      expect(peek).toBeDefined()
+      expect(peek.text).toContain('Tests are red, as expected')
+      expect(peek.text).toContain('⚙ Read, Bash×2 · Reading the plan')
+      expect(asked).toContain('agent1')
+      await ui.press({ key: 'agent:agent1' })
+      expect(await ui.find({ key: 'peek:agent1' })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`a transcript the session cannot read says so (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: { deny: 'agent1 runs in another process' } }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+      await ui.unmount()
+    })
+
+    test(`an empty transcript says there is nothing yet (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: [] }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('no messages yet')
+      await ui.unmount()
+    })
+
+    test(`a read that fails reads as not readable and the pane still draws (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => {
+        throw new Error('no such op')
+      })
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain(DENIED)
+      expect(await ui.find({ text: /impl-1/ })).toBeDefined()
+      await ui.unmount()
+    })
+  }
+
+  // The room arithmetic counts each dim line as one row: in a narrow pane they must truncate, not wrap.
+  for (const [what, value] of [
+    ['not readable', { deny: 'agent1 runs in another process' }],
+    ['empty', []],
+  ] as const) {
+    test(`terminal: the ${what} line keeps to one row in a narrow pane`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: value as never }))
+      await running($, w)
+      const ui = await mountPane($, 'terminal', 40)
+      await ui.press({ key: 'agent:agent1' })
+      type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+      const walk = (n: unknown): Drawn[] =>
+        n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+      const box = walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === 'peek:agent1')!
+      const lines = walk(box).filter(b => b.type === 'Text')
+      expect(lines).toHaveLength(1)
+      expect(lines[0]!.props?.wrap).toBe('truncate')
+      await ui.unmount()
+    })
+  }
+
+  test('terminal: main has no transcript button', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    await step($)
+    const ui = await mountPane($, 'terminal')
+    expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
+    expect(await ui.find({ key: 'agent:main' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('desktop: pressing main highlights it but opens no transcript', async ($, on) => {
+    const w = world(on)
+    let asked = 0
+    on('session.messages', () => {
+      asked++
+      return { value: transcript as never }
+    })
+    await running($, w)
+    await step($)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:main' })
+    expect(await ui.find({ key: 'peek:main' })).toBeUndefined()
+    expect(asked).toBe(0)
+    await ui.unmount()
+  })
+
+  test('terminal: an open transcript takes its rows from the activity', async ($, on) => {
+    world(on)
+    on('session.messages', () => ({ value: transcript as never }))
+    await start($)
+    for (let i = 1; i <= 12; i++) await spawn($, { prompt: 'P', name: `impl-${i}` })
+    const ui = await mountPane($, 'terminal', 80)
+    type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+    const walk = (n: unknown): Drawn[] =>
+      n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+    const activity = async () =>
+      walk(await ui.drawn()).filter(
+        b => b.type === 'Text' && b.props?.wrap === 'truncate' && (b.children ?? []).some(c => typeof c === 'string' && c.includes('spawned')),
+      ).length
+    const ROOM = 30 - 12 - 8 - 1 // the Hand over main button's row, as in 'terminal pane header'
+    expect(await activity()).toBe(ROOM)
+    await ui.press({ key: 'agent:agent1' })
+    expect(await activity()).toBe(ROOM - (3 + 2)) // three message lines inside a border
+    await ui.unmount()
+  })
 })
 
 describe('terminal pane header', () => {

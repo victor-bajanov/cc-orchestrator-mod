@@ -30,6 +30,7 @@ import {
   logId,
   mainButtonShown,
   paneHeader,
+  peekLines,
   seriesColors,
 } from './view'
 
@@ -45,7 +46,7 @@ const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'i
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 /** The activity line whose full-text card a click pinned open ('' for none). */
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
-/** The agent whose chart line the desktop pane highlights ('' for none). */
+/** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
 /** Mirrors `mainHandoverQueued` for drawing: the buttons say a handover waits on this turn. */
 const queuedAtom = atom({ plugin: 'orchestrator', key: 'mainQueued' } as const, false)
@@ -152,6 +153,22 @@ function togglePinned($: $, id: string) {
 
 function toggleSelected($: $, id: string) {
   return update($, selectedAtom, s => (s === id ? '' : id))
+}
+
+/** What the pane shows when an agent's transcript cannot be read. */
+export const PEEK_DENIED = 'transcript not readable (teammate in another pane, or finished)'
+
+/**
+ * An agent's last `n` messages as pane lines, read while drawing (reads are allowed there).
+ * A `{ deny }` (a teammate in another pane's process, a finished agent) or a failed read is `{ deny }`.
+ */
+async function peekOf($: $, id: string, width: number, n: number): Promise<{ lines: string[] } | { deny: string }> {
+  try {
+    const found = await $.session.messages({ agentId: id })
+    return 'deny' in found ? { deny: found.deny } : { lines: peekLines(found, width, n) }
+  } catch (err) {
+    return { deny: String(err) }
+  }
 }
 
 // ---- subagents -------------------------------------------------------
@@ -625,6 +642,8 @@ export const register: Register = (on, options) => {
         selected: hl,
       })
       const fits = cols - 6
+      // Main is the main view already: only a subagent's transcript is shown.
+      const peek = selected && selected !== 'main' ? await peekOf($, selected, fits, 8) : undefined
       return (
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -644,10 +663,10 @@ export const register: Register = (on, options) => {
             <Svg key="chart" isInteractive source={chart.source} alt={chart.alt} width={chart.width} height={chart.height} />
           )}
           <Box flexDirection="column">
-            {orderRows(rows).map(({ row, depth }) => {
+            {orderRows(rows).flatMap(({ row, depth }) => {
               const ceiling = ceilingOf(row, cfg)
               const pct = Math.round((row.tokens / ceiling) * 100)
-              return (
+              return [
                 <Box key={`row:${row.id}`} flexDirection="row" paddingLeft={depth * 2} gap={1}>
                   <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
@@ -666,8 +685,23 @@ export const register: Register = (on, options) => {
                       onPress={() => startHandover($, row.id, 'from the pane')}
                     />
                   )}
-                </Box>
-              )
+                </Box>,
+                peek && selected === row.id && (
+                  <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" marginLeft={depth * 2}>
+                    {'deny' in peek ? (
+                      <Text dimColor>{PEEK_DENIED}</Text>
+                    ) : peek.lines.length === 0 ? (
+                      <Text dimColor>no messages yet</Text>
+                    ) : (
+                      peek.lines.map((l, j) => (
+                        <Text key={`p${j}`} wrap="truncate">
+                          {l}
+                        </Text>
+                      ))
+                    )}
+                  </Box>
+                ),
+              ]
             })}
           </Box>
           <Box flexDirection="column">
@@ -718,8 +752,12 @@ export const register: Register = (on, options) => {
       done: '✓',
       stalled: '!',
     }
+    const selected = liveSelection(rows, await read($, selectedAtom))
+    // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.
+    const peek = selected && selected !== 'main' ? await peekOf($, selected, Math.max(10, cols - 4), 5) : undefined
+    const peekRows = peek ? ('lines' in peek ? Math.max(1, peek.lines.length) : 1) + 2 : 0
     // The header's button can wrap onto a row of its own.
-    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0))
+    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0) - peekRows)
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -733,22 +771,50 @@ export const register: Register = (on, options) => {
           )}
         </Box>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
-        {ordered.map(({ row, depth }) => {
+        {ordered.flatMap(({ row, depth }) => {
           const ceiling = ceilingOf(row, cfg)
           const live = LIVE.includes(row.status)
           const name = `${'  '.repeat(depth)}${glyph[row.status]} ${label(row)}`
-          return (
+          const cell = (
+            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
+              {name.slice(0, NAME).padEnd(NAME)}
+            </Text>
+          )
+          return [
             <Box key={row.id}>
-              <Text dimColor={!live} inverse={viewed === row.id} wrap="truncate">
-                {name.slice(0, NAME).padEnd(NAME)}
-              </Text>
+              {row.id === 'main' ? (
+                cell
+              ) : (
+                <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
+                  {cell}
+                </Button>
+              )}
               <Text dimColor={!live}>{fmtTokens(row.tokens).padStart(6)} </Text>
               <Text color={live ? tone[level(row.tokens, ceiling)] : 'subtle'}>
                 {timeline(row.samples, width, t0, now, ceiling, live)}
               </Text>
               <Text dimColor> {row.status.padEnd(12)}</Text>
-            </Box>
-          )
+            </Box>,
+            peek && selected === row.id && (
+              <Box key={`peek:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
+                {'deny' in peek ? (
+                  <Text dimColor wrap="truncate">
+                    {PEEK_DENIED}
+                  </Text>
+                ) : peek.lines.length === 0 ? (
+                  <Text dimColor wrap="truncate">
+                    no messages yet
+                  </Text>
+                ) : (
+                  peek.lines.map((l, j) => (
+                    <Text key={`p${j}`} wrap="truncate">
+                      {l}
+                    </Text>
+                  ))
+                )}
+              </Box>
+            ),
+          ]
         })}
         <Text dimColor>
           {' '.repeat(NAME + 7)}

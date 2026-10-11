@@ -65,7 +65,7 @@ Hard ceiling 500k tokens per agent; the mod acts at `agentThreshold` (450k).
 
 **Rosters.** The orchestrator's task roster (`<scratchpad>/<task>/roster.md`): one line per agent with name, id, role, task and status. It maps agents to roles. The mod's run roster (`.orchestrator/<run>/roster.md`, also `/orch roster`) has each agent's status, context, peak, note path and replaced-by links.
 
-**Tools:** `/orch` opens the pane (agent tree, context over time, activity log) and `/orch close` closes it; `/orch handover <name or id>` hands an agent over now; `/orch handover` restarts the main session. In ask mode the pane has a `Hand over main` button on both the terminal and the desktop app. In the desktop app the pane also shows a context chart and a `Hand over` button beside each live subagent, which do what `/orch handover` does, so `/orch` is optional there.
+**Tools:** `/orch` opens the pane (agent tree, context over time, activity log; clicking a subagent shows its last messages there, for the person, not your context) and `/orch close` closes it; `/orch handover <name or id>` hands an agent over now; `/orch handover` restarts the main session. In ask mode the pane has a `Hand over main` button on both the terminal and the desktop app. In the desktop app the pane also shows a context chart and a `Hand over` button beside each live subagent, which do what `/orch handover` does, so `/orch` is optional there.
 
 ## 4. Main session while it runs
 

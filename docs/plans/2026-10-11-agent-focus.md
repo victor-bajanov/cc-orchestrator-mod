@@ -213,3 +213,40 @@ npx -p typescript@5.6.3 tsc -p .
 - **`Pane.view` on the desktop is unverified.** 2.1.295 ships no `.d.ts`, and the type doc mentions only "the tasks list". The mod degrades to no mark (D5's optional chaining, test 4). The manual desktop check records the outcome.
 - **A teammate's `view.agentId` might not match our row id** if the host keys teammates differently. T:11882 says it is the `agentId` the loop's events carry, which is what rows use. If the manual check shows a mismatch, fall back to matching `$.agent.list()` (`id` or `teammateId`) in a follow-up.
 - **The terminal header becomes a row with a Button.** On a narrow pane the button wraps onto its own line, which costs one row of activity. This is accepted.
+
+## Task 4: in-pane transcript (option P, approved)
+
+The user approved Escalation P: clicking an agent in the Orchestrator pane shows that agent's transcript inside the pane, on both surfaces, read with `$.session.messages({ agentId })` (finding 4). No main-view switching. The *in view* mark (Task 2) stays.
+
+**Scope:** `hooks/view.ts`, `hooks/view.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `types/index.d.ts` (doc comment only), `README.md`, `skills/orchestrated-run/SKILL.md`. The version bump (0.3.0, D9) stays the orchestrator's.
+
+### Decisions
+
+| # | Decision | Rationale |
+| --- | --- | --- |
+| P1 | **No new state.** The click selection `selectedAtom` (`selectedAgent`) is the open-transcript target on both surfaces; `toggleSelected` opens and closes it. Only its doc comment in `types/index.d.ts` changes. | One click, one meaning: the desktop's highlight and the transcript are the same selection. The `peekAgent` key the escalation sketched is not needed. |
+| P2 | **Pure helper** `peekLines(messages, width, n): string[]` in `view.ts`. It drops messages with no text and no tool use (tool-result-only user rows), keeps the last `n`, and draws each as one line: `role: ` then, when it called tools, `⚙ Read, Bash×2 · ` (counts per tool, in first-use order), then its text with whitespace collapsed; a line longer than `width` is cut with `cut`. Tools come before the text so the cut never hides them. | Testable without mounting; one line per message keeps the terminal row budget exact. |
+| P3 | **The read** is a top-level `peekOf($, id, width, n)` in `register.tsx`, called while drawing (reads are allowed there). It answers `{ lines }` or `{ deny }`; a `{ deny }` result or a throw both read as unreadable. | The `$` invariant; a host without the op or a kit with no stub must not break the pane. |
+| P4 | **Unreadable** (`deny`): one dim line `transcript not readable (teammate in another pane, or finished)`. **Empty:** one dim line `no messages yet`. | The caller's wording; empty is not an error. |
+| P5 | **Main is never peeked.** On the desktop main's row stays a Button (it still highlights its chart line); no transcript is drawn for it. On the terminal main's name is plain Text. | Main is the main view already. |
+| P6 | **Desktop:** the transcript is a `Box key="peek:<id>" borderStyle="round"` in flow directly beneath the selected row, `n = 8`, width `cols - 6`, lines `wrap="truncate"`. A second click closes it. | As the activity card already expands in flow. |
+| P7 | **Terminal:** each non-main row's name cell becomes `<Button key="agent:<id>" plain onPress={toggleSelected}>` holding the same name `Text` (still `inverse` when in view; `bold` when open). The transcript is a `Box key="peek:<id>" borderStyle="round"` beneath the row, `n = 5`, inner width `cols - 4`. **Room:** an open transcript costs `lines + 2` rows (border), taken from the activity's `room` (floor 3 kept). | Buttons in a terminal pane are supported (plain, Text children). Honest row budget. |
+| P8 | A selection naming a row no longer listed opens nothing (`liveSelection`, as for the highlight). | Stale selection guard, unchanged. |
+
+### Failing tests to write first
+
+`view.test.ts`, `describe('peekLines')`:
+1. `[]` gives `[]`; a user row with only `toolResults` and no text is dropped.
+2. Keeps the last `n` drawable messages, oldest first.
+3. Role prefix and collapsed whitespace: `{ role: 'assistant', text: 'a\n  b' }` gives `assistant: a b`.
+4. Tool summary before the text: two Bash and one Read give `assistant: ⚙ Bash×2, Read · text`; tools with no text give `assistant: ⚙ Bash×2, Read`.
+5. A long line is cut to exactly `width` characters ending in `…`; a short one is untouched.
+
+`register.test.ts`, `describe('agent transcript')`, looped over `terminal` and `desktop` where noted, with `on('session.messages', …)` stubs:
+1. (both) No `peek:agent1` until `agent:agent1` is pressed; then its text holds the agent's last message and a tool summary; pressing again removes it. The stub saw `agentId: 'agent1'`.
+2. (both) A `{ deny }` answer draws `transcript not readable (teammate in another pane, or finished)`.
+3. (both) An empty transcript draws `no messages yet`.
+4. (both) A stub that throws reads as not readable; the pane still draws.
+5. (terminal) Main has no `agent:main` Button; (desktop) pressing `agent:main` draws no `peek:main`.
+6. (terminal) An open transcript takes its rows from the activity: with twelve agents logged, opening a three-message transcript leaves `ROOM - 1 - (3 + 2)` activity lines.
+7. The existing terminal `names` helper descends into the row's Button so the in-view `inverse` checks keep passing.

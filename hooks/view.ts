@@ -1,3 +1,5 @@
+import type { SessionMessage } from 'claude-code'
+
 import type { AgentRow, AgentStatus, LogEntry, MainPhase, Sample } from '../types'
 import { fmtTokens, label } from './core'
 
@@ -41,6 +43,32 @@ export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 1
 
 /** An activity line cut to `fits` characters, ending in an ellipsis. */
 export const cut = (text: string, fits: number): string => `${text.slice(0, Math.max(1, fits - 1))}…`
+
+/** `Bash×2, Read`: each tool once, in first-use order, with its count past one. */
+const toolSummary = (uses: SessionMessage['toolUses']): string => {
+  const counts = new Map<string, number>()
+  for (const u of uses) counts.set(u.tool, (counts.get(u.tool) ?? 0) + 1)
+  return [...counts].map(([tool, n]) => (n > 1 ? `${tool}×${n}` : tool)).join(', ')
+}
+
+/**
+ * An agent's last `n` messages, one line each, for the pane's transcript peek:
+ * `role: ⚙ tools · text`, whitespace collapsed, cut to `width`. Messages with no
+ * text and no tool use (a user row of tool results alone) are left out.
+ */
+export const peekLines = (messages: readonly SessionMessage[], width: number, n: number): string[] =>
+  messages
+    .map(m => {
+      const text = m.text.replace(/\s+/g, ' ').trim()
+      const tools = m.toolUses.length ? `⚙ ${toolSummary(m.toolUses)}` : ''
+      return { m, body: [tools, text].filter(Boolean).join(' · ') }
+    })
+    .filter(x => x.body !== '')
+    .slice(-n)
+    .map(({ m, body }) => {
+      const line = `${m.role}: ${body}`
+      return line.length > width ? cut(line, width) : line
+    })
 
 /** The context limit a row is held to: main's for main, the agents' otherwise. */
 export const ceilingOf = (r: AgentRow, t: { agentThreshold: number; mainThreshold: number }): number =>
