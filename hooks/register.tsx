@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
-import { toolDetail } from './detail'
+import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
   HANDOVER_CLAUSE,
@@ -105,6 +105,34 @@ const canHandOver = (r: AgentRow) => r.id !== 'main' && isActive(r)
 /** The selection, or '' when it names no row (so a stale one fades no line). */
 export const liveSelection = (rows: readonly AgentRow[], selected: string) =>
   rows.some(r => r.id === selected) ? selected : ''
+
+/** A dispatch this plugin raised (`next.origin`, as plugin.json names it); anything malformed is not. */
+export const isOwnOrigin = (origin: unknown): boolean =>
+  typeof origin === 'object' && origin !== null && (origin as { plugin?: unknown }).plugin === 'orchestrator'
+
+/** One of the mod's sends in flight. */
+export type OwnSend = { agentId: string; text: string }
+
+/**
+ * Whether a SendMessage check is one of the mod's own sends: the exact text to a recipient one is in flight
+ * to; or, this plugin's origin and a send in flight to that recipient. The origin is never enough alone: it
+ * also covers the model inside an agent the mod spawned. `to` names a recipient as `namesAgent` does.
+ */
+export const isOwnSend = (o: {
+  origin: unknown
+  to: unknown
+  message: unknown
+  inFlight: readonly OwnSend[]
+  rows: readonly AgentRow[]
+}): boolean => {
+  const own = isOwnOrigin(o.origin)
+  const toward = (s: OwnSend) => {
+    if (typeof o.to === 'object' && o.to !== null) return (o.to as { agentId?: unknown }).agentId === s.agentId
+    return namesAgent(o.to, o.rows.find(a => a.id === s.agentId) ?? { id: s.agentId })
+  }
+  return o.inFlight.some(s => toward(s) && (own || (typeof o.message === 'string' && s.text === o.message)))
+}
+
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
@@ -146,7 +174,7 @@ let nudgedSinceDrain = false
  * SendMessage call, and the classifier refuses it because no user request asked for it. tool.check
  * allows exactly these sends, and only while they are in flight.
  */
-const ownSends: { agentId: string; text: string }[] = []
+const ownSends: OwnSend[] = []
 /** A SendMessage check went unmatched while the mod had a send in flight, and was logged: once per load. */
 let checkMissLogged = false
 /**
@@ -490,7 +518,7 @@ function detailBody($: $, ui: Ui, d: ToolDetail, copy?: { toolUseId: string }) {
             <Text dimColor bold>
               {sec.label}
             </Text>
-            {copy && copyButton($, ui, `sec:${copy.toolUseId}:${i}`, sec.kind === 'code' ? sec.source : sec.text)}
+            {copy && copyButton($, ui, `sec:${copy.toolUseId}:${i}`, bodyOf(sec))}
           </Box>
           {sec.kind === 'code' ? (
             <Code
@@ -587,12 +615,23 @@ function debugValue(v: unknown) {
 /** The mod's only way to send: marks the send as its own for tool.check while it is in flight. */
 async function sendOwn($: $, agentId: string, text: string) {
   const mark = { agentId, text }
+  const unmark = () => {
+    const i = ownSends.indexOf(mark)
+    if (i >= 0) ownSends.splice(i, 1)
+  }
   ownSends.push(mark) // synchronously, before any await
+  // A send that never answers allows nothing past DRAIN_TIMEOUT_MS.
+  let timer: { cancel: () => void } | undefined
+  try {
+    timer = $.clock.after(DRAIN_TIMEOUT_MS, unmark)
+  } catch {
+    // no timer: the mark lasts as long as the send
+  }
   try {
     return await $.session.send({ to: { agentId }, text })
   } finally {
-    const i = ownSends.indexOf(mark)
-    if (i >= 0) ownSends.splice(i, 1)
+    timer?.cancel()
+    unmark()
   }
 }
 
@@ -610,8 +649,8 @@ async function noticeRename($: $, id: string, requested: string | undefined, nam
     if (!requested || !name || name === requested) return
     const text = nameNotice(name, requested)
     if ((await read($, outboxAtom)).some(d => d.agentId === id && d.text === text)) return
-    await enqueue($, { agentId: id, text, what: `${name}: name notice not delivered` })
-    await log($, `"${requested}" was taken: ${id} is registered as ${name}; told it so`)
+    await enqueue($, { agentId: id, text, what: `${name}: name notice not delivered`, liveOnly: true })
+    await log($, `"${requested}" registered as ${name} (${id}); told it so`)
   } catch (err) {
     $.ui.log(`orchestrator: name notice not queued: ${String(err)}`)
   }
@@ -800,7 +839,14 @@ async function drain($: $) {
   delivered.splice(0, Math.max(0, delivered.length - DELIVERED_MAX))
   // A respawn or a HANDOVER changes rows: those are awaited (in a turn.complete, not a handover path).
   const changes: Promise<unknown>[] = []
+  // Read once, for live-only messages: one whose agent is no longer live is dropped (unread rows: dropped too).
+  let rows: AgentRow[] = []
+  if (taken.some(d => d.liveOnly)) rows = await read($, agentsAtom).catch(() => [])
   for (const d of taken) {
+    if (d.liveOnly && (d.kind ?? 'send') === 'send') {
+      const r = rows.find(a => a.id === d.agentId)
+      if (!r || !LIVE.includes(r.status)) continue
+    }
     if (d.kind === 'respawn') {
       changes.push(
         (d.row ? respawn($, d.row) : Promise.resolve()).catch(err => log($, `${d.what}: ${String(err)}`, 'warn')),
@@ -1119,8 +1165,12 @@ export const register: Register = (on, options) => {
     // The engine suffixes a taken name (`orchestrator` → `orchestrator-2`): SendMessage, check-ins and
     // reports go by the one it registered, which only its list says (F19).
     let name = e.name
+    // A teammate's address (`<name>@<team>`), which its SendMessage checks may name it by.
+    let teammateId = res.teammateId
     try {
-      name = (await $.agent.list()).find(a => a.id === id)?.name ?? e.name
+      const info = (await $.agent.list()).find(a => a.id === id)
+      name = info?.name ?? e.name
+      teammateId ??= info?.teammateId
     } catch {
       // the requested name stands
     }
@@ -1135,6 +1185,7 @@ export const register: Register = (on, options) => {
         parentId: e.parentAgentId ?? 'main',
         background: e.background,
         ...(e.isTeammate && { isTeammate: true }),
+        ...(typeof teammateId === 'string' && { teammateId }),
         brief: {
           prompt: e.prompt,
           subagentType: type,
@@ -1273,22 +1324,18 @@ export const register: Register = (on, options) => {
   on('tool.check', { tool: 'SendMessage' }, async ($, e, next) => {
     try {
       const input = (e.input ?? {}) as { to?: unknown; message?: unknown }
-      if (typeof input.message === 'string' && ownSends.length > 0) {
+      if (ownSends.length > 0) {
         const rows = await read($, agentsAtom)
-        const to = input.to
-        const mine = ownSends.some(s => {
-          if (s.text !== input.message) return false
-          if (typeof to === 'object' && to !== null) return (to as { agentId?: unknown }).agentId === s.agentId
-          const r = rows.find(a => a.id === s.agentId) ?? { id: s.agentId }
-          return namesAgent(to, r)
-        })
+        const mine = isOwnSend({ origin: next.origin, to: input.to, message: input.message, inFlight: ownSends, rows })
         if (mine) return { decision: 'allow', reason: 'orchestrator mod: its own message' }
       }
       if (ownSends.length > 0 && !checkMissLogged) {
         checkMissLogged = true
-        $.ui.log(
-          `orchestrator: SendMessage check not matched: to=${debugValue(input.to)} message=${debugValue(input.message)}`,
-        )
+        // No message text: the debug log may be shared, and a message can carry anything.
+        const length = typeof input.message === 'string' ? `${input.message.length} chars` : typeof input.message
+        $.ui.log(`orchestrator: SendMessage check not matched: to=${debugValue(input.to)} message=${length}`, {
+          to: 'debug',
+        })
       }
     } catch {
       // fall through to the engine's verdict

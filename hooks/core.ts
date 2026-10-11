@@ -176,7 +176,7 @@ export const replacementPrompt = (brief: Brief, notePath: string): string =>
 
 /** Tells an agent the engine registered it under a suffixed name, so its children report to the right one. */
 export const nameNotice = (name: string, requested: string): string =>
-  `[orchestrator mod] You are registered as \`${name}\` (\`${requested}\` was taken); tell your children to SendMessage \`${name}\`.`
+  `[orchestrator mod] You are registered as \`${name}\` (you asked for \`${requested}\`); tell your children to SendMessage \`${name}\`.`
 
 export const mainHandoverPrompt = (notePath: string): string =>
   [

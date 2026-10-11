@@ -169,7 +169,7 @@ describe('notePathFor', () => {
 describe('prompts', () => {
   test('nameNotice names the registered and the requested name', () => {
     expect(nameNotice('orchestrator-2', 'orchestrator')).toBe(
-      '[orchestrator mod] You are registered as `orchestrator-2` (`orchestrator` was taken); tell your children to SendMessage `orchestrator-2`.',
+      '[orchestrator mod] You are registered as `orchestrator-2` (you asked for `orchestrator`); tell your children to SendMessage `orchestrator-2`.',
     )
   })
   test('a replacement keeps the original brief and points at the note', () => {

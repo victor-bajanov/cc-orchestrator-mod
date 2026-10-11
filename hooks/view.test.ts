@@ -812,6 +812,20 @@ describe('namesAgent', () => {
     expect(namesAgent('agent2 [3fa9c1]', r)).toBe(true)
     expect(namesAgent('impl-3 [3fa9c1]', r)).toBe(false)
   })
+
+  test("a teammate is named by its address too: its teammateId, or its name at the address's team", () => {
+    const t = { ...row({ id: 'agent2', name: 'impl-2' }), teammateId: 'impl-2@s' }
+    expect(namesAgent('impl-2@s', t)).toBe(true)
+    expect(namesAgent('impl-2@s [3fa9c1]', t)).toBe(true)
+    expect(namesAgent('impl-2', t)).toBe(true)
+    expect(namesAgent('impl-2@other', t)).toBe(false)
+    expect(namesAgent('impl-3@s', t)).toBe(false)
+    // a replacement registered under a new name keeps its team: its name at that team names it
+    const renamed = { ...row({ id: 'agent3', name: 'impl-2-2' }), teammateId: 'impl-2@s' }
+    expect(namesAgent('impl-2-2@s', renamed)).toBe(true)
+    // no teammateId: an address names nothing
+    expect(namesAgent('impl-2@s', row({ id: 'agent2', name: 'impl-2' }))).toBe(false)
+  })
 })
 
 describe('resolveAgent', () => {

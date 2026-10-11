@@ -505,10 +505,16 @@ export const contextChart = (i: ChartInput): { source: string; alt: string; widt
  * Whether a `SendMessage` `to` names this row: its id or name, or `main` for the main thread. A
  * trailing ` [ref]` (as ListAgents prints a row) is ignored.
  */
-export const namesAgent = (to: unknown, row: Pick<AgentRow, 'id' | 'name'>): boolean => {
+export const namesAgent = (to: unknown, row: Pick<AgentRow, 'id' | 'name' | 'teammateId'>): boolean => {
   if (typeof to !== 'string') return false
   const name = to.replace(/\s*\[[^\]]*\]$/, '').trim()
-  return name !== '' && (row.id === 'main' ? name === 'main' : name === row.id || name === row.name)
+  if (name === '') return false
+  if (row.id === 'main') return name === 'main'
+  if (name === row.id || name === row.name) return true
+  // A teammate by its address: its teammateId, or its registered name at that address's team.
+  const tid = row.teammateId
+  if (typeof tid !== 'string' || !tid.includes('@')) return false
+  return name === tid || (row.name !== undefined && name === `${row.name}@${tid.slice(tid.lastIndexOf('@') + 1)}`)
 }
 
 /**
