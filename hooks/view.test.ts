@@ -11,6 +11,7 @@ import {
   cut,
   hhmm,
   logId,
+  mainButtonShown,
   paneHeader,
   seriesColors,
 } from './view'
@@ -229,6 +230,22 @@ describe('contextChart', () => {
       'Context over time: impl-1 300k of 450k; main thread 20k of 450k',
     )
     expect(contextChart({ ...base, rows: [], colors: new Map() }).alt).toBe('No model requests yet.')
+  })
+})
+
+describe('mainButtonShown', () => {
+  test('ask mode shows it unless main is already handing over', () => {
+    expect(mainButtonShown('ask', 'idle')).toBe(true)
+    expect(mainButtonShown('ask', 'offered')).toBe(true)
+    expect(mainButtonShown('ask', 'cooldown')).toBe(true)
+    expect(mainButtonShown('ask', 'writing')).toBe(false)
+    expect(mainButtonShown('ask', 'clearing')).toBe(false)
+  })
+
+  test('auto and off never show it', () => {
+    expect(mainButtonShown('auto', 'idle')).toBe(false)
+    expect(mainButtonShown('auto', 'offered')).toBe(false)
+    expect(mainButtonShown('off', 'idle')).toBe(false)
   })
 })
 

@@ -147,6 +147,17 @@ const snapshot = (w: World): { agents: AgentRow[]; mainPhase: string } =>
 const row = (w: World, id: string) => snapshot(w).agents.find(r => r.id === id)
 const phase = (w: World) => snapshot(w).mainPhase
 
+const mountPane = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile', bodyColumns = 100) =>
+  $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns } as never })
+
+/** One live agent at 300k; main stays at its default 1,000 tokens, below every threshold. */
+const running = async ($: Engine, w: World) => {
+  await start($)
+  await spawn($, { prompt: 'P', name: 'impl-1' })
+  w.tokens.set('agent1', 300_000)
+  await step($, 'agent1')
+}
+
 describe('subagents', () => {
   test('adds the HANDOVER clause to a brief and records the agent', async ($, on) => {
     const w = world(on)
@@ -557,17 +568,76 @@ describe('pane', () => {
   })
 })
 
-describe('desktop pane', () => {
-  const mountPane = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile', bodyColumns = 100) =>
-    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns } as never })
+describe('main handover control', () => {
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`in ask mode below the threshold the pane offers Hand over main (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      const ui = await mountPane($, surface)
+      expect((await ui.find({ key: 'handover:main' }))!.props.label).toBe('Hand over main')
+      await ui.press({ key: 'handover:main' })
+      await w.clock.advance(10)
+      expect(w.prompts[0]).toContain('main-1.md')
+      await ui.unmount()
+    })
 
-  const running = async ($: Engine, w: World) => {
-    await start($)
-    await spawn($, { prompt: 'P', name: 'impl-1' })
-    w.tokens.set('agent1', 300_000)
-    await step($, 'agent1')
+    test(`auto mode shows no Hand over main (${surface})`, { options: { mainHandover: 'auto' } }, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      const ui = await mountPane($, surface)
+      expect(await ui.findAll({ key: 'handover:main' })).toHaveLength(0)
+      await ui.unmount()
+    })
+
+    test(`off mode shows no Hand over main (${surface})`, { options: { mainHandover: 'off' } }, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      const ui = await mountPane($, surface)
+      expect(await ui.findAll({ key: 'handover:main' })).toHaveLength(0)
+      await ui.unmount()
+    })
+
+    test(`Hand over main is hidden while main hands over (${surface})`, async ($, on) => {
+      const w = world(on)
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'handover:main' })
+      expect(await ui.find({ key: 'handover:main' })).toBeUndefined()
+      await w.clock.advance(10)
+      await ui.unmount()
+    })
+
+    test(`Hand over main pressed mid-turn says queued and starts once (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('turn.start', ($, e) => ({ turnId: e.turnId }))
+      await running($, w)
+      await $.turn.start({ text: 'go', turnId: 'T' })
+      const ui = await mountPane($, surface)
+      expect((await ui.find({ key: 'handover:main' }))!.props.label).toBe('Hand over main')
+      await ui.press({ key: 'handover:main' })
+      expect((await ui.find({ key: 'handover:main' }))!.props.label).toBe('Handover queued')
+      await ui.press({ key: 'handover:main' })
+      await w.clock.advance(10)
+      expect(w.prompts).toHaveLength(0)
+      await complete($, undefined)
+      await w.clock.advance(10)
+      expect(w.prompts.filter(p => p.includes('main-1.md'))).toHaveLength(1)
+      await ui.unmount()
+    })
+
+    test(`the band stays threshold-only (${surface})`, async ($, on) => {
+      const w = world(on)
+      // The host's own above-prompt row, which the plugin passes through to when it has nothing to offer.
+      on('ui.render', () => ({ type: 'Text', children: [''] }) as never)
+      await running($, w)
+      const band = await $.ui.mount({ plugin: 'orchestrator', surface, component: 'AbovePrompt', props: {} as never })
+      expect(await band.find({ key: 'handover' })).toBeUndefined()
+      await band.unmount()
+    })
   }
+})
 
+describe('desktop pane', () => {
   test('the desktop draws an interactive chart; the terminal draws none', async ($, on) => {
     const w = world(on)
     await running($, w)
@@ -735,14 +805,6 @@ describe('desktop pane', () => {
     await ui.press({ key: 'handover:main' })
     await w.clock.advance(10)
     expect(w.prompts[0]).toContain('main-1.md')
-    await ui.unmount()
-  })
-
-  test('no Hand over main when main handover is off', { options: { mainHandover: 'off' } }, async ($, on) => {
-    const w = world(on)
-    await running($, w)
-    const ui = await mountPane($, 'desktop')
-    expect(await ui.find({ key: 'handover:main' })).toBeUndefined()
     await ui.unmount()
   })
 
