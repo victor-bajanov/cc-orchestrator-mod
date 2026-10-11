@@ -1,6 +1,6 @@
 # Pane detail: timestamped transcript, tool-call popups, model and effort, status colours
 
-Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.3** · Engines: terminal 2.1.296, desktop app's bundled 2.1.295
+Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.4** (amended: items 5 and 6 added) · Engines: terminal 2.1.296, desktop app's bundled 2.1.295
 
 ## Goal
 
@@ -81,6 +81,25 @@ Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.3*
   - State writes are not allowed while drawing.
   - `hhmm` (V:42) draws **UTC**, as the activity log does.
 
+### Wake-ups for a subagent orchestrator (amendment, item 5)
+
+- **F13. `CronCreate` enqueues a prompt into the session's REPL, not into an agent.** Its tool description says: "Schedule a prompt to be enqueued … Jobs only fire while the REPL is idle (not mid-query)". The schema is at T:16196-16209.
+  - A subagent can call it: it is in this planner subagent's own tool list.
+  - When it fires, the prompt lands in the **main** conversation. It neither reaches nor wakes a subagent, and nothing routes it to one.
+  - Its granularity is one minute.
+  - **Verdict:** it works for a main-session orchestrator only.
+- **F14. `ScheduleWakeup` is not usable.** Its input is `/loop` input (T:16579-16590), it is clamped to 60-3600 s, and it re-enters the `/loop` skill. It is not in a subagent's tool list (absent from this subagent's tools). **Not usable.**
+- **F15. Other candidates fail too.**
+  - `RemoteTrigger` drives claude.ai cloud routines, which run a separate cloud session (tool description). That is the wrong process and may cost money. **Not usable.**
+  - `Monitor` (T:16377-16389) streams a shell command's lines to the agent that started it, while it is live, capped at 30 min. It is not a wake-up for an agent that has ended its turn.
+- **F16. What does wake a subagent: `$.session.send({ to: { agentId } })`.**
+  - The address type says it "resumes a finished subagent from its transcript with the message, as the tool does", and a live teammate "goes idle between turns and wakes on a message" (`SessionSendAddress` T:11528-11538; T:339).
+  - The mod already relies on this for HANDOVER (R:244-259).
+  - Mod timers come from `$.clock.after` and `$.clock.every`, with the 30 s `sync` at R:351. Module timers die on reload; deadlines kept in `$.state` survive it.
+  - **The only mechanism that wakes a subagent orchestrator is mod-side: a deadline plus `$.session.send` to the parent's agent id.**
+- **F17. Engine agent statuses** include `waiting`: "on background work it owns, … in a background subagent, on an Agent call alone" (`AgentStatus` T:537-545). The mod's own `AgentStatus` (types/index.d.ts:13) has no `waiting`. The parent link is `AgentRow.parentId`: `'main'`, an agent id, or undefined for main itself.
+- **F18. Reports are not delivered automatically.** The caller reports that in this build a background subagent's final text is not delivered to its parent, and the spawn result says "ended without delivering a report through SubagentHandback". Only `SendMessage` reached the orchestrator.
+
 ## Decisions
 
 | # | Decision |
@@ -102,6 +121,9 @@ Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.3*
 | D15 | **Terminal status colours** come from pure `statusStyle(status)`. They apply to the row's **glyph and status word**; the name keeps today's dim-when-settled.<br>• `running`: `color 'success', bold` (bright green)<br>• `idle`: `color 'warning', dimColor` (faint orange)<br>• `done`: `color 'success', dimColor` (faint green)<br>• `stalled`: `color 'error', bold` (red)<br>• `handing-over`: `color 'suggestion', bold` (accent blue)<br>• `replaced`: `color 'inactive', dimColor`<br>Theme keys are used, not raw colours, so the colours follow the theme (F11). |
 | D16 | **Desktop status emoji** come from pure `statusEmoji(status, id)`. The emoji is placed before the dim status word in the row Button.<br>• `running`: `runnerFor(id)`, which is `🏃‍♂️` when `djb2(id)` is even and `🏃‍♀️` when it is odd. The choice is stable per agent and the same on every redraw and reload.<br>• `idle` 😴, `done` ✅, `stalled` 🛑, `handing-over` 📝 (writing its note), `replaced` ♻️.<br>The terminal keeps its single-width glyphs, because emoji widths break cell layout. |
 | D17 | **Pure code goes to `view.ts` and the new `detail.ts`. Wiring goes to `register.tsx`**, in three sequential tasks. `core.ts` is untouched. |
+| D18 | **`waiting` is a display status only.** Pure `displayStatus(row, rows)` returns `'waiting'` when `row.status === 'idle'` and some row with `parentId === row.id` has status `running`, `idle` or `handing-over`, applied recursively. A child that itself displays `waiting` is idle, so it already counts. Otherwise it returns `row.status`.<br>The type is `DisplayStatus = AgentStatus \| 'waiting'`, and it is **never stored**. Every handover, stall, sync and `canHandOver` check keeps reading `row.status`, so a waiting orchestrator is still `idle` for HANDOVER-as-message.<br>**Terminal:** glyph `◐`, `color 'planMode'` (teal, distinct from idle's faint orange and handing-over's blue), not dim.<br>**Desktop:** ⏳.<br>`statusStyle` and `statusEmoji` take `DisplayStatus`. The status word shows `waiting`. |
+| D19 | **Skill brief (item 5).** Orchestrators keep using background agents. Each spawn prompt must end with a persuasive, explicit report-back clause: *"Your final message is NOT delivered to me. Before you end, you MUST call SendMessage to `<orchestrator name>` with your full report; if you skip this, I never learn you finished and the run stalls."* The orchestrator names itself, so it must be spawned with a `name`.<br>For each spawn, the orchestrator estimates the task's duration and adds a buffer (max(10 min, 50%)), then arms a **single-shot check-in**. When the check-in fires and no report has arrived, the orchestrator checks the agent (`/orch roster`, the pane, or a SendMessage nudge). When the report arrives first, the check-in is ignored.<br>**Mechanism per F13 to F16:**<br>• A **main-session** orchestrator uses `CronCreate` with `recurring: false` and a pinned minute, and `CronDelete`s it on the report.<br>• A **subagent** orchestrator has no tool that wakes it. It relies on the mod check-in (D20) when Task 7 is approved. Until then the skill tells it so plainly: set no cron, and keep the report-back clause; the main session's cron is the backstop. |
+| D20 | **Mod check-in (optional Task 7; needs the user's design call).**<br>The mod registers a tool `mcp__orchestrator__checkin` `{ agent: name\|id, minutes: number }` in `session.start`, served by a `tool.call` hook. It records `checkinAt = now + minutes` on the child's row, and the parent is the calling loop's `e.agentId ?? 'main'`. Calling it again re-arms; `minutes: 0` cancels.<br>**Disarming:** the check-in is disarmed when the mod sees the child's `SendMessage` whose `to` names the parent (a `tool.call` on `SendMessage` from the child's loop), or when the parent's own report arrives some other way.<br>**Firing:** the existing 30 s `sync` fires a due check-in once.<br>• For a **subagent parent:** `$.session.send({ to: { agentId: parent }, text: '[orchestrator mod] check-in: <label> (id) has not reported after N min; status <displayStatus>, last active <hh:mm>.' })`. This wakes or resumes the parent (F16).<br>• For **main:** a toast plus `$.session.append` (the `tellParent` path).<br>The deadline lives in state (`AgentRow.checkinAt?`, `checkinBy?`), so it survives a reload.<br>**Alternative for the user to weigh:** the mod could forward a child's final answer to its parent automatically, as `onAgentEnd` already does for replacements. That removes the need for the report-back clause but duplicates any report the child did send. |
 
 ## File scopes and ordering
 
@@ -109,12 +131,14 @@ Date: 2026-10-11 · Branch: `pane-detail` · Mod version now: 0.3.0 → **0.3.3*
 | --- | --- | --- |
 | 1 | `hooks/view.ts`, `hooks/view.test.ts`, `types/index.d.ts` (types only, no state keys) | **parallel** with 2 and 6 |
 | 2 | `hooks/detail.ts` (new), `hooks/detail.test.ts` (new) | **parallel** with 1 and 6 |
-| 3 | `hooks/register.tsx`, `hooks/register.test.ts` | after 1 |
+| 1b | `hooks/view.ts`, `hooks/view.test.ts` | after 1's polish, before 3 |
+| 3 | `hooks/register.tsx`, `hooks/register.test.ts` | after 1b |
 | 4 | `hooks/register.tsx`, `hooks/register.test.ts`, `hooks/view.ts`, `hooks/view.test.ts` (legacy removal only), `types/index.d.ts` | after 3 |
 | 5 | `hooks/register.tsx`, `hooks/register.test.ts`, `types/index.d.ts` | after 4 and 2 |
-| 6 | `README.md`, `skills/orchestrated-run/SKILL.md`, then `.claude-plugin/plugin.json` version **0.3.3** | docs in parallel at any time; the version bump is last, after 5 is green |
+| 6 | `README.md`, `skills/orchestrated-run/SKILL.md` (D19 brief and the D18 status included), then `.claude-plugin/plugin.json` version **0.3.4** | docs in parallel at any time; the version bump is last, after 5 (and 7, if approved) is green |
+| 7 (optional, escalated) | `hooks/register.tsx`, `hooks/register.test.ts`, `types/index.d.ts`, plus a D19 wording tweak in SKILL.md and README | after 5, and only on the user's go-ahead (D20) |
 
-**TDD is mandatory for Tasks 1 to 5.** For every behaviour: write the failing test first, run `claude plugin test .` and watch it fail for the expected reason, then implement until it passes. Pass this rule on to any sub-agent. Task 6 is content and exempt.
+**TDD is mandatory for Tasks 1, 1b, 2, 3, 4, 5 and 7.** For every behaviour: write the failing test first, run `claude plugin test .` and watch it fail for the expected reason, then implement until it passes. Pass this rule on to any sub-agent. Task 6 is content and exempt.
 
 **Gates after every task:** `claude plugin test .` (count = previous + new, 0 fail), `claude plugin validate .`, and `npx -p typescript@5.6.3 tsc -p .`.
 
@@ -212,7 +236,29 @@ Leave `peekLines`, `peekView` and `Peek` in place; Task 4 removes them.
 
 **Acceptance:** pure; imports `hhmm` from `./view` and types only. All gates are green.
 
+### Task 1b: waiting display status (view.ts; after Task 1's polish, before Task 3)
+
+**Scope:** `hooks/view.ts`, `hooks/view.test.ts`.
+
+**Exports:**
+- `type DisplayStatus = AgentStatus | 'waiting'`;
+- `displayStatus(row, rows): DisplayStatus` (D18);
+- `statusStyle` and `statusEmoji` widened to `DisplayStatus`.
+
+**Failing tests first:**
+1. An idle parent with a running child displays `waiting`. With an idle child it displays `waiting`. With a handing-over child it displays `waiting`.
+2. An idle parent whose only child is done, replaced or stalled displays `idle`. A parent with no children displays `idle`.
+3. A running parent with a running child displays `running`: only idle becomes waiting.
+4. Nesting: main idle, child idle, grandchild running. Both main and the child display `waiting`.
+5. Main (`id 'main'`) is the parent of rows with `parentId: 'main'`.
+6. `statusStyle('waiting')` is `{ color: 'planMode' }`, and `statusEmoji('waiting', id)` is `⏳`.
+7. Purity: the input rows are unchanged (deep-equal before and after).
+
 ### Task 3: model, effort and status on the rows (register.tsx)
+
+**Amended:** every status glyph, colour, emoji and status word uses `displayStatus(row, rows)`. All logic (`canHandOver`, `isActive`, `LIVE`, sync, the header counts) keeps reading `row.status`. Extra failing tests:
+8. (both) agent1 is idle with a running child agent2 (`parentAgentId: 'agent1'`). The row draws `waiting`: `◐` with `color 'planMode'` on the terminal, `⏳` on the desktop.
+9. In that same state, pressing `handover:agent1` still sends the HANDOVER **as a message**, because the stored status is idle (`w.sent` gains it). The `handover:agent1` button is still drawn.
 
 **Implementation:**
 - **`turn.step`:** patch `model` and `effort` on the row (D12), inside the existing `try`, beside `recordStep`.
@@ -286,10 +332,38 @@ Leave `peekLines`, `peekView` and `Peek` in place; Task 4 removes them.
   - each row shows its model and effort;
   - the terminal colours and the desktop emoji are listed.
 - **README "Develop":** mention `hooks/detail.ts`.
-- **SKILL.md §3 "Tools":** one clause saying that clicking a tool call in a transcript opens its detail.
-- **Last, after Task 5 is green:** `.claude-plugin/plugin.json` `"version": "0.3.3"`. Rerun all gates.
+- **SKILL.md §3 "Tools":** one clause saying that clicking a tool call in a transcript opens its detail. Also add the `waiting` status (idle with live children).
+- **SKILL.md, orchestrator brief (§2 checklist) and spawn guidance, per D19:**
+  - background agents stay;
+  - every spawn names the agent and ends with the persuasive SendMessage report-back clause (give the exact wording);
+  - the orchestrator itself must be spawned with a `name`;
+  - the single-shot check-in, with the estimate-plus-buffer rule;
+  - the mechanism per F13 to F16: main uses `CronCreate` with `recurring: false`; a subagent orchestrator cannot schedule its own wake-up, so it relies on the report-back clause and the main session's backstop, or on `checkin` once Task 7 ships;
+  - the check-in is ignored or cancelled (`CronDelete`) once the report arrives.
+- **README, "The orchestrated-run skill":** the same points in two or three sentences.
+- **Last, after Task 5 is green:** `.claude-plugin/plugin.json` `"version": "0.3.4"`. Rerun all gates.
+
+### Task 7 (optional, escalated): mod check-in for subagent orchestrators (D20)
+
+Run this task only on the user's go-ahead. TDD is mandatory.
+
+**Scope:**
+- `hooks/register.tsx` and `hooks/register.test.ts`;
+- `types/index.d.ts`: `AgentRow.checkinAt?: number` and `checkinBy?: string`;
+- a pure `checkinDue(rows, now)` and the message text in `view.ts` and `view.test.ts`.
+
+**Failing tests first:**
+1. Calling `mcp__orchestrator__checkin` from agent1's loop (`agentId: 'agent1'`, `{ agent: 'impl-2', minutes: 30 }`) stores `checkinAt` on agent2 and `checkinBy: 'agent1'`.
+2. Advancing 30 minutes and 30 s, the sync sends one `w.sent` entry to agent1 naming impl-2. Further syncs send nothing more.
+3. If agent2's `SendMessage` (a `tool.call` from agent2's loop with `to: 'agent1'`, or agent1's name) comes before the deadline, the check-in is disarmed and nothing is sent.
+4. With `checkinBy` set to main, the check-in toasts and appends instead of sending.
+5. `minutes: 0` cancels. An unknown agent answers an error text, and nothing is stored.
+6. A reload (re-register) keeps the deadline, and it still fires.
+7. The tool never blocks or alters the HANDOVER path: the existing `tool.call` HANDOVER tests stay green.
 
 ## Escalations and degradations
+
+- **Item 5 timer (design call needed).** No agent-callable tool wakes a **subagent** orchestrator. `CronCreate` fires into the main REPL only (F13); `ScheduleWakeup` is `/loop`-only and not available to subagents (F14); `RemoteTrigger` and `Monitor` don't fit (F15). The only working wake-up is mod-side `$.session.send` to the agent id (F16). The choice is between Task 7 (D20, the `checkin` tool) and auto-forwarding a child's final answer to its parent (the alternative in D20). Until the user decides, the skill tells subagent orchestrators to rely on the report-back clause.
 
 - **No message timestamps in the API (F1).**
   - Times are what the mod observed: tool calls while loaded, step answers, and the brief.
