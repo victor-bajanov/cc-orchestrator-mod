@@ -59,6 +59,8 @@ const world = (on: On) => {
     writes: [] as string[],
     /** While set, the engine's turn.step and tool.call beneath the plugin wait on it. */
     holdNext: undefined as Promise<void> | undefined,
+    /** While set, `$.agent.list()` answers only once it settles: a slow engine list. */
+    holdList: undefined as Promise<void> | undefined,
     /** Each `$.ui.log` line. */
     logs: [] as string[],
     /** Each `$.ui.log` line with the sink it asked for (`undefined`: the transcript). */
@@ -86,7 +88,10 @@ const world = (on: On) => {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'S1' }))
   on('session.root', () => ({ value: '/repo' }))
-  on('agent.list', () => ({ value: w.agents as never }))
+  on('agent.list', async () => {
+    if (w.holdList) await w.holdList
+    return { value: w.agents as never }
+  })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.send', async ($, e) => {
     if (w.checkSends) {
@@ -3312,6 +3317,7 @@ describe("auto mode: the mod's own sends", () => {
     await start($)
     w.agents = [{ id: 'agent1', name: 'impl-1', teammateId: 'impl-1@s' }]
     await spawn($, { prompt: 'P', name: 'impl-1', isTeammate: true })
+    await w.clock.settle()
     expect(row(w, 'agent1')!.teammateId).toBe('impl-1@s')
   })
 
@@ -3639,6 +3645,7 @@ describe('engine-assigned names', () => {
     await start($)
     w.agents = [{ id: 'agent1', name: 'orchestrator-2' }]
     await spawn($, { prompt: 'P', name: 'orchestrator', ...o })
+    await w.clock.settle()
     await step($, 'agent1')
   }
 
@@ -3648,7 +3655,7 @@ describe('engine-assigned names', () => {
     expect(row(w, 'agent1')!.name).toBe('orchestrator-2')
     expect(row(w, 'agent1')!.brief!.name).toBe('orchestrator')
     const ui = await mountPane($, 'desktop')
-    expect(JSON.stringify(await ui.drawn())).toContain('spawned orchestrator-2 (agent1)')
+    expect(JSON.stringify(await ui.drawn())).toContain('\\"orchestrator\\" registered as orchestrator-2 (agent1)')
     await ui.unmount()
   })
 
@@ -3681,6 +3688,7 @@ describe('engine-assigned names', () => {
     w.agents = [{ id: 'agent1', name: 'orchestrator' }, { id: 'agent2', name: 'orchestrator-2' }]
     await spawn($, { prompt: 'P', name: 'orchestrator' })
     await spawn($, { prompt: 'P2', name: 'orchestrator' })
+    await w.clock.settle()
     await call($, undefined, CHECKIN, { agent: 'orchestrator', minutes: 30 })
     expect(row(w, 'agent1')!.checkinAt).toBeDefined()
     expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
@@ -3692,6 +3700,7 @@ describe('engine-assigned names', () => {
     w.agents = [{ id: 'agent1', name: 'impl-2' }, { id: 'agent2', name: 'impl-3' }]
     await spawn($, { prompt: 'P', name: 'impl' })
     await spawn($, { prompt: 'P2', name: 'impl' })
+    await w.clock.settle()
     const res = String((await call($, undefined, CHECKIN, { agent: 'impl', minutes: 30 })).result)
     expect(res).toContain('could mean')
     expect(res).toContain('agent1')
@@ -3760,6 +3769,23 @@ describe('engine-assigned names', () => {
     expect(w.sent).toHaveLength(1)
   })
 
+  test('a slow agent list never holds the spawn: the row is recorded at once, renamed when the list answers', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.agents = [{ id: 'agent1', name: 'orchestrator-2' }]
+    let answer!: () => void
+    w.holdList = new Promise<void>(resolve => (answer = resolve))
+    const res = await Promise.race([spawn($, { prompt: 'P', name: 'orchestrator' }), w.clock.advance(1000).then(() => 'held')])
+    expect(res).not.toBe('held')
+    expect(row(w, 'agent1')!.name).toBe('orchestrator')
+    answer()
+    await w.clock.settle()
+    expect(row(w, 'agent1')!.name).toBe('orchestrator-2')
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(w.sent).toEqual([{ to: 'agent1', text: NOTICE }])
+  })
+
   test('a renamed agent that finished before the turn end is not woken by its notice', async ($, on) => {
     const w = world(on)
     await renamed($, w)
@@ -3797,6 +3823,7 @@ describe('engine-assigned names', () => {
     await start($)
     w.agents = [{ id: 'agent1', name: 'bg-1' }]
     await spawn($, { prompt: 'P' })
+    await w.clock.settle()
     expect(row(w, 'agent1')!.name).toBe('bg-1')
     await complete($, undefined)
     await w.clock.settle()

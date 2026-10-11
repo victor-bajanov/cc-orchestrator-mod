@@ -192,6 +192,8 @@ const TEXT_STAMPS_MAX = 50
 const STAMPS_MAX = 500
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
+/** Agents already told their registered name: one notice each, however many paths learn the rename. */
+const noticed = new Set<string>()
 
 async function runDir($: $) {
   let id = await read($, runAtom)
@@ -658,12 +660,41 @@ async function tellParent($: $, parentId: string | undefined, text: string) {
 async function noticeRename($: $, id: string, requested: string | undefined, name: string | undefined) {
   try {
     if (!requested || !name || name === requested) return
+    // Claimed before any await: the spawn hook's lookup and a respawn may both get here for one agent.
+    if (noticed.has(id)) return
+    noticed.add(id)
     const text = nameNotice(name, requested)
     if ((await read($, outboxAtom)).some(d => d.agentId === id && d.text === text)) return
     await enqueue($, { agentId: id, text, what: `${name}: name notice not delivered`, liveOnly: true })
     await log($, `"${requested}" registered as ${name} (${id}); told it so`)
   } catch (err) {
     $.ui.log(`orchestrator: name notice not queued: ${String(err)}`)
+  }
+}
+
+/**
+ * The engine suffixes a taken name (`orchestrator` → `orchestrator-2`): SendMessage, check-ins and reports go
+ * by the one it registered, which only its list says (F19). Read after the spawn returns, it renames the row
+ * (and adds a teammate's address) and queues the renamed agent its notice. An unlisted agent, or a list that
+ * fails, keeps the requested name. Never throws.
+ */
+async function registeredName($: $, id: string, requested: string | undefined) {
+  try {
+    const info = (await $.agent.list()).find(a => a.id === id)
+    if (!info) return
+    const r = (await read($, agentsAtom)).find(a => a.id === id)
+    if (!r) return
+    const name = info.name ?? requested
+    const teammateId = r.teammateId ?? info.teammateId
+    if (name !== r.name || teammateId !== r.teammateId) {
+      await update($, agentsAtom, l =>
+        patch(l, id, { name, ...(typeof teammateId === 'string' && { teammateId }) }),
+      )
+      await persist($)
+    }
+    await noticeRename($, id, requested, name)
+  } catch {
+    // the requested name stands
   }
 }
 
@@ -1173,18 +1204,9 @@ export const register: Register = (on, options) => {
     const id = res.agentId
     lastSpawned = id
     const type = e.subagentType ?? (e as typeof e & { subagent_type?: string }).subagent_type ?? 'agent'
-    // The engine suffixes a taken name (`orchestrator` → `orchestrator-2`): SendMessage, check-ins and
-    // reports go by the one it registered, which only its list says (F19).
-    let name = e.name
+    const name = e.name
     // A teammate's address (`<name>@<team>`), which its SendMessage checks may name it by.
-    let teammateId = res.teammateId
-    try {
-      const info = (await $.agent.list()).find(a => a.id === id)
-      name = info?.name ?? e.name
-      teammateId ??= info?.teammateId
-    } catch {
-      // the requested name stands
-    }
+    const teammateId = res.teammateId
     const now = await $.clock.now()
     await update($, agentsAtom, l => [
       ...l.filter(a => a.id !== id),
@@ -1208,7 +1230,8 @@ export const register: Register = (on, options) => {
     ])
     await log($, `spawned ${name ?? e.description} (${id})`)
     await persist($)
-    await noticeRename($, id, e.name, name)
+    // Off the spawn's path: the Agent result and the pane never wait on the engine's list.
+    void registeredName($, id, e.name)
     if (!paneOffered) {
       paneOffered = true
       void $.ui.open({ id: PANE, title: 'Orchestrator' })
