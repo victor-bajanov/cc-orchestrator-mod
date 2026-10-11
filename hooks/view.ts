@@ -19,6 +19,10 @@ export const paneHeader = (
   return `${live} live · ${replaced} handed over · limits ${fmtTokens(o.agentThreshold)} / main ${fmtTokens(o.mainThreshold)} (${o.mainMode}${o.phase !== 'idle' ? `, ${o.phase}` : ''})`
 }
 
+/** Whether either pane offers Hand over main: only in ask mode, and not while main is already handing over. */
+export const mainButtonShown = (mode: string, phase: MainPhase): boolean =>
+  mode === 'ask' && phase !== 'writing' && phase !== 'clearing'
+
 /**
  * main → MAIN_COLOR; every other row in `rows` order (spawn order) → PALETTE[i % PALETTE.length],
  * so a later spawn never shifts an earlier agent's colour.

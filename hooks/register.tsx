@@ -20,7 +20,18 @@ import {
   timeline,
   wrapFill,
 } from './core'
-import { LIVE, ceilingOf, chartWidthPx, contextChart, cut, hhmm, logId, paneHeader, seriesColors } from './view'
+import {
+  LIVE,
+  ceilingOf,
+  chartWidthPx,
+  contextChart,
+  cut,
+  hhmm,
+  logId,
+  mainButtonShown,
+  paneHeader,
+  seriesColors,
+} from './view'
 
 type $ = EngineInterface
 
@@ -590,13 +601,14 @@ export const register: Register = (on, options) => {
       phase,
     })
     const tone = { ok: 'success', warn: 'warning', hot: 'error' } as const
+    const shown = mainButtonShown(cfg.mainMode, phase)
+    // A press while queued does nothing: startMainHandover returns on the queued flag.
+    const queued = await read($, queuedAtom)
 
     if (e.surface !== 'terminal') {
       // Desktop, VS Code, mobile: a vector chart, native buttons, activity that expands in flow.
       const { Box, Button, Text, Svg } = $.ui.resolve(e)
       const selected = liveSelection(rows, await read($, selectedAtom))
-      // A press while queued does nothing: startMainHandover returns on the queued flag.
-      const queued = await read($, queuedAtom)
       const colors = seriesColors(rows)
       const chart = contextChart({
         rows,
@@ -608,13 +620,12 @@ export const register: Register = (on, options) => {
         colors,
         selected,
       })
-      const canHandMain = cfg.mainMode !== 'off' && phase !== 'writing' && phase !== 'clearing'
       const fits = cols - 6
       return (
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
             <Text bold>{header}</Text>
-            {canHandMain && (
+            {shown && (
               <Button
                 key="handover:main"
                 variant="secondary"
@@ -705,7 +716,16 @@ export const register: Register = (on, options) => {
     const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8)
     return (
       <Box flexDirection="column">
-        <Text bold>{header}</Text>
+        <Box flexDirection="row" gap={1}>
+          <Text bold>{header}</Text>
+          {shown && (
+            <Button
+              key="handover:main"
+              label={queued ? 'Handover queued' : 'Hand over main'}
+              onPress={() => startMainHandover($)}
+            />
+          )}
+        </Box>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
         {ordered.map(({ row, depth }) => {
           const ceiling = ceilingOf(row, cfg)
