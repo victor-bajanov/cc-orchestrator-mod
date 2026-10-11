@@ -2585,6 +2585,26 @@ describe('collapse', () => {
   /** The selection, as the c hotkey sees it: none targets main. */
   const selectedOf = async (ui: Ui) => ((await hotkey(ui))?.props.label === 'collapse main thread' ? '' : 'something')
 
+  test('a fold whose state write fails never rejects, by the glyph or the c hotkey', async ($, on) => {
+    const w = world(on)
+    let failCollapsed = false
+    on('state.set', async ($, e, next) => {
+      // a thrown hook is skipped by the kit: a malformed answer is what fails the write
+      if (failCollapsed && (e as unknown as { key: string }).key === 'collapsed') return { value: null } as never
+      return next(e)
+    })
+    await crew($, w)
+    const ui = await mountPane($, 'desktop')
+    failCollapsed = true
+    const errors: unknown[] = []
+    await fold(ui, 'agent1').catch(err => errors.push(err))
+    await ui.press({ key: 'fold-hotkey' }).catch(err => errors.push(err))
+    await w.clock.settle()
+    expect(errors).toEqual([])
+    expect(await glyph(ui, 'agent1')).toBe('▾')
+    await ui.unmount()
+  })
+
   for (const surface of ['terminal', 'desktop'] as const) {
     test(`the fold glyph collapses finished descendants, and again expands them (${surface})`, async ($, on) => {
       const w = world(on)
@@ -3337,6 +3357,13 @@ describe("auto mode: the mod's own sends", () => {
       expect(isOwnSend({ origin: undefined, to: 'impl-2', message: 'HANDOVER x', inFlight, rows })).toBe(false)
     })
 
+    test("a check from an agent's loop (agentId set) trusts no origin: only the exact text", () => {
+      // an agent the mod respawned is credited with the mod's origin; the mod's own send runs in no loop
+      expect(isOwnSend({ origin: OWN, agentId: 'agent3', to: 'impl-1', message: 'another text', inFlight, rows })).toBe(false)
+      expect(isOwnSend({ origin: OWN, agentId: 'agent3', to: 'impl-1', message: 'HANDOVER x', inFlight, rows })).toBe(true)
+      expect(isOwnSend({ origin: OWN, agentId: undefined, to: 'impl-1', message: 'another text', inFlight, rows })).toBe(true)
+    })
+
     test('a teammate address names the recipient', () => {
       const toTeammate = [{ agentId: 'agent2', text: 't' }]
       expect(isOwnSend({ origin: ENGINE, to: 'impl-2@s', message: 't', inFlight: toTeammate, rows })).toBe(true)
@@ -3344,7 +3371,7 @@ describe("auto mode: the mod's own sends", () => {
     })
   })
 
-  test("own origin is not trusted by itself: with no send in flight, the engine's verdict stands", async ($, on) => {
+  test("a check with no send in flight gets the engine's verdict", async ($, on) => {
     const w = world(on)
     autoMode($, on, w)
     await idle($, w)

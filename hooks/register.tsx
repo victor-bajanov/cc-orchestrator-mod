@@ -116,16 +116,19 @@ export type OwnSend = { agentId: string; text: string }
 /**
  * Whether a SendMessage check is one of the mod's own sends: the exact text to a recipient one is in flight
  * to; or, this plugin's origin and a send in flight to that recipient. The origin is never enough alone: it
- * also covers the model inside an agent the mod spawned. `to` names a recipient as `namesAgent` does.
+ * also covers the model inside an agent the mod spawned, so it counts only for a check from no loop (no `agentId`):
+ * the mod's own send runs in none. `to` names a recipient as `namesAgent` does.
  */
 export const isOwnSend = (o: {
   origin: unknown
+  /** The loop the check is decided in (`tool.check`'s `agentId`); absent for the main loop or none. */
+  agentId?: string
   to: unknown
   message: unknown
   inFlight: readonly OwnSend[]
   rows: readonly AgentRow[]
 }): boolean => {
-  const own = isOwnOrigin(o.origin)
+  const own = o.agentId === undefined && isOwnOrigin(o.origin)
   const toward = (s: OwnSend) => {
     if (typeof o.to === 'object' && o.to !== null) return (o.to as { agentId?: unknown }).agentId === s.agentId
     return namesAgent(o.to, o.rows.find(a => a.id === s.agentId) ?? { id: s.agentId })
@@ -297,9 +300,17 @@ function copyButton($: $, ui: Ui, id: string, text: string) {
   return <Button key={`copy:${id}`} plain dimColor label="⧉" onPress={e => void copyText($, text, e.surface)} />
 }
 
-/** Collapses or expands a row's finished descendants. */
-function toggleCollapsed($: $, id: string) {
-  return update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
+/** Collapses or expands a row's finished descendants. Never rejects: a failed write leaves the fold as it was. */
+async function toggleCollapsed($: $, id: string) {
+  try {
+    await update($, collapsedAtom, c => (c.includes(id) ? c.filter(x => x !== id) : [...c, id]))
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: fold not saved: ${String(err)}`, { to: 'debug' })
+    } catch {
+      // nothing more to do
+    }
+  }
 }
 
 /** How long a transcript read may take before the pane calls it not readable. */
@@ -1326,7 +1337,14 @@ export const register: Register = (on, options) => {
       const input = (e.input ?? {}) as { to?: unknown; message?: unknown }
       if (ownSends.length > 0) {
         const rows = await read($, agentsAtom)
-        const mine = isOwnSend({ origin: next.origin, to: input.to, message: input.message, inFlight: ownSends, rows })
+        const mine = isOwnSend({
+          origin: next.origin,
+          agentId: e.agentId,
+          to: input.to,
+          message: input.message,
+          inFlight: ownSends,
+          rows,
+        })
         if (mine) return { decision: 'allow', reason: 'orchestrator mod: its own message' }
       }
       if (ownSends.length > 0 && !checkMissLogged) {

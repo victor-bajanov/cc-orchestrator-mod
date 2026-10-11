@@ -141,7 +141,7 @@ declare module 'claude-code' {
       transcripts: Record<string, Transcript>
       /** Messages queued by timers, delivered by the next hook to run. */
       outbox: Delivery[]
-      /** Rows collapsed by a double-click: their finished descendants are hidden from the pane (display only). */
+      /** Rows collapsed by the fold glyph or `c`: their finished descendants are hidden from the pane (display only). */
       collapsed: string[]
       /** The tool call open in the detail dialog, or null. */
       toolView: ToolView | null
