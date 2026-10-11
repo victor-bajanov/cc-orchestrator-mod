@@ -637,7 +637,8 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
   const parentId = c.parentId ?? 'main'
   // Its parent as spawned, or the replacement now carrying that parent's work.
   const parents = [parentId, latest(rows, parentId)].map(p => rows.find(r => r.id === p) ?? { id: p })
-  // A SubagentHandback is delivered to the main session, not the parent agent: it is no report to the parent.
+  // A SubagentHandback may reach main rather than the parent: it is no report to the parent (never ok), but
+  // it is noted, so the forward that follows is flagged as a possible duplicate.
   const isReport = tool === 'SendMessage' && parents.some(p => namesAgent(args.to, p))
   if (isReport) {
     const out = res as { deny?: unknown; isError?: unknown; result?: unknown }
@@ -645,6 +646,10 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
     const ok = out.deny === undefined && !out.isError && result.success !== false
     const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok, final: true }
     await update($, agentsAtom, l => patch(l, id, { report, ...DISARMED }))
+    await persist($)
+  } else if (tool === 'SubagentHandback' && c.report === undefined) {
+    const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok: false, final: false }
+    await update($, agentsAtom, l => patch(l, id, { report }))
     await persist($)
   } else if (c.report?.final) {
     await update($, agentsAtom, l => patch(l, id, { report: { ...c.report!, final: false } }))

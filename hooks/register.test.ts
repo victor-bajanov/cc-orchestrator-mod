@@ -2328,6 +2328,8 @@ describe('auto-forward', () => {
     await end($, 'agent2', 'Report')
     expect(forwards(w)).toHaveLength(1)
     expect(forwards(w)[0]!.text).toContain('Report')
+    // It may have reached main already: flagged as a possible duplicate.
+    expect(forwards(w)[0]!.text).toContain('may duplicate a message it sent you')
   })
 
   test('each run is judged on its own: a resumed child that does not report is forwarded', async ($, on) => {
