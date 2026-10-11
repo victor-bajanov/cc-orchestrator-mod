@@ -9,6 +9,7 @@ import {
   notePathFor,
   orderRows,
   recordStep,
+  nameNotice,
   replacementPrompt,
   resumePrompt,
   rosterMarkdown,
@@ -166,6 +167,11 @@ describe('notePathFor', () => {
 })
 
 describe('prompts', () => {
+  test('nameNotice names the registered and the requested name', () => {
+    expect(nameNotice('orchestrator-2', 'orchestrator')).toBe(
+      '[orchestrator mod] You are registered as `orchestrator-2` (`orchestrator` was taken); tell your children to SendMessage `orchestrator-2`.',
+    )
+  })
   test('a replacement keeps the original brief and points at the note', () => {
     const p = replacementPrompt({ prompt: 'Do X.', subagentType: 'general-purpose', description: 'x' }, '/n.md')
     expect(p.startsWith('Do X.')).toBe(true)

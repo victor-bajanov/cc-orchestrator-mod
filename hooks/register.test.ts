@@ -4,6 +4,7 @@ import type { On } from 'claude-code'
 import type { AgentRow } from '../types'
 import { PEEK_TIMEOUT_MS, liveSelection } from './register'
 import { hhmm } from './view'
+import { nameNotice } from './core'
 import { PEEK_DENIED as DENIED, runnerFor } from './view'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
@@ -3557,8 +3558,83 @@ describe('engine-assigned names', () => {
     await renamed($, w, { isTeammate: true })
     await complete($, 'agent1')
     const probes: string[] = []
-    w.duringSend = async (check, e) => probes.push(await check({ to: 'orchestrator-2', message: e.text }))
+    // the queued name notice goes out too; this probes the HANDOVER send
+    w.duringSend = async (check, e) => {
+      if (e.text.startsWith('HANDOVER')) probes.push(await check({ to: 'orchestrator-2', message: e.text }))
+    }
     await $.command.run({ command: 'orch', args: 'handover agent1' } as never)
     expect(probes).toEqual(['allow'])
+  })
+
+  const NOTICE = nameNotice('orchestrator-2', 'orchestrator')
+  const logged = async ($: Engine) => {
+    const ui = await mountPane($, 'desktop')
+    const s = JSON.stringify(await ui.drawn())
+    await ui.unmount()
+    return s
+  }
+
+  test('a renamed agent is told its registered name once, at the next turn end', async ($, on) => {
+    const w = world(on)
+    await renamed($, w)
+    expect(w.sent).toHaveLength(0)
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(w.sent).toEqual([{ to: 'agent1', text: NOTICE }])
+    expect(await logged($)).toContain('\\"orchestrator\\" was taken: agent1 is registered as orchestrator-2')
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(w.sent).toHaveLength(1)
+  })
+
+  test('an agent that got the name it asked for is told nothing', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.agents = [{ id: 'agent1', name: 'orchestrator' }]
+    await spawn($, { prompt: 'P', name: 'orchestrator' })
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(w.sent.filter(s => s.text.includes('registered as'))).toHaveLength(0)
+    expect(await logged($)).not.toContain('was taken')
+  })
+
+  test('an unnamed agent the engine names is told nothing', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.agents = [{ id: 'agent1', name: 'bg-1' }]
+    await spawn($, { prompt: 'P' })
+    expect(row(w, 'agent1')!.name).toBe('bg-1')
+    await complete($, undefined)
+    await w.clock.settle()
+    expect(w.sent.filter(s => s.text.includes('registered as'))).toHaveLength(0)
+    expect(await logged($)).not.toContain('was taken')
+  })
+
+  test('a renamed replacement is told its name, once', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'Read files.', name: 'probe' })
+    w.agents = [
+      { id: 'agent1', name: 'probe', teammateId: 'probe@s' },
+      { id: 'agent2', name: 'probe-2', teammateId: 'probe-2@s' },
+    ]
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/probe-agent1-1.md`, 'x')
+    await complete($, 'agent1')
+    expect(row(w, 'agent2')!.name).toBe('probe-2')
+    await complete($, undefined)
+    await w.clock.settle()
+    await complete($, undefined)
+    await w.clock.settle()
+    const notices = w.sent.filter(s => s.text.includes('registered as'))
+    expect(notices).toEqual([{ to: 'agent2', text: nameNotice('probe-2', 'probe') }])
+  })
+
+  test('the notice is queued in state.json, so a reload keeps it', async ($, on) => {
+    const w = world(on)
+    await renamed($, w)
+    const outbox = (JSON.parse(w.files.get(STATE)!) as { outbox?: { agentId: string; text: string }[] }).outbox ?? []
+    expect(outbox).toEqual([expect.objectContaining({ agentId: 'agent1', text: NOTICE })])
   })
 })

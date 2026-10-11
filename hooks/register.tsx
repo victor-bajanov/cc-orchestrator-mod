@@ -12,6 +12,7 @@ import {
   label,
   level,
   mainHandoverPrompt,
+  nameNotice,
   newRow,
   notePathFor,
   orderRows,
@@ -603,6 +604,19 @@ async function tellParent($: $, parentId: string | undefined, text: string) {
   }
 }
 
+/** When the engine registered an agent under another name than it asked for, queues it a notice (once) and logs it. Never throws. */
+async function noticeRename($: $, id: string, requested: string | undefined, name: string | undefined) {
+  try {
+    if (!requested || !name || name === requested) return
+    const text = nameNotice(name, requested)
+    if ((await read($, outboxAtom)).some(d => d.agentId === id && d.text === text)) return
+    await enqueue($, { agentId: id, text, what: `${name}: name notice not delivered` })
+    await log($, `"${requested}" was taken: ${id} is registered as ${name}; told it so`)
+  } catch (err) {
+    $.ui.log(`orchestrator: name notice not queued: ${String(err)}`)
+  }
+}
+
 async function respawn($: $, old: AgentRow) {
   const brief = old.brief
   if (!brief || !old.notePath) {
@@ -652,6 +666,7 @@ async function respawn($: $, old: AgentRow) {
     )
   })
   await log($, `${label(old)} replaced by ${newId}, resuming from ${old.notePath}`)
+  await noticeRename($, newId, brief.name, info?.name)
   await tellParent(
     $,
     old.parentId,
@@ -1131,6 +1146,7 @@ export const register: Register = (on, options) => {
     ])
     await log($, `spawned ${name ?? e.description} (${id})`)
     await persist($)
+    await noticeRename($, id, e.name, name)
     if (!paneOffered) {
       paneOffered = true
       void $.ui.open({ id: PANE, title: 'Orchestrator' })
