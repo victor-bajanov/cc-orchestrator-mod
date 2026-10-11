@@ -86,6 +86,8 @@ let mainHandoverQueued = false
 let mainHandoverStarting = false
 /** Agents whose transcript read is in flight: one read per agent at a time. */
 const peeking = new Set<string>()
+/** Agents triggered while their read was in flight: each is read once more when it settles. */
+const peekAgain = new Set<string>()
 // The id the agent.spawn hook last saw started: a plugin's own spawn may resolve without it.
 let lastSpawned: string | undefined
 
@@ -171,36 +173,54 @@ const PEEK_CHARS = 500
 
 /**
  * Reads an agent's transcript tail into `peeksAtom`, off the render (a drawing never awaits it).
- * A refusal, a failure or a read past PEEK_TIMEOUT_MS is stored as denied. The agent counts as
- * in flight until the read itself settles, so a hung read never has others piled behind it.
+ * The agent counts as in flight until the read itself settles, so a hung read never has others
+ * piled behind it; a trigger meanwhile is remembered, and one reread follows once it settles.
+ * A refusal, a failure or a read past PEEK_TIMEOUT_MS is stored as denied, unless lines are
+ * already cached: an agent that finished, or a slow read, keeps the last lines shown.
  */
 async function refreshPeek($: $, id: string) {
-  if (id === 'main' || peeking.has(id)) return
+  if (id === 'main') return
+  if (peeking.has(id)) {
+    peekAgain.add(id)
+    return
+  }
   peeking.add(id)
   const found = $.session
     .messages({ agentId: id })
     .then(f => ('deny' in f ? undefined : peekLines(f, PEEK_CHARS, PEEK_MAX)))
     .catch(() => undefined)
-    .finally(() => peeking.delete(id))
+    .finally(() => {
+      peeking.delete(id)
+      if (peekAgain.delete(id)) schedulePeek($, id)
+    })
   let timer: { cancel: () => void } | undefined
   const late = new Promise<undefined>(resolve => {
     timer = $.clock.after(PEEK_TIMEOUT_MS, () => resolve(undefined))
   })
   const lines = await Promise.race([found, late])
   timer?.cancel()
-  const t = await $.clock.now()
-  await update($, peeksAtom, p => ({ ...p, [id]: lines ? { lines, t } : { denied: true as const, t } }))
+  await update($, peeksAtom, p =>
+    lines ? { ...p, [id]: { lines } } : p[id] && 'lines' in p[id] ? p : { ...p, [id]: { denied: true as const } },
+  )
 }
 
 /** Starts a transcript read outside the dispatch that asked for it, so no hook or press waits on it. */
 function schedulePeek($: $, id: string) {
-  if (id === 'main' || peeking.has(id)) return
+  if (id === 'main') return
+  if (peeking.has(id)) {
+    peekAgain.add(id)
+    return
+  }
   $.clock.after(0, () => void refreshPeek($, id).catch(() => undefined))
 }
 
-/** Rereads the transcript of the agent an event came from, when it is the one open in the pane. */
+/** Rereads the transcript of the agent an event came from, when it is the one open in the pane. Never throws. */
 async function peekIfSelected($: $, id: string | undefined) {
-  if (id && id === (await read($, selectedAtom))) schedulePeek($, id)
+  try {
+    if (id && id === (await read($, selectedAtom))) schedulePeek($, id)
+  } catch {
+    // The peek is a convenience: whatever fails here must not reach a handover or a step's record.
+  }
 }
 
 // ---- subagents -------------------------------------------------------
@@ -436,6 +456,7 @@ export const register: Register = (on, options) => {
   mainHandoverQueued = false
   mainHandoverStarting = false
   peeking.clear()
+  peekAgain.clear()
 
   // ---- events ----------------------------------------------------------
 
@@ -503,7 +524,6 @@ export const register: Register = (on, options) => {
       }
       const tokens = contextOf(res.usage)
       await update($, agentsAtom, l => recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }))
-      await peekIfSelected($, e.agentId)
       if (id === 'main') await checkMain($, tokens)
       else if (tokens >= cfg.agentThreshold) {
         const r = (await read($, agentsAtom)).find(a => a.id === id)
@@ -526,24 +546,29 @@ export const register: Register = (on, options) => {
     } catch (err) {
       $.ui.log(`orchestrator: step not recorded: ${String(err)}`)
     }
+    // Last, after the step is recorded and any handover started: the peek can cost them nothing.
+    await peekIfSelected($, e.agentId)
     return res
   })
 
   on('tool.call', async ($, e, next) => {
     const res = await next(e)
     if (e.agentId === undefined || res.deny !== undefined) return res
+    let out = res
     try {
-      await peekIfSelected($, e.agentId)
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
-      if (r?.status !== 'handing-over' || r.handoverVia || !r.notePath) return res
-      await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
-      await log($, `${label(r)}: HANDOVER delivered with a tool result`)
-      await persist($)
-      return { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+      if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
+        await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
+        await log($, `${label(r)}: HANDOVER delivered with a tool result`)
+        await persist($)
+        out = { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+      }
     } catch (err) {
       $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
-      return res
     }
+    // Last, after the HANDOVER is attached: the peek can cost it nothing.
+    await peekIfSelected($, e.agentId)
+    return out
   })
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.

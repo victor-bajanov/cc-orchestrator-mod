@@ -3,6 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import {
   LIMIT_COLOR,
   LIVE,
+  PEEK_DENIED,
   MAIN_COLOR,
   PALETTE,
   ceilingOf,
@@ -306,16 +307,16 @@ describe('peekLines', () => {
 })
 
 describe('peekView', () => {
-  const DENIED = 'transcript not readable (teammate in another pane, or finished)'
+  const DENIED = PEEK_DENIED
   test('nothing read yet is loading; denied is the not-readable line; no lines is nothing yet', () => {
     expect(peekView(undefined, 40, 5)).toEqual({ dim: 'loading…' })
-    expect(peekView({ denied: true, t: 1 }, 40, 5)).toEqual({ dim: DENIED })
-    expect(peekView({ lines: [], t: 1 }, 40, 5)).toEqual({ dim: 'no messages yet' })
+    expect(peekView({ denied: true }, 40, 5)).toEqual({ dim: DENIED })
+    expect(peekView({ lines: [] }, 40, 5)).toEqual({ dim: 'no messages yet' })
   })
 
   test('keeps the last n lines and cuts each to the width', () => {
     const lines = ['user: one', 'assistant: two', `assistant: ${'x'.repeat(60)}`]
-    const v = peekView({ lines, t: 1 }, 20, 2) as { lines: string[] }
+    const v = peekView({ lines }, 20, 2) as { lines: string[] }
     expect(v.lines).toHaveLength(2)
     expect(v.lines[0]).toBe('assistant: two')
     expect(v.lines[1]).toHaveLength(20)

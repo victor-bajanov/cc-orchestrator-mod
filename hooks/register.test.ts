@@ -3,6 +3,7 @@ import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
 import { PEEK_TIMEOUT_MS, liveSelection } from './register'
+import { PEEK_DENIED as DENIED } from './view'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
 const STATE = `${RUN_DIR}/state.json`
@@ -940,7 +941,6 @@ describe('agent in view', () => {
 })
 
 describe('agent transcript', () => {
-  const DENIED = 'transcript not readable (teammate in another pane, or finished)'
   const transcript = [
     { role: 'user', text: 'Implement task 1', toolUses: [] },
     {
@@ -1088,7 +1088,6 @@ describe('agent transcript', () => {
 })
 
 describe('transcript read off the render', () => {
-  const DENIED = 'transcript not readable (teammate in another pane, or finished)'
   const LINES = [{ role: 'assistant', text: 'Tests are red, as expected', toolUses: [] }]
   /** A `session.messages` answer the test releases by hand; `calls` counts the reads. */
   const held = (on: Parameters<typeof world>[0]) => {
@@ -1194,6 +1193,93 @@ describe('transcript read off the render', () => {
     await step($, 'agent1')
     await w.clock.settle()
     expect(h.calls).toBe(2)
+    await ui.unmount()
+  })
+})
+
+describe('transcript reads under load', () => {
+  const said = (text: string) => ({ value: [{ role: 'assistant', text, toolUses: [] }] as never })
+  /** Every read waits until the test answers it, in order. */
+  const queued = (on: Parameters<typeof world>[0]) => {
+    const q: ((v: unknown) => void)[] = []
+    on('session.messages', () => new Promise(resolve => q.push(resolve as (v: unknown) => void)))
+    return q
+  }
+
+  test('a failing transcript read never costs a handover its HANDOVER or a step its record', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => said('first'))
+    let trap = false
+    on('state.get', ($, e, next) => {
+      // A hook that throws is skipped; a deny makes the plugin's read reject.
+      if (trap && e.key === 'selectedAgent') return { deny: 'peek path failed' } as never
+      return next(e)
+    })
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    await ui.unmount()
+    await $.command.run({ command: 'orch', args: 'handover impl-1' } as never)
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+    const steps = row(w, 'agent1')!.steps
+    trap = true
+    expect((await tool($, 'agent1')).context?.[0]).toContain('HANDOVER')
+    await step($, 'agent1')
+    expect(row(w, 'agent1')!.steps).toBe(steps + 1)
+  })
+
+  test('a trigger during a read rereads once it settles, so the box shows the newer read', async ($, on) => {
+    const w = world(on)
+    const q = queued(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    await step($, 'agent1')
+    await w.clock.settle()
+    expect(q).toHaveLength(1)
+    q[0]!(said('first'))
+    await w.clock.settle()
+    expect(q).toHaveLength(2)
+    q[1]!(said('second'))
+    await w.clock.settle()
+    expect((await ui.find({ key: 'peek:agent1' }))!.text).toContain('second')
+    await ui.unmount()
+  })
+
+  test('a later read that times out keeps the lines already shown', async ($, on) => {
+    const w = world(on)
+    const q = queued(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    q[0]!(said('first'))
+    await w.clock.settle()
+    await step($, 'agent1')
+    await w.clock.advance(PEEK_TIMEOUT_MS + 10)
+    const text = (await ui.find({ key: 'peek:agent1' }))!.text
+    expect(text).toContain('first')
+    expect(text).not.toContain(DENIED)
+    await ui.unmount()
+  })
+
+  test('a finished agent whose transcript is then refused keeps its last lines', async ($, on) => {
+    const w = world(on)
+    let calls = 0
+    on('session.messages', () => (calls++ === 0 ? said('last words') : { value: { deny: 'agent1 finished' } }))
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    await complete($, 'agent1')
+    await w.clock.advance(30_000)
+    await w.clock.settle()
+    expect(calls).toBeGreaterThan(1)
+    const text = (await ui.find({ key: 'peek:agent1' }))!.text
+    expect(text).toContain('last words')
+    expect(text).not.toContain(DENIED)
     await ui.unmount()
   })
 })

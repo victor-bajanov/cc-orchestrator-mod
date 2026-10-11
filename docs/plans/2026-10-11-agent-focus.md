@@ -262,6 +262,11 @@ The user approved Escalation P: clicking an agent in the Orchestrator pane shows
 - **One at a time:** a module-level in-flight `Set` allows one read per agent.
 - **Timeout:** the read races a cancellable `$.clock.after(PEEK_TIMEOUT_MS = 3000)`, cancelled once the race settles. A refusal, a failure or a timeout is stored as `denied`, which draws `PEEK_DENIED`. The agent stays in flight until the read itself settles, so a hung read never has more reads piled behind it.
 - **Lines:** stored cleaned, up to 8, each capped at 500 characters (`PEEK_CHARS`); the render cuts them to its width.
+- **Code-review fixes on 4242a08:**
+  - `peekIfSelected` swallows its own errors, and `tool.call` and `turn.step` call it last, after the HANDOVER is attached and the step is recorded.
+  - A trigger during a read sets `peekAgain`, and one reread follows when the read settles.
+  - A timeout, deny or failure never overwrites cached `lines`.
+  - `Peek` has no stamp.
 - **Rules:** state writes happen only in presses, events and timers, never while drawing. The Hand over buttons never wait on a read.
 - **Tests:** `describe('transcript read off the render')` in `register.test.ts` covers four cases. Each failed first by timing out because the render awaited the read.
   - (a) a read that never answers blocks neither the pane nor Hand over / Hand over main (both surfaces);
