@@ -35,7 +35,7 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 
 *Desktop app.* The pane has:
 - a chart of each agent's context over time, one coloured line per agent, with the limits as dashed red lines; hover a line for the agent's name, context and status
-- a tree of agents, each with its colour, context and status; click one to highlight its line in the chart, click again to clear
+- a tree of agents, each with its colour, context and status; click one to highlight its line in the chart, click again to clear (the agent in view stays highlighted)
 - the agent open in the main view is marked *in view* and its line highlighted, unless you clicked another
 - a `Hand over` button beside each live subagent, and a `Hand over main` button in the header (hidden unless `mainHandover` is `ask`, and while main is handing over)
 - an activity log; a line too long for the pane ends in `…`, and clicking it expands the full text beneath it
