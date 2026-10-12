@@ -1,31 +1,48 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
+import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ShellExit, ToolView, Transcript } from '../types'
 import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
   ACTIVITY_MAX,
   HANDOVER_CLAUSE,
   activityLine,
+  addShell,
   adoptChildren,
+  backgroundedShell,
   briefPathFor,
+  ceilingDue,
+  ceilingNudge,
   contextOf,
+  dropShell,
+  endShell,
   fmtTokens,
+  goneShells,
+  graceDue,
   handoverMessage,
   label,
   level,
   mainHandoverPrompt,
+  markCeiling,
   nameNotice,
   newRow,
   notePathFor,
+  numberSetting,
+  openShells,
   orderRows,
+  pickUpShells,
   recordStep,
   replacementPrompt,
   respawnFailedNotice,
   resumePrompt,
   rosterMarkdown,
+  shellEndWords,
+  shellExit,
+  shellName,
+  shellNudge,
   timeline,
+  watchdogNudge,
   wrapFill,
 } from './core'
 import {
@@ -104,6 +121,14 @@ const cfg = {
   autoRespawn: true,
   injectClause: true,
   runRoot: '',
+  /** How often open shells' output files are checked; 0: never. */
+  shellPollSeconds: 15,
+  /** How long an idle agent's finished shells may go unpicked before a nudge; 0: never. */
+  shellGraceSeconds: 60,
+  /** How long an idle agent with nothing running waits before one nudge; 0: never. */
+  idleWatchdogMinutes: 5,
+  /** How long a shell may run before one nudge; 0: never. */
+  shellCeilingMinutes: 60,
 }
 
 /** Running or idle: an agent loop that has not settled or started handing over. */
@@ -1319,6 +1344,107 @@ async function sync($: $) {
   await toolIfPending($)
 }
 
+// ---- background shells -----------------------------------------------
+
+/** What one `$.fs.read` may copy: a bigger output file is left to reconciliation and the ceiling. */
+const FS_READ_MAX = 4 * 1024 * 1024
+/** Each open shell's output file size at its last poll: an unchanged file is not read again. */
+const shellSizes = new Map<string, number>()
+/** A poll in flight: the next tick skips rather than overlap it. */
+let shellTicking = false
+
+/** The exit marker at the end of an output file; none for no path, a file too big or gone, or no marker yet. */
+async function readExit($: $, path: string): Promise<number | 'killed' | undefined> {
+  if (!path) return undefined
+  try {
+    if ((await $.fs.stat(path)).size > FS_READ_MAX) return undefined
+    return shellExit(await $.fs.read(path))
+  } catch {
+    return undefined
+  }
+}
+
+/** Records how an open shell ended, wherever it is tracked. */
+async function shellEnded($: $, shellId: string, exit: ShellExit) {
+  const rows = await read($, agentsAtom)
+  const r = rows.find(a => a.shells?.some(s => s.id === shellId && s.exit === undefined))
+  const shell = r?.shells?.find(s => s.id === shellId)
+  if (!r || !shell) return
+  const t = await $.clock.now()
+  await update($, agentsAtom, l => endShell(l, shellId, exit, t))
+  shellSizes.delete(shellId)
+  await log($, `${label(r)}: background command "${shellName(shell)}" (${shellId}) ${shellEndWords(exit)}`)
+  await persist($)
+}
+
+/** Tracks a Bash call an agent (or main) sent to the background, and drops a shell a TaskStop stopped. */
+async function noteShell($: $, agentId: string, tool: string, args: Record<string, unknown>, res: object) {
+  if (tool === 'Bash') {
+    const bg = backgroundedShell(res)
+    if (!bg) return
+    const r = (await read($, agentsAtom)).find(a => a.id === agentId)
+    if (!r) return
+    const shell = {
+      ...bg,
+      description: String(args.description ?? ''),
+      command: String(args.command ?? ''),
+      startedAt: await $.clock.now(),
+    }
+    await update($, agentsAtom, l => addShell(l, agentId, shell))
+    await log($, `${label(r)}: background command "${shellName(shell)}" (${shell.id}) started`)
+    await persist($)
+  } else if (tool === 'TaskStop') {
+    const done = res as { deny?: unknown; isError?: unknown }
+    if (done.deny !== undefined || done.isError) return
+    const id = args.task_id ?? args.shell_id
+    if (typeof id !== 'string') return
+    const r = (await read($, agentsAtom)).find(a => a.shells?.some(s => s.id === id))
+    const shell = r?.shells?.find(s => s.id === id)
+    if (!r || !shell) return
+    await update($, agentsAtom, l => dropShell(l, id))
+    shellSizes.delete(id)
+    await log($, `${label(r)}: background command "${shellName(shell)}" (${id}) stopped (TaskStop)`)
+    await persist($)
+  }
+}
+
+/** Polls each open shell's output file for its exit marker, reading a file only when its size changed. */
+async function shellTick($: $) {
+  if (shellTicking) return
+  shellTicking = true
+  try {
+    const rows = await read($, agentsAtom)
+    if (cfg.shellPollSeconds > 0) {
+      for (const shell of rows.flatMap(openShells)) {
+        if (!shell.outputPath) continue
+        try {
+          const size = (await $.fs.stat(shell.outputPath)).size
+          // Empty as it was backgrounded: an unseen file counts as 0 bytes.
+          if (size === (shellSizes.get(shell.id) ?? 0)) continue
+          if (size > FS_READ_MAX) {
+            shellSizes.set(shell.id, size)
+            continue
+          }
+          // A read that rejects goes to the catch with the size unrecorded: the next tick retries it.
+          const exit = shellExit(await $.fs.read(shell.outputPath))
+          shellSizes.set(shell.id, size)
+          if (exit !== undefined) await shellEnded($, shell.id, exit)
+        } catch {
+          // A file gone or unreadable: reconciliation at a turn end, or the ceiling, settles the shell.
+        }
+      }
+    }
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: background commands not polled: ${String(err)}`)
+    } catch {
+      // nothing more to do
+    }
+  } finally {
+    shellTicking = false
+  }
+}
+
 // ---- main thread -----------------------------------------------------
 
 function setPhase($: $, p: MainPhase) {
@@ -1399,6 +1525,10 @@ export const register: Register = (on, options) => {
   cfg.autoRespawn = options.autoRespawn !== false
   cfg.injectClause = options.injectClause !== false
   cfg.runRoot = String(options.runRoot ?? '').replace(/\/+$/, '')
+  cfg.shellPollSeconds = numberSetting(options.shellPollSeconds, 15)
+  cfg.shellGraceSeconds = numberSetting(options.shellGraceSeconds, 60)
+  cfg.idleWatchdogMinutes = numberSetting(options.idleWatchdogMinutes, 5)
+  cfg.shellCeilingMinutes = numberSetting(options.shellCeilingMinutes, 60)
   paneOffered = false
   mainBusy = false
   mainHandoverQueued = false
@@ -1419,6 +1549,8 @@ export const register: Register = (on, options) => {
   activityPending.length = 0
   activityChain = Promise.resolve()
   handoverStarting.clear()
+  shellSizes.clear()
+  shellTicking = false
 
   // ---- events ----------------------------------------------------------
 
@@ -1452,6 +1584,8 @@ export const register: Register = (on, options) => {
     // A (re)load starts with no handover queued: the state must not say otherwise.
     await update($, queuedAtom, () => false)
     $.clock.every(SYNC_MS, () => void sync($))
+    // Runs even with polling off: the shell deadlines ride it too.
+    $.clock.every((cfg.shellPollSeconds || 30) * 1000, () => void shellTick($))
     return next(e)
   })
 
@@ -1621,6 +1755,11 @@ export const register: Register = (on, options) => {
       return res
     }
     let out = redirected === undefined ? res : { ...res, context: [...(res.context ?? []), redirected] }
+    try {
+      await noteShell($, e.agentId ?? 'main', e.tool, argsOf(call), res)
+    } catch (err) {
+      $.ui.log(`orchestrator: shell not tracked: ${String(err)}`)
+    }
     if (e.agentId === undefined) return out
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)

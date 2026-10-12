@@ -27,7 +27,7 @@ const world = (on: On) => {
     /** Runs while /clear is in flight, as a turn the person starts before the restart finishes. */
     duringClear: undefined as (() => Promise<unknown>) | undefined,
     /** What `$.agent.list()` answers. */
-    agents: [] as { id: string; name?: string; teammateId?: string }[],
+    agents: [] as { id: string; name?: string; teammateId?: string; status?: string }[],
     /** The `teammateId` the next `agent.spawn` answers with, once (the list need not give it). */
     nextTeammateId: undefined as string | undefined,
     closed: [] as string[],
@@ -103,6 +103,10 @@ const world = (on: On) => {
     sessionId: 'S1',
     /** `fs.write` to this path throws ('' none). */
     fsFails: '' as string,
+    /** The next `fs.read` throws, once. */
+    readFailsOnce: false,
+    /** Each path `fs.read` was asked for, in order. */
+    reads: [] as string[],
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -199,9 +203,19 @@ const world = (on: On) => {
   })
   on('fs.exists', ($, e) => ({ value: w.files.has(e.path) }))
   on('fs.read', ($, e) => {
+    w.reads.push(e.path)
+    if (w.readFailsOnce) {
+      w.readFailsOnce = false
+      throw new Error('EIO: read failed')
+    }
     const text = w.files.get(e.path)
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: text }
+  })
+  on('fs.stat', ($, e) => {
+    const text = w.files.get(e.path)
+    if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
+    return { value: { kind: 'file', size: text.length, mtimeMs: 0, isLink: false } }
   })
   on('ui.log', ($, e) => {
     if (w.logFails) throw new Error('log broke')
@@ -2313,6 +2327,58 @@ const family = async ($: Engine, w: World) => {
   await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
   await step($, 'agent2')
   w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+}
+
+/** Where the engine writes background commands' output in these tests. */
+const TASKS = '/private/tmp/claude-501/-repo/S1/tasks'
+
+/**
+ * An agent's (or main's) Bash call sent to the background, as the engine answers it: an empty output file, its id,
+ * and the text naming the file; `auto` when the engine moved it there at its timeout.
+ */
+const bgBash = async (
+  $: Engine,
+  w: World,
+  agentId: string | undefined,
+  id: string,
+  o: { description?: string; command?: string; auto?: boolean; endsWithFinal?: boolean; isError?: boolean } = {},
+) => {
+  const path = `${TASKS}/${id}.output`
+  w.files.set(path, '')
+  const text = o.auto
+    ? `Command did not complete within its 3s timeout and was moved to the background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.`
+    : `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.`
+  const before = w.toolAnswer
+  w.toolAnswer = e =>
+    e.tool === 'Bash'
+      ? {
+          result: {
+            stdout: '',
+            stderr: '',
+            interrupted: false,
+            backgroundTaskId: id,
+            ...(o.auto && { timedOutAfterMs: 3000 }),
+            ...(o.endsWithFinal && { backgroundEndsWithFinalResponse: true }),
+          },
+          text,
+          ...(o.isError && { isError: true }),
+        }
+      : before?.(e)
+  try {
+    return await call($, agentId, 'Bash', {
+      command: o.command ?? 'npm test',
+      description: o.description ?? 'run the tests',
+      ...(!o.auto && { run_in_background: true }),
+    })
+  } finally {
+    w.toolAnswer = before
+  }
+}
+
+/** The engine appends a background command's exit marker to its output file. */
+const endOutput = (w: World, id: string, code: number | 'killed') => {
+  const path = `${TASKS}/${id}.output`
+  w.files.set(path, (w.files.get(path) ?? '') + (code === 'killed' ? '\n[killed]\n' : `\n[exited with code ${code}]\n`))
 }
 
 describe('check-in', () => {
@@ -4722,5 +4788,195 @@ describe('activity.log', () => {
     expect(l.some(x => x.includes('already starting'))).toBe(false)
     expect(l.some(x => x.includes('HANDOVER sent'))).toBe(true)
     await ui.unmount()
+  })
+})
+
+describe('background shells: tracking', () => {
+  const ACT = `${RUN_DIR}/activity.log`
+  const logged = async (w: World, text: string) => {
+    await w.clock.settle()
+    return (w.files.get(ACT) ?? '').includes(text)
+  }
+  const out = (id: string) => `${TASKS}/${id}.output`
+  /** One poll interval (15 s by default) passes and the poll's reads settle. */
+  const poll = async (w: World, ms = 15_000) => {
+    await w.clock.advance(ms)
+    await w.clock.settle()
+  }
+
+  test("a subagent's backgrounded Bash call is tracked on its row and logged", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    const now = w.clock.now()
+    await bgBash($, w, 'agent2', 'b1', { description: 'run the tests', command: 'npm test' })
+    expect(row(w, 'agent2')!.shells).toEqual([
+      { id: 'b1', outputPath: out('b1'), description: 'run the tests', command: 'npm test', startedAt: now },
+    ])
+    expect(row(w, 'agent1')!.shells).toBeUndefined()
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) started')).toBe(true)
+  })
+
+  test('a command the engine moved to the background is tracked too', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b2', { auto: true, description: 'build' })
+    expect(row(w, 'agent2')!.shells).toEqual([expect.objectContaining({ id: 'b2', outputPath: out('b2'), description: 'build' })])
+    // With no description, the log names it by its command, cut to 80 characters.
+    await bgBash($, w, 'agent2', 'b3', { auto: true, description: '', command: 'x'.repeat(100) })
+    expect(await logged(w, `impl-2: background command "${'x'.repeat(80)}" (b3) started`)).toBe(true)
+  })
+
+  test("main's backgrounded call is tracked on main's row", async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    expect(row(w, 'main')!.shells).toEqual([expect.objectContaining({ id: 'm1', outputPath: out('m1') })])
+    expect(await logged(w, 'main thread: background command "run the tests" (m1) started')).toBe(true)
+  })
+
+  test('foreground, failed and ends-with-final-response calls are not tracked', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent2', 'Bash', { command: 'ls', description: 'list' })
+    await bgBash($, w, 'agent2', 'b1', { isError: true })
+    await bgBash($, w, 'agent2', 'b2', { endsWithFinal: true })
+    expect(row(w, 'agent2')!.shells).toBeUndefined()
+    expect(await logged(w, 'background command')).toBe(false)
+  })
+
+  test('TaskStop of a tracked shell (task_id or shell_id) drops it and logs the stop; an unknown id changes nothing', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2', { description: 'build' })
+    await bgBash($, w, 'agent2', 'b3')
+    await call($, 'agent2', 'TaskStop', { task_id: 'b1' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b2', 'b3'])
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) stopped (TaskStop)')).toBe(true)
+    // The model's stop of its parent's shell, by the deprecated alias, still finds it.
+    await call($, 'agent1', 'TaskStop', { shell_id: 'b2' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b3'])
+    expect(await logged(w, 'impl-2: background command "build" (b2) stopped (TaskStop)')).toBe(true)
+    const writes = w.writes.length
+    await call($, 'agent2', 'TaskStop', { task_id: 'nope' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b3'])
+    expect(w.writes.length).toBe(writes)
+  })
+
+  test('the poll records the exit code and its time from the output file and logs it', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'all 12 passed')
+    endOutput(w, 'b1', 0)
+    const t = w.clock.now() + 15_000
+    await poll(w)
+    const r = row(w, 'agent2')!
+    expect(r.shells).toEqual([expect.objectContaining({ id: 'b1', exit: 0, endedAt: t })])
+    expect(r.shellsDoneAt).toBe(t)
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) exited with code 0')).toBe(true)
+  })
+
+  test('a killed marker is recorded as killed; no marker or a marker mid-file leaves it open', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, 'agent2', 'b3')
+    endOutput(w, 'b1', 'killed')
+    w.files.set(out('b2'), 'still working\n')
+    w.files.set(out('b3'), '\n[exited with code 0]\nand more output\n')
+    await poll(w)
+    const shells = row(w, 'agent2')!.shells!
+    expect(shells.map(s => [s.id, s.exit])).toEqual([
+      ['b1', 'killed'],
+      ['b2', undefined],
+      ['b3', undefined],
+    ])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBeUndefined()
+    expect(await logged(w, '(b1) was killed')).toBe(true)
+  })
+
+  test('an unchanged file is not read again', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    const reads = () => w.reads.filter(p => p === out('b1')).length
+    // Empty as it was backgrounded: nothing to read.
+    await poll(w)
+    expect(reads()).toBe(0)
+    w.files.set(out('b1'), 'some output\n')
+    await poll(w)
+    expect(reads()).toBe(1)
+    await poll(w)
+    await poll(w)
+    expect(reads()).toBe(1)
+    endOutput(w, 'b1', 3)
+    await poll(w)
+    expect(reads()).toBe(2)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(3)
+    // Ended: no longer polled.
+    w.files.set(out('b1'), 'changed again')
+    await poll(w)
+    expect(reads()).toBe(2)
+  })
+
+  test('a missing or over-4 MiB output file is not read and stays open; the poll keeps going', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, 'agent2', 'b3')
+    w.files.delete(out('b1'))
+    w.files.set(out('b2'), 'x'.repeat(4 * 1024 * 1024) + '\n[exited with code 0]\n')
+    endOutput(w, 'b3', 0)
+    await poll(w)
+    expect(w.reads.filter(p => p === out('b1') || p === out('b2'))).toEqual([])
+    expect(row(w, 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', undefined],
+      ['b2', undefined],
+      ['b3', 0],
+    ])
+    endOutput(w, 'b1', 2)
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(2)
+  })
+
+  test('a failed read is retried on the next poll', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    w.readFailsOnce = true
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(0)
+  })
+
+  test('shellPollSeconds 0 polls nothing', { options: { shellPollSeconds: 0 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await poll(w, 120_000)
+    expect(w.reads.filter(p => p === out('b1'))).toEqual([])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+  })
+
+  test('tracked shells survive in state.json', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    endOutput(w, 'b2', 1)
+    await poll(w)
+    const saved = JSON.parse(w.writes.at(-1)!) as { agents: AgentRow[] }
+    expect(saved.agents.find(a => a.id === 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', undefined],
+      ['b2', 1],
+    ])
+    expect(row(w, 'agent2')!.shells).toHaveLength(2)
   })
 })
