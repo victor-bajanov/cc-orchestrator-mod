@@ -1530,16 +1530,20 @@ async function shellTick($: $) {
 async function shellDeadlines($: $, now: number) {
   try {
     const rows = await read($, agentsAtom)
+    const graceMs = cfg.shellGraceSeconds * 1000
+    const minutes = cfg.shellCeilingMinutes
+    // The engine's list only when something is due: a row the engine has finished gets no nudge.
+    if (!graceDue(rows, now, graceMs).length && !ceilingDue(rows, now, minutes * 60_000).length) return
+    const engine = new Map((await $.agent.list()).map(a => [a.id, String(a.status)]))
     let changed = false
-    for (const r of graceDue(rows, now, cfg.shellGraceSeconds * 1000)) {
+    for (const r of graceDue(rows, now, graceMs, engine)) {
       const finished = (r.shells ?? []).filter(s => s.exit !== undefined)
       await enqueue($, { agentId: r.id, text: shellNudge(finished), what: `shell nudge for ${label(r)} not delivered`, liveOnly: true })
       await update($, agentsAtom, l => pickUpShells(l, r.id))
       changed = true
       await log($, `${label(r)}: nudged about finished background command(s) ${finished.map(s => s.id).join(', ')}`)
     }
-    const minutes = cfg.shellCeilingMinutes
-    for (const { row: r, shell } of ceilingDue(rows, now, minutes * 60_000)) {
+    for (const { row: r, shell } of ceilingDue(rows, now, minutes * 60_000, engine)) {
       await update($, agentsAtom, l => markCeiling(l, shell.id))
       changed = true
       const what = `${label(r)}: background command "${shellName(shell)}" (${shell.id}) still running after ${minutes} min`
@@ -1764,6 +1768,8 @@ export const register: Register = (on, options) => {
  }).catch(($, e, next) => next(e)) // tracking failed: the spawn goes ahead either way
 
   on('turn.step', async function* ($, e, next) {
+    // A shell that ends after this, during the step, had no notice in the prompt the step answers.
+    const stepStart = await $.clock.now()
     const res = yield* next(e)
     if (!res.usage) return res
     try {
@@ -1790,7 +1796,7 @@ export const register: Register = (on, options) => {
       const pickUp = (id === 'main' || newRun) && !!before?.shells?.some(s => s.exit !== undefined)
       await update($, agentsAtom, l => {
         const stepped = patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran)
-        return pickUp ? pickUpShells(stepped, id) : stepped
+        return pickUp ? pickUpShells(stepped, id, undefined, newRun ? stepStart : undefined) : stepped
       })
       try {
         // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.

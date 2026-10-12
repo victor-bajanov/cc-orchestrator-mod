@@ -477,6 +477,22 @@ describe('shell rows', () => {
     const none = pickUpShells(rows, 'a1', 'nothing here, not even b3')
     expect(none[0]?.shells?.map(s => s.id)).toEqual(['b1', 'b2', 'b3'])
   })
+
+  test('pickUpShells with a cutoff keeps shells that ended after it', () => {
+    const rows = [
+      row({
+        id: 'a1',
+        shellsDoneAt: 9,
+        shells: [shell({ id: 'b1', exit: 0, endedAt: 5 }), shell({ id: 'b2', exit: 0, endedAt: 9 })],
+      }),
+    ]
+    const cut = pickUpShells(rows, 'a1', undefined, 7)
+    expect(cut[0]?.shells?.map(s => s.id)).toEqual(['b2'])
+    expect(cut[0]?.shellsDoneAt).toBe(9)
+    // Ended at the cutoff itself: its notice was in the run's prompt.
+    expect(pickUpShells(rows, 'a1', undefined, 9)[0]?.shells).toEqual([])
+    expect(pickUpShells(rows, 'a1', undefined, 4)[0]?.shells?.map(s => s.id)).toEqual(['b1', 'b2'])
+  })
 })
 
 describe('graceDue', () => {
@@ -535,6 +551,25 @@ describe('ceiling', () => {
     const marked = markCeiling(rows, 'b1')
     expect(marked[1]?.shells?.[0]?.ceilingNudged).toBe(true)
     expect(ceilingDue(marked, 100, 100).map(d => d.shell.id)).toEqual(['m1', 'b3'])
+  })
+
+  test('graceDue and ceilingDue skip rows the engine lists completed, failed or killed; main stays eligible for the ceiling', () => {
+    const finished = (id: string) =>
+      row({ id, status: 'idle', lastActive: 0, shellsDoneAt: 100, shells: [shell({ id: `f-${id}`, exit: 0, endedAt: 100 })] })
+    const graceRows = ['a1', 'a2', 'a3', 'a4', 'a5'].map(finished)
+    const engine = new Map([
+      ['a1', 'idle'],
+      ['a2', 'completed'],
+      ['a3', 'failed'],
+      ['a4', 'killed'],
+    ])
+    // a5 is unlisted: the engine has dropped it.
+    expect(graceDue(graceRows, 1000, 60, engine).map(r => r.id)).toEqual(['a1'])
+    expect(graceDue(graceRows, 1000, 60).map(r => r.id)).toEqual(['a1', 'a2', 'a3', 'a4', 'a5'])
+    const open = (id: string) => row({ id, status: 'idle', shells: [shell({ id: `o-${id}`, startedAt: 0 })] })
+    const ceilingRows = [row({ id: 'main', type: 'main', shells: [shell({ id: 'm1', startedAt: 0 })] }), ...['a1', 'a2', 'a3', 'a4', 'a5'].map(open)]
+    expect(ceilingDue(ceilingRows, 100, 100, engine).map(d => d.row.id)).toEqual(['main', 'a1'])
+    expect(ceilingDue(ceilingRows, 100, 100).map(d => d.row.id)).toEqual(['main', 'a1', 'a2', 'a3', 'a4', 'a5'])
   })
 
   test('ceilingNudge omits Output with no path', () => {

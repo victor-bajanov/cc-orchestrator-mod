@@ -5627,4 +5627,47 @@ describe('background shells: grace and ceiling nudges', () => {
     expect(w.writes.length).toBe(writes)
     expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
   })
+
+  test("a shell that ends during a new run's first step is not picked up; with no further step, the grace nudge still fires", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await complete($, 'agent2')
+    // Woken by something else; while its first step runs, the command exits and the poll sees it.
+    let release = () => {}
+    w.holdNext = new Promise<void>(r => (release = r))
+    const stepping = step($, 'agent2')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(0)
+    w.holdNext = undefined
+    release()
+    await stepping
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+    await complete($, 'agent2')
+    await poll(w, 60_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('a completed one-shot subagent with an unpicked finished shell is never nudged', async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2', status: 'completed' }]
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+  })
+
+  test("a completed subagent's shell past the ceiling is not nudged", { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await complete($, 'agent2')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2', status: 'completed' }]
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBeUndefined()
+  })
 })

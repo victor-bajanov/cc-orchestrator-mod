@@ -353,8 +353,11 @@ const keepShells = (r: AgentRow, keep: (s: Shell) => boolean): AgentRow => {
 export const dropShell = (rows: AgentRow[], shellId: string): AgentRow[] =>
   rows.map(r => (r.shells?.some(s => s.id === shellId) ? keepShells(r, s => s.id !== shellId) : r))
 
-/** The agent picked up its finished shells: all of them, or with `mention` those whose id or output path it names. */
-export const pickUpShells = (rows: AgentRow[], agentId: string, mention?: string): AgentRow[] =>
+/**
+ * The agent picked up its finished shells: all of them, or with `mention` those whose id or output path it names.
+ * With `endedBy`, one that ended after it is kept: its notice came too late for the run that picked up.
+ */
+export const pickUpShells = (rows: AgentRow[], agentId: string, mention?: string, endedBy?: number): AgentRow[] =>
   rows.map(r =>
     r.id !== agentId
       ? r
@@ -362,18 +365,27 @@ export const pickUpShells = (rows: AgentRow[], agentId: string, mention?: string
           r,
           s =>
             s.exit === undefined ||
+            (endedBy !== undefined && (s.endedAt ?? 0) > endedBy) ||
             (mention !== undefined && !mention.includes(s.id) && !(s.outputPath && mention.includes(s.outputPath))),
         ),
   )
 
+/** The engine has finished this agent: it lists it ended, or no longer lists it (never main). No list: none. */
+const engineEnded = (r: AgentRow, engine?: ReadonlyMap<string, string>): boolean => {
+  if (!engine || r.id === 'main') return false
+  const status = engine.get(r.id)
+  return status === undefined || status === 'completed' || status === 'failed' || status === 'killed'
+}
+
 /** Idle agents (never main) whose shells have all finished and gone unpicked for the grace, counted from the later of their end and the agent's last activity. */
-export const graceDue = (rows: readonly AgentRow[], now: number, graceMs: number): AgentRow[] =>
+export const graceDue = (rows: readonly AgentRow[], now: number, graceMs: number, engine?: ReadonlyMap<string, string>): AgentRow[] =>
   graceMs <= 0
     ? []
     : rows.filter(
         r =>
           r.id !== 'main' &&
           r.status === 'idle' &&
+          !engineEnded(r, engine) &&
           r.shellsDoneAt !== undefined &&
           openShells(r).length === 0 &&
           (r.shells ?? []).some(s => s.exit !== undefined) &&
@@ -395,11 +407,16 @@ export const shellNudge = (shells: readonly Shell[]): string =>
       ].join('\n')
 
 /** Open shells running past the ceiling, not yet nudged, on live rows (main included). */
-export const ceilingDue = (rows: readonly AgentRow[], now: number, ceilingMs: number): { row: AgentRow; shell: Shell }[] =>
+export const ceilingDue = (
+  rows: readonly AgentRow[],
+  now: number,
+  ceilingMs: number,
+  engine?: ReadonlyMap<string, string>,
+): { row: AgentRow; shell: Shell }[] =>
   ceilingMs <= 0
     ? []
     : rows
-        .filter(r => r.status === 'running' || r.status === 'idle' || r.status === 'handing-over')
+        .filter(r => (r.status === 'running' || r.status === 'idle' || r.status === 'handing-over') && !engineEnded(r, engine))
         .flatMap(r =>
           openShells(r)
             .filter(s => !s.ceilingNudged && now - s.startedAt >= ceilingMs)
