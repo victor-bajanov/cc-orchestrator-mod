@@ -22,8 +22,25 @@ import {
   briefPathFor,
   respawnFailedNotice,
   wrapFill,
+  numberSetting,
+  OUTPUT_PATH,
+  backgroundedShell,
+  shellExit,
+  shellEndWords,
+  openShells,
+  addShell,
+  endShell,
+  dropShell,
+  pickUpShells,
+  graceDue,
+  shellNudge,
+  ceilingDue,
+  markCeiling,
+  ceilingNudge,
+  goneShells,
+  watchdogNudge,
 } from './core'
-import type { AgentRow } from '../types'
+import type { AgentRow, Shell } from '../types'
 
 const row = (over: Partial<AgentRow>): AgentRow => ({
   id: 'a1',
@@ -301,5 +318,291 @@ describe('activityLine', () => {
   test('the info level prints info', () => {
     expect(activityLine(Date.UTC(2026, 9, 12, 10, 0, 0), 'info', 'x\r\ny')).toBe('2026-10-12T10:00:00.000Z info x ⏎ y')
     expect(ACTIVITY_MAX).toBe(2000)
+  })
+})
+
+// ---- background shells
+
+const shell = (over: Partial<Shell>): Shell => ({
+  id: 'b1',
+  outputPath: '/t/b1.output',
+  description: 'run the tests',
+  command: 'npm test',
+  startedAt: 0,
+  ...over,
+})
+
+describe('numberSetting', () => {
+  test('defaults, 0 kept, negatives and junk fall back', () => {
+    expect(numberSetting(undefined, 15)).toBe(15)
+    expect(numberSetting(null, 15)).toBe(15)
+    expect(numberSetting(30, 15)).toBe(30)
+    expect(numberSetting('45', 15)).toBe(45)
+    expect(numberSetting(0, 15)).toBe(0)
+    expect(numberSetting(-1, 15)).toBe(15)
+    expect(numberSetting('soon', 15)).toBe(15)
+    expect(numberSetting(Infinity, 15)).toBe(15)
+  })
+})
+
+describe('backgroundedShell', () => {
+  const text = (id: string) => `Command running in background with ID: ${id}. Output is being written to: /t/${id}.output. Check it later.`
+  test('explicit, auto-background, missing path, foreground, error, ends with final response', () => {
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b1' }, text: text('b1') })).toEqual({ id: 'b1', outputPath: '/t/b1.output' })
+    const auto = 'Command did not complete within its 3s timeout and was moved to the background with ID: b2. Output is being written to: /t/b2.output.'
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b2', timedOutAfterMs: 3000 }, text: auto })).toEqual({ id: 'b2', outputPath: '/t/b2.output' })
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b3' }, text: 'moved to the background' })).toEqual({ id: 'b3', outputPath: '' })
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b3' } })).toEqual({ id: 'b3', outputPath: '' })
+    expect(backgroundedShell({ result: { stdout: 'ok', stderr: '' }, text: 'ok' })).toBeUndefined()
+    expect(backgroundedShell({ result: { backgroundTaskId: '' }, text: text('b4') })).toBeUndefined()
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b5' }, text: text('b5'), isError: true })).toBeUndefined()
+    expect(backgroundedShell({ deny: 'no', result: { backgroundTaskId: 'b6' } })).toBeUndefined()
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b7', backgroundEndsWithFinalResponse: true }, text: text('b7') })).toBeUndefined()
+    expect(backgroundedShell(undefined)).toBeUndefined()
+    expect(backgroundedShell('text')).toBeUndefined()
+    expect(OUTPUT_PATH.exec(text('b8'))?.[1]).toBe('/t/b8.output')
+  })
+
+  test('an output path with spaces is parsed whole', () => {
+    const path = '/Users/a b/tmp/claude-501/-my project/S1/tasks/b9.output'
+    const moved = `Command did not complete within its 3s timeout and was moved to the background with ID: b9. Output is being written to: ${path}. You will be notified when it completes.`
+    const running = `Command running in background with ID: b9. Output is being written to: ${path}.`
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b9' }, text: moved })).toEqual({ id: 'b9', outputPath: path })
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b9' }, text: running })).toEqual({ id: 'b9', outputPath: path })
+  })
+})
+
+describe('shellExit', () => {
+  test('0, 137, killed, none, marker not at EOF, empty file, marker only', () => {
+    expect(shellExit('done\n\n[exited with code 0]\n')).toBe(0)
+    expect(shellExit('x'.repeat(5000) + '\n[exited with code 137]\n')).toBe(137)
+    expect(shellExit('partial\n[killed]\n')).toBe('killed')
+    expect(shellExit('still going\n')).toBeUndefined()
+    expect(shellExit('\n[exited with code 0]\nmore output\n')).toBeUndefined()
+    expect(shellExit('')).toBeUndefined()
+    expect(shellExit('\n[exited with code 2]\n')).toBe(2)
+  })
+})
+
+describe('shellEndWords', () => {
+  test('a code, killed, unknown', () => {
+    expect(shellEndWords(0)).toBe('exited with code 0')
+    expect(shellEndWords(137)).toBe('exited with code 137')
+    expect(shellEndWords('killed')).toBe('was killed')
+    expect(shellEndWords('unknown')).toBe('finished (exit code unknown)')
+  })
+})
+
+describe('shell rows', () => {
+  test('addShell replaces by id and clears watchdog; unknown agent unchanged', () => {
+    const rows = [row({ id: 'a1', watchdog: { t: 5, ends: 1 } }), row({ id: 'a2' })]
+    const once = addShell(rows, 'a1', shell({ id: 'b1', command: 'one' }))
+    expect(once[0]?.shells?.map(s => s.command)).toEqual(['one'])
+    expect(once[0]?.watchdog).toBeUndefined()
+    expect(once[1]).toBe(rows[1])
+    const twice = addShell(once, 'a1', shell({ id: 'b1', command: 'two' }))
+    expect(twice[0]?.shells?.map(s => s.command)).toEqual(['two'])
+    expect(addShell(twice, 'a1', shell({ id: 'b2' }))[0]?.shells?.map(s => s.id)).toEqual(['b1', 'b2'])
+    expect(addShell(rows, 'nobody', shell({}))).toBe(rows)
+  })
+
+  test('openShells lists the shells with no exit', () => {
+    const r = row({ shells: [shell({ id: 'b1' }), shell({ id: 'b2', exit: 0, endedAt: 3 })] })
+    expect(openShells(r).map(s => s.id)).toEqual(['b1'])
+    expect(openShells(row({}))).toEqual([])
+  })
+
+  test('endShell sets exit once and shellsDoneAt only when the last open ends', () => {
+    const rows = [row({ id: 'a1', shells: [shell({ id: 'b1' }), shell({ id: 'b2' })] })]
+    const one = endShell(rows, 'b1', 0, 100)
+    expect(one[0]?.shells?.[0]).toMatchObject({ exit: 0, endedAt: 100 })
+    expect(one[0]?.shellsDoneAt).toBeUndefined()
+    const again = endShell(one, 'b1', 'killed', 150)
+    expect(again[0]?.shells?.[0]).toMatchObject({ exit: 0, endedAt: 100 })
+    const both = endShell(again, 'b2', 'killed', 200)
+    expect(both[0]?.shells?.[1]).toMatchObject({ exit: 'killed', endedAt: 200 })
+    expect(both[0]?.shellsDoneAt).toBe(200)
+    expect(endShell(both, 'nope', 1, 300)).toEqual(both)
+  })
+
+  test('dropShell of the last open shell sets shellsDoneAt from the finished ones', () => {
+    const rows = [
+      row({
+        id: 'a1',
+        status: 'idle',
+        shells: [shell({ id: 'b1' }), shell({ id: 'b2', exit: 0, endedAt: 7 }), shell({ id: 'b3', exit: 1, endedAt: 9 })],
+      }),
+    ]
+    const out = dropShell(rows, 'b1')
+    expect(out[0]?.shells?.map(s => s.id)).toEqual(['b2', 'b3'])
+    expect(out[0]?.shellsDoneAt).toBe(9)
+    expect(graceDue(out, 9 + 60, 60).map(r => r.id)).toEqual(['a1'])
+  })
+
+  test('dropShell removes it from any row and clears shellsDoneAt with no finished shell left', () => {
+    const rows = [
+      row({ id: 'a1', shells: [shell({ id: 'b1', exit: 0, endedAt: 5 })], shellsDoneAt: 5 }),
+      row({ id: 'a2', shells: [shell({ id: 'b2' }), shell({ id: 'b3', exit: 1, endedAt: 6 })], shellsDoneAt: 6 }),
+    ]
+    const out = dropShell(rows, 'b1')
+    expect(out[0]?.shells).toEqual([])
+    expect(out[0]?.shellsDoneAt).toBeUndefined()
+    const kept = dropShell(rows, 'b2')
+    expect(kept[1]?.shells?.map(s => s.id)).toEqual(['b3'])
+    expect(kept[1]?.shellsDoneAt).toBe(6)
+  })
+
+  test('pickUpShells all vs mention by id or path', () => {
+    const rows = [
+      row({
+        id: 'a1',
+        shellsDoneAt: 9,
+        shells: [
+          shell({ id: 'b1', outputPath: '/t/b1.output', exit: 0, endedAt: 5 }),
+          shell({ id: 'b2', outputPath: '/t/x.output', exit: 0, endedAt: 9 }),
+          shell({ id: 'b3', outputPath: '' }),
+        ],
+      }),
+      row({ id: 'a2', shells: [shell({ id: 'b9', exit: 0 })], shellsDoneAt: 1 }),
+    ]
+    const all = pickUpShells(rows, 'a1')
+    expect(all[0]?.shells?.map(s => s.id)).toEqual(['b3'])
+    expect(all[0]?.shellsDoneAt).toBeUndefined()
+    expect(all[1]).toBe(rows[1])
+    const byId = pickUpShells(rows, 'a1', '{"command":"cat b1 log"}')
+    expect(byId[0]?.shells?.map(s => s.id)).toEqual(['b2', 'b3'])
+    expect(byId[0]?.shellsDoneAt).toBe(9)
+    const byPath = pickUpShells(rows, 'a1', '{"file_path":"/t/x.output"}')
+    expect(byPath[0]?.shells?.map(s => s.id)).toEqual(['b1', 'b3'])
+    const none = pickUpShells(rows, 'a1', 'nothing here, not even b3')
+    expect(none[0]?.shells?.map(s => s.id)).toEqual(['b1', 'b2', 'b3'])
+  })
+
+  test('pickUpShells with a cutoff keeps shells that ended after it', () => {
+    const rows = [
+      row({
+        id: 'a1',
+        shellsDoneAt: 9,
+        shells: [shell({ id: 'b1', exit: 0, endedAt: 5 }), shell({ id: 'b2', exit: 0, endedAt: 9 })],
+      }),
+    ]
+    const cut = pickUpShells(rows, 'a1', undefined, 7)
+    expect(cut[0]?.shells?.map(s => s.id)).toEqual(['b2'])
+    expect(cut[0]?.shellsDoneAt).toBe(9)
+    // Ended at the cutoff itself: its notice was in the run's prompt.
+    expect(pickUpShells(rows, 'a1', undefined, 9)[0]?.shells).toEqual([])
+    expect(pickUpShells(rows, 'a1', undefined, 4)[0]?.shells?.map(s => s.id)).toEqual(['b1', 'b2'])
+  })
+})
+
+describe('graceDue', () => {
+  const done = (over: Partial<AgentRow>) =>
+    row({ status: 'idle', lastActive: 0, shellsDoneAt: 100, shells: [shell({ exit: 0, endedAt: 100 })], ...over })
+  test('idle only, not main, waits on the later of shellsDoneAt and lastActive, 0 disables, none while one is open', () => {
+    expect(graceDue([done({})], 160, 60).map(r => r.id)).toEqual(['a1'])
+    expect(graceDue([done({})], 159, 60)).toEqual([])
+    expect(graceDue([done({ status: 'running' })], 1000, 60)).toEqual([])
+    expect(graceDue([done({ id: 'main' })], 1000, 60)).toEqual([])
+    expect(graceDue([done({ lastActive: 150 })], 160, 60)).toEqual([])
+    expect(graceDue([done({ lastActive: 150 })], 210, 60).map(r => r.id)).toEqual(['a1'])
+    expect(graceDue([done({})], 1000, 0)).toEqual([])
+    const open = done({ shells: [shell({ exit: 0, endedAt: 100 }), shell({ id: 'b2' })] })
+    expect(graceDue([open], 1000, 60)).toEqual([])
+    expect(graceDue([done({ shellsDoneAt: undefined })], 1000, 60)).toEqual([])
+    expect(graceDue([done({ shells: [] })], 1000, 60)).toEqual([])
+  })
+})
+
+describe('shellNudge', () => {
+  const t = Date.UTC(2026, 9, 12, 9, 5, 30)
+  test('one and several, path omitted, command fallback', () => {
+    expect(shellNudge([shell({ exit: 0, endedAt: t })])).toBe(
+      '[orchestrator mod] your background command "run the tests" (id b1) exited with code 0 at 09:05 UTC and you haven\'t picked it up; output: /t/b1.output',
+    )
+    expect(shellNudge([shell({ exit: 'killed', endedAt: t, outputPath: '' })])).toBe(
+      '[orchestrator mod] your background command "run the tests" (id b1) was killed at 09:05 UTC and you haven\'t picked it up',
+    )
+    const long = 'x'.repeat(100)
+    expect(shellNudge([shell({ description: '', command: long, exit: 'unknown', endedAt: t })])).toContain(
+      `"${'x'.repeat(80)}" (id b1) finished (exit code unknown) at 09:05 UTC`,
+    )
+    expect(shellNudge([shell({ exit: 0, endedAt: t }), shell({ id: 'b2', description: 'build', exit: 2, endedAt: t, outputPath: '' })])).toBe(
+      [
+        "[orchestrator mod] your background commands finished and you haven't picked them up:",
+        '- "run the tests" (id b1) exited with code 0 at 09:05 UTC; output: /t/b1.output',
+        '- "build" (id b2) exited with code 2 at 09:05 UTC',
+      ].join('\n'),
+    )
+  })
+})
+
+describe('ceiling', () => {
+  test('ceilingDue and markCeiling, 0 disables, done rows skipped', () => {
+    const rows = [
+      row({ id: 'main', type: 'main', shells: [shell({ id: 'm1', startedAt: 0 })] }),
+      row({ id: 'a1', status: 'idle', shells: [shell({ id: 'b1', startedAt: 0 }), shell({ id: 'b2', startedAt: 50 })] }),
+      row({ id: 'a2', status: 'handing-over', shells: [shell({ id: 'b3', startedAt: 0 }), shell({ id: 'b4', startedAt: 0, exit: 0 })] }),
+      row({ id: 'a3', status: 'done', shells: [shell({ id: 'b5', startedAt: 0 })] }),
+      row({ id: 'a4', status: 'replaced', shells: [shell({ id: 'b6', startedAt: 0 })] }),
+    ]
+    expect(ceilingDue(rows, 100, 100).map(d => `${d.row.id}:${d.shell.id}`)).toEqual(['main:m1', 'a1:b1', 'a2:b3'])
+    expect(ceilingDue(rows, 99, 100)).toEqual([])
+    expect(ceilingDue(rows, 1000, 0)).toEqual([])
+    const marked = markCeiling(rows, 'b1')
+    expect(marked[1]?.shells?.[0]?.ceilingNudged).toBe(true)
+    expect(ceilingDue(marked, 100, 100).map(d => d.shell.id)).toEqual(['m1', 'b3'])
+  })
+
+  test('graceDue and ceilingDue skip rows the engine lists completed, failed or killed; main stays eligible for the ceiling', () => {
+    const finished = (id: string) =>
+      row({ id, status: 'idle', lastActive: 0, shellsDoneAt: 100, shells: [shell({ id: `f-${id}`, exit: 0, endedAt: 100 })] })
+    const graceRows = ['a1', 'a2', 'a3', 'a4', 'a5'].map(finished)
+    const engine = new Map([
+      ['a1', 'idle'],
+      ['a2', 'completed'],
+      ['a3', 'failed'],
+      ['a4', 'killed'],
+    ])
+    // a5 is unlisted: the engine has dropped it.
+    expect(graceDue(graceRows, 1000, 60, engine).map(r => r.id)).toEqual(['a1'])
+    expect(graceDue(graceRows, 1000, 60).map(r => r.id)).toEqual(['a1', 'a2', 'a3', 'a4', 'a5'])
+    const open = (id: string) => row({ id, status: 'idle', shells: [shell({ id: `o-${id}`, startedAt: 0 })] })
+    const ceilingRows = [row({ id: 'main', type: 'main', shells: [shell({ id: 'm1', startedAt: 0 })] }), ...['a1', 'a2', 'a3', 'a4', 'a5'].map(open)]
+    expect(ceilingDue(ceilingRows, 100, 100, engine).map(d => d.row.id)).toEqual(['main', 'a1'])
+    expect(ceilingDue(ceilingRows, 100, 100).map(d => d.row.id)).toEqual(['main', 'a1', 'a2', 'a3', 'a4', 'a5'])
+  })
+
+  test('ceilingNudge omits Output with no path', () => {
+    expect(ceilingNudge(shell({ outputPath: '' }), 60)).toBe(
+      '[orchestrator mod] your background command "run the tests" (id b1) is still running after 60 min; check it (e.g. a suspended process) or stop it (TaskStop).',
+    )
+  })
+
+  test('ceilingNudge', () => {
+    expect(ceilingNudge(shell({}), 60)).toBe(
+      '[orchestrator mod] your background command "run the tests" (id b1) is still running after 60 min; check it (e.g. a suspended process) or stop it (TaskStop). Output: /t/b1.output',
+    )
+  })
+})
+
+describe('goneShells', () => {
+  test('non-array, listed, unlisted', () => {
+    const rows = [
+      row({ id: 'a1', shells: [shell({ id: 'b1' }), shell({ id: 'b2' }), shell({ id: 'b3', exit: 0 })] }),
+      row({ id: 'main', shells: [shell({ id: 'm1' })] }),
+    ]
+    expect(goneShells(rows, undefined)).toEqual([])
+    expect(goneShells(rows, { id: 'b1' })).toEqual([])
+    expect(goneShells(rows, [{ id: 'b1', type: 'shell' }]).map(g => `${g.agentId}:${g.shell.id}`)).toEqual(['a1:b2', 'main:m1'])
+    expect(goneShells(rows, [{ id: 'b1' }, { id: 'b2' }, { id: 'm1' }])).toEqual([])
+    expect(goneShells(rows, [null, 'b1']).length).toBe(3)
+  })
+})
+
+describe('watchdogNudge', () => {
+  test('names the minutes', () => {
+    expect(watchdogNudge(5)).toBe(
+      "[orchestrator mod] you've been idle 5 min with no running children or background commands; if you're waiting on something, check it; otherwise carry on or report.",
+    )
   })
 })

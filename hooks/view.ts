@@ -1,7 +1,7 @@
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 
 import type { AgentRow, AgentStatus, DisplayStatus, LogEntry, MainPhase, Sample, Transcript, TranscriptItem } from '../types'
-import { fmtTokens, label } from './core'
+import { fmtTokens, hhmm, label } from './core'
 
 export type { DisplayStatus }
 
@@ -41,8 +41,8 @@ export const seriesColors = (rows: readonly AgentRow[]): Map<string, string> => 
   return out
 }
 
-/** The UTC hh:mm of a time, as the terminal pane shows it. */
-export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 16)
+/** Moved to core (shell nudges use it); still exported here for the pane's callers. */
+export { hhmm }
 
 /** An activity line cut to `fits` characters, ending in an ellipsis. */
 export const cut = (text: string, fits: number): string => `${text.slice(0, Math.max(1, fits - 1))}…`
@@ -615,6 +615,28 @@ export const sameReport = (a: string, b: string): boolean => {
 /** Rows whose check-in deadline has come. */
 export const checkinDue = (rows: readonly AgentRow[], now: number): AgentRow[] =>
   rows.filter(r => r.checkinAt !== undefined && r.checkinAt <= now)
+
+/**
+ * Idle agents the idle watchdog nudges: never main, only one the engine too lists idle (not ended, not
+ * held on its own work), with no busy child and no background command, idle `idleMs` or longer. Once
+ * nudged, not again until a run besides the nudge's own has ended (`ends` 2). `idleMs` 0: none.
+ */
+export const watchdogDue = (rows: readonly AgentRow[], engine: ReadonlyMap<string, string>, now: number, idleMs: number): AgentRow[] =>
+  idleMs <= 0
+    ? []
+    : rows.filter(
+        r =>
+          r.id !== 'main' &&
+          r.status === 'idle' &&
+          engine.get(r.id) === 'idle' &&
+          displayStatus(r, rows) === 'idle' &&
+          !r.shells?.length &&
+          now - r.lastActive >= idleMs &&
+          (r.watchdog === undefined || r.watchdog.ends >= 2),
+      )
+
+/** The patch counting one more turn end since the idle watchdog's nudge; undefined (nothing to patch) without one. */
+export const watchdogTurnEnded = (w?: AgentRow['watchdog']) => w && { watchdog: { ...w, ends: w.ends + 1 } }
 
 /**
  * Whether a child's final answer goes to its parent agent, and whether it may repeat what the child

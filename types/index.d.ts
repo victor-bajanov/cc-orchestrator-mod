@@ -16,6 +16,24 @@ export type AgentStatus = 'running' | 'idle' | 'handing-over' | 'replaced' | 'do
 /** What the pane shows for a row: its status, or `waiting` for an idle row with live descendants. Never stored. */
 export type DisplayStatus = AgentStatus | 'waiting'
 
+/** How a background shell ended: its exit code, `killed` (TaskStop, or claude's graceful exit), or `unknown` (the engine stopped listing it and its file has no marker). */
+export type ShellExit = number | 'killed' | 'unknown'
+
+/** A Bash command an agent sent to the background, as the mod tracks it. */
+export type Shell = {
+  /** The result's backgroundTaskId. */
+  id: string
+  /** From the result's text; '' when it names none. */
+  outputPath: string
+  description: string
+  command: string
+  startedAt: number
+  endedAt?: number
+  exit?: ShellExit
+  /** The one ceiling nudge (or main's warning) was given. */
+  ceilingNudged?: true
+}
+
 /** One agent loop as the mod tracks it; the main thread is the row with id `main`. */
 export type AgentRow = {
   id: string
@@ -71,6 +89,12 @@ export type AgentRow = {
   effort?: string
   /** When a step last revived it from done: it was resumed by a message after it ended. */
   resumedAt?: number
+  /** Its open background shells, and finished ones not yet picked up. */
+  shells?: Shell[]
+  /** When its last open shell ended. */
+  shellsDoneAt?: number
+  /** The idle watchdog's nudge, and how many of its turns have ended since. */
+  watchdog?: { t: number; ends: number }
 }
 
 export type LogEntry = { t: number; text: string; level: 'info' | 'warn' }

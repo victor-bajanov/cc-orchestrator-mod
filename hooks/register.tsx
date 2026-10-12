@@ -1,31 +1,48 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, Transcript } from '../types'
+import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ShellExit, ToolView, Transcript } from '../types'
 import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
   ACTIVITY_MAX,
   HANDOVER_CLAUSE,
   activityLine,
+  addShell,
   adoptChildren,
+  backgroundedShell,
   briefPathFor,
+  ceilingDue,
+  ceilingNudge,
   contextOf,
+  dropShell,
+  endShell,
   fmtTokens,
+  goneShells,
+  graceDue,
   handoverMessage,
   label,
   level,
   mainHandoverPrompt,
+  markCeiling,
   nameNotice,
   newRow,
   notePathFor,
+  numberSetting,
+  openShells,
   orderRows,
+  pickUpShells,
   recordStep,
   replacementPrompt,
   respawnFailedNotice,
   resumePrompt,
   rosterMarkdown,
+  shellEndWords,
+  shellExit,
+  shellName,
+  shellNudge,
   timeline,
+  watchdogNudge,
   wrapFill,
 } from './core'
 import {
@@ -60,6 +77,8 @@ import {
   textKey,
   transcriptItems,
   transcriptView,
+  watchdogDue,
+  watchdogTurnEnded,
 } from './view'
 import type { TranscriptLine } from './view'
 
@@ -104,6 +123,14 @@ const cfg = {
   autoRespawn: true,
   injectClause: true,
   runRoot: '',
+  /** How often open shells' output files are checked; 0: never. */
+  shellPollSeconds: 15,
+  /** How long an idle agent's finished shells may go unpicked before a nudge; 0: never. */
+  shellGraceSeconds: 60,
+  /** How long an idle agent with nothing running waits before one nudge; 0: never. */
+  idleWatchdogMinutes: 5,
+  /** How long a shell may run before one nudge; 0: never. */
+  shellCeilingMinutes: 60,
 }
 
 /** Running or idle: an agent loop that has not settled or started handing over. */
@@ -1088,6 +1115,58 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
   }
 }
 
+/** How long before a turn end another agent's shell must have started for that turn end's list to cover it. */
+const RECONCILE_MARGIN_MS = 30_000
+
+/**
+ * Ends every tracked open shell a turn end's `background_tasks` no longer lists (the engine drops a finished one):
+ * with the code its file holds, else `unknown`. It catches what polling missed. A missing list does nothing.
+ * `rows` are those read before the hook's `next`: a shell tracked while it ran is missing from the list, not gone.
+ * The stopping agent's (`agentId`) shells are ended at once. Another agent's only once started at least
+ * RECONCILE_MARGIN_MS before the turn end (`at`): the session-wide list can predate that agent's new shell. So
+ * another agent's shell gone at a turn end less than 30 s after it started is left to the poll or a later turn end;
+ * if the poll can't read its file (polling off, the file missing or unreadable) and no turn end comes, only the
+ * ceiling nudge catches it.
+ */
+async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] | undefined, agentId: string, at: number) {
+  if (!rows) return
+  try {
+    const gone = goneShells(rows, tasks).filter(g => g.agentId === agentId || at - g.shell.startedAt >= RECONCILE_MARGIN_MS)
+    for (const { shell } of gone) {
+      await shellEnded($, shell.id, (await readExit($, shell.outputPath)) ?? 'unknown')
+    }
+  } catch (err) {
+    $.ui.log(`orchestrator: shells not reconciled: ${String(err)}`)
+  }
+}
+
+/**
+ * The hook on both turn ends (`classic.Stop`, `classic.SubagentStop`): bookkeeping after `next`, never a send, and it
+ * never changes the answer. The rows are read before `next`, as the list was taken: a shell tracked while the hooks
+ * beneath ran is not in it, yet still running. The stopping agent is `agent_id`, absent on main's Stop.
+ */
+async function reconcileAtStop<E extends { background_tasks?: unknown; agent_id?: string }, R>(
+  $: $,
+  e: E,
+  next: (e: E) => Promise<R>,
+) {
+  let before: AgentRow[] | undefined
+  let at = 0
+  try {
+    at = await $.clock.now()
+    before = await read($, agentsAtom)
+  } catch {
+    before = undefined // nothing to reconcile against
+  }
+  const res = await next(e)
+  try {
+    await reconcileShells($, e.background_tasks, before, e.agent_id ?? 'main', at)
+  } catch {
+    // see above
+  }
+  return res
+}
+
 // ---- delivery from timers ---------------------------------------------
 //
 // A run woken by `$.session.send` (or started by `$.agent.spawn`) from a `$.clock` callback runs
@@ -1224,6 +1303,24 @@ async function fireCheckins($: $, now: number) {
 }
 
 /**
+ * Nudges each agent idle with nothing running past `idleWatchdogMinutes`, once per idle stretch: the nudge
+ * is recorded first, and queued, live only, for the next turn end to deliver.
+ */
+async function fireWatchdog($: $, now: number, engine: ReadonlyMap<string, string>) {
+  for (const r of watchdogDue(await read($, agentsAtom), engine, now, cfg.idleWatchdogMinutes * 60_000)) {
+    await update($, agentsAtom, l => patch(l, r.id, { watchdog: { t: now, ends: 0 } }))
+    await enqueue($, {
+      agentId: r.id,
+      text: watchdogNudge(cfg.idleWatchdogMinutes),
+      what: `idle nudge for ${label(r)} not delivered`,
+      liveOnly: true,
+    })
+    await log($, `${label(r)}: idle ${cfg.idleWatchdogMinutes} min with nothing running: nudged`)
+    await persist($)
+  }
+}
+
+/**
  * Forwards a child's final answer to its parent agent when `forwardTarget` says so, which wakes or
  * resumes that parent. A failure is warned, never thrown.
  */
@@ -1246,7 +1343,10 @@ async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
   if (!r) return
   // Its run is over: its next run reports afresh. Its check-in is spent only when it truly ends below; a
   // handover keeps it, for the replacement to inherit (or for the note-writing run it is woken for).
-  await update($, agentsAtom, l => patch(l, id, { report: undefined }))
+  // A turn ended since the idle watchdog's nudge: one besides the nudge's own run re-arms it.
+  await update($, agentsAtom, l =>
+    patch(l, id, { report: undefined, ...watchdogTurnEnded(l.find(a => a.id === id)?.watchdog) }),
+  )
   // A stalled handover is settled by its end like any other: by the note, if it wrote one late.
   if (r.status === 'handing-over' || r.status === 'stalled') {
     if (r.notePath && (await $.fs.exists(r.notePath))) {
@@ -1266,7 +1366,8 @@ async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
       await log($, `${label(r)} ended without writing its handover note`, 'warn')
     }
   } else if (isActive(r)) {
-    await update($, agentsAtom, l => patch(l, id, { status: 'idle', ...DISARMED }))
+    // A teammate ends a turn whenever it waits on its children: only its report or its end disarms its check-in.
+    await update($, agentsAtom, l => patch(l, id, { status: 'idle', ...(r.isTeammate ? {} : DISARMED) }))
     if (r.isOurs && !r.isTeammate && r.parentId === 'main') {
       // The engine does not tell main of an agent the mod spawned: its replacement's report is submitted.
       const text = `[orchestrator mod] ${label(r)} (id ${id}, replacement for ${r.replaces}) reports:\n\n${answer}`
@@ -1285,7 +1386,9 @@ const resumedRunning = (r: AgentRow, now: number) =>
 
 /** Marks agents the engine no longer lists as done, and handovers that hang as stalled. */
 async function sync($: $) {
-  const listed = new Set((await $.agent.list()).map(a => a.id))
+  const listedAgents = await $.agent.list()
+  const listed = new Set(listedAgents.map(a => a.id))
+  const engineStatus = new Map(listedAgents.map(a => [a.id, String(a.status)]))
   const now = await $.clock.now()
   const rows = await read($, agentsAtom)
   let changed = false
@@ -1297,7 +1400,7 @@ async function sync($: $) {
       void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' }).catch(() => undefined)
       changed = true
     } else if (isActive(r) && !listed.has(r.id) && !resumedRunning(r, now)) {
-      await update($, agentsAtom, l => patch(l, r.id, { status: 'done' }))
+      await update($, agentsAtom, l => patch(l, r.id, { status: 'done', ...DISARMED }))
       changed = true
     }
   }
@@ -1313,10 +1416,204 @@ async function sync($: $) {
   } catch (err) {
     $.ui.log(`orchestrator: check-ins not fired: ${String(err)}`)
   }
+  try {
+    await fireWatchdog($, now, engineStatus)
+  } catch (err) {
+    $.ui.log(`orchestrator: idle watchdog not run: ${String(err)}`)
+  }
   // The open transcript is read again now and then, so one left loading (a reload, a lost read) settles.
   const selected = liveSelection(await read($, agentsAtom), await read($, selectedAtom))
   if (selected) schedulePeek($, selected)
   await toolIfPending($)
+}
+
+// ---- background shells -----------------------------------------------
+
+/** The biggest output file read whole: a bigger one's marker is read from its tail, so a poll never copies much. */
+const FULL_READ_MAX = 64 * 1024
+/** Each open shell's output file size at its last poll: an unchanged file is not read again. */
+const shellSizes = new Map<string, number>()
+/** A poll in flight: the next tick skips rather than overlap it. */
+let shellTicking = false
+
+/**
+ * The exit marker in a file's last 256 bytes, through `tail`: for a file over FULL_READ_MAX. Undefined for no marker
+ * yet; null when tail failed (it rejected, or exited non-zero), so the poll tries it again.
+ */
+async function tailExit($: $, path: string): Promise<number | 'killed' | undefined | null> {
+  try {
+    const res = await $.process.run(['tail', '-c', '256', path], { timeoutMs: 5000 })
+    return res.exitCode === 0 ? shellExit(res.stdout) : null
+  } catch {
+    return null
+  }
+}
+
+/** The exit marker at the end of an output file; none for no path, a file gone, or no marker yet. */
+async function readExit($: $, path: string): Promise<number | 'killed' | undefined> {
+  if (!path) return undefined
+  try {
+    if ((await $.fs.stat(path)).size > FULL_READ_MAX) return (await tailExit($, path)) ?? undefined
+    return shellExit(await $.fs.read(path))
+  } catch {
+    return undefined
+  }
+}
+
+/** Records how an open shell ended, wherever it is tracked. */
+async function shellEnded($: $, shellId: string, exit: ShellExit) {
+  const rows = await read($, agentsAtom)
+  const r = rows.find(a => a.shells?.some(s => s.id === shellId && s.exit === undefined))
+  const shell = r?.shells?.find(s => s.id === shellId)
+  if (!r || !shell) return
+  const t = await $.clock.now()
+  await update($, agentsAtom, l => endShell(l, shellId, exit, t))
+  shellSizes.delete(shellId)
+  await log($, `${label(r)}: background command "${shellName(shell)}" (${shellId}) ${shellEndWords(exit)}`)
+  await persist($)
+}
+
+/** Tracks a Bash call an agent (or main) sent to the background, and drops a shell a TaskStop stopped. */
+async function noteShell($: $, agentId: string, tool: string, args: Record<string, unknown>, res: object) {
+  // A call naming a finished shell's id or output path (Read, TaskOutput, cat) picked it up; a failed one did not.
+  const own = (await read($, agentsAtom)).find(a => a.id === agentId)
+  if (!(res as { isError?: unknown }).isError && own?.shells?.some(s => s.exit !== undefined)) {
+    const mention = JSON.stringify(args)
+    const kept = own.shells.length
+    let left = kept
+    await update($, agentsAtom, l => {
+      const next = pickUpShells(l, agentId, mention)
+      left = next.find(a => a.id === agentId)?.shells?.length ?? 0
+      return next
+    })
+    if (left !== kept) await persist($)
+  }
+  if (tool === 'Bash') {
+    const bg = backgroundedShell(res)
+    if (!bg) return
+    const r = (await read($, agentsAtom)).find(a => a.id === agentId)
+    if (!r) return
+    const shell = {
+      ...bg,
+      description: String(args.description ?? ''),
+      command: String(args.command ?? ''),
+      startedAt: await $.clock.now(),
+    }
+    await update($, agentsAtom, l => addShell(l, agentId, shell))
+    await log($, `${label(r)}: background command "${shellName(shell)}" (${shell.id}) started`)
+    await persist($)
+  } else if (tool === 'TaskStop') {
+    const done = res as { deny?: unknown; isError?: unknown }
+    if (done.deny !== undefined || done.isError) return
+    const id = args.task_id ?? args.shell_id
+    if (typeof id !== 'string') return
+    const r = (await read($, agentsAtom)).find(a => a.shells?.some(s => s.id === id))
+    const shell = r?.shells?.find(s => s.id === id)
+    if (!r || !shell) return
+    await update($, agentsAtom, l => dropShell(l, id))
+    shellSizes.delete(id)
+    await log($, `${label(r)}: background command "${shellName(shell)}" (${id}) stopped (TaskStop)`)
+    await persist($)
+  }
+}
+
+/** Polls each open shell's output file for its exit marker, reading a file only when its size changed. */
+async function shellTick($: $) {
+  if (shellTicking) return
+  shellTicking = true
+  try {
+    const rows = await read($, agentsAtom)
+    if (cfg.shellPollSeconds > 0) {
+      for (const shell of rows.flatMap(openShells)) {
+        if (!shell.outputPath) continue
+        try {
+          const size = (await $.fs.stat(shell.outputPath)).size
+          // Empty as it was backgrounded: an unseen file counts as 0 bytes.
+          if (size === (shellSizes.get(shell.id) ?? 0)) continue
+          // Over FULL_READ_MAX: its tail, again only once it grows. A read that rejects (it goes to the catch) or a
+          // tail that fails (null) leaves the size unrecorded: the next tick retries it.
+          const exit =
+            size > FULL_READ_MAX ? await tailExit($, shell.outputPath) : shellExit(await $.fs.read(shell.outputPath))
+          if (exit === null) continue
+          shellSizes.set(shell.id, size)
+          if (exit !== undefined) await shellEnded($, shell.id, exit)
+        } catch {
+          // A file gone or unreadable: reconciliation at a turn end, or the ceiling, settles the shell.
+        }
+      }
+    }
+    try {
+      await shellDeadlines($, await $.clock.now())
+    } catch (err) {
+      $.ui.log(`orchestrator: background command nudges not checked: ${String(err)}`)
+    }
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: background commands not polled: ${String(err)}`)
+    } catch {
+      // nothing more to do
+    }
+  } finally {
+    shellTicking = false
+  }
+}
+
+/**
+ * From the poll: queues one nudge to an idle agent whose finished shells went unpicked for the grace (then counts
+ * them picked up, so it is sent once), and one about each shell past the ceiling (main: a warning, never a prompt).
+ * Every nudge is live-only and rides the outbox. Never throws.
+ */
+async function shellDeadlines($: $, now: number) {
+  try {
+    const rows = await read($, agentsAtom)
+    const graceMs = cfg.shellGraceSeconds * 1000
+    const minutes = cfg.shellCeilingMinutes
+    // The engine's list only when something is due: a row the engine has finished gets no nudge.
+    const graceAny = graceDue(rows, now, graceMs)
+    const ceilingAny = ceilingDue(rows, now, minutes * 60_000)
+    if (!graceAny.length && !ceilingAny.length) return
+    // A list that fails leaves every row eligible: drain's live-only check still guards delivery.
+    const engine = await $.agent.list().then(
+      l => new Map(l.map(a => [a.id, String(a.status)])),
+      () => undefined,
+    )
+    let changed = false
+    // A row the engine lists as ended is settled unnudged, so no later tick asks the engine about it again.
+    const ended = (id: string) => ['completed', 'failed', 'killed'].includes(engine?.get(id) ?? '')
+    for (const r of graceAny.filter(r => ended(r.id))) {
+      await update($, agentsAtom, l => pickUpShells(l, r.id))
+      changed = true
+    }
+    for (const { shell } of ceilingAny.filter(d => ended(d.row.id))) {
+      await update($, agentsAtom, l => markCeiling(l, shell.id))
+      changed = true
+    }
+    for (const r of graceDue(rows, now, graceMs, engine)) {
+      const finished = (r.shells ?? []).filter(s => s.exit !== undefined)
+      await enqueue($, { agentId: r.id, text: shellNudge(finished), what: `shell nudge for ${label(r)} not delivered`, liveOnly: true })
+      await update($, agentsAtom, l => pickUpShells(l, r.id))
+      changed = true
+      await log($, `${label(r)}: nudged about finished background command(s) ${finished.map(s => s.id).join(', ')}`)
+    }
+    for (const { row: r, shell } of ceilingDue(rows, now, minutes * 60_000, engine)) {
+      await update($, agentsAtom, l => markCeiling(l, shell.id))
+      changed = true
+      const what = `${label(r)}: background command "${shellName(shell)}" (${shell.id}) still running after ${minutes} min`
+      if (r.id === 'main') {
+        await log($, what, 'warn')
+      } else {
+        await enqueue($, { agentId: r.id, text: ceilingNudge(shell, minutes), what: `ceiling nudge for ${label(r)} not delivered`, liveOnly: true })
+        await log($, `${what}: nudged`)
+      }
+    }
+    if (changed) await persist($)
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: background command nudges not checked: ${String(err)}`)
+    } catch {
+      // nothing more to do
+    }
+  }
 }
 
 // ---- main thread -----------------------------------------------------
@@ -1399,6 +1696,10 @@ export const register: Register = (on, options) => {
   cfg.autoRespawn = options.autoRespawn !== false
   cfg.injectClause = options.injectClause !== false
   cfg.runRoot = String(options.runRoot ?? '').replace(/\/+$/, '')
+  cfg.shellPollSeconds = numberSetting(options.shellPollSeconds, 15)
+  cfg.shellGraceSeconds = numberSetting(options.shellGraceSeconds, 60)
+  cfg.idleWatchdogMinutes = numberSetting(options.idleWatchdogMinutes, 5)
+  cfg.shellCeilingMinutes = numberSetting(options.shellCeilingMinutes, 60)
   paneOffered = false
   mainBusy = false
   mainHandoverQueued = false
@@ -1419,6 +1720,8 @@ export const register: Register = (on, options) => {
   activityPending.length = 0
   activityChain = Promise.resolve()
   handoverStarting.clear()
+  shellSizes.clear()
+  shellTicking = false
 
   // ---- events ----------------------------------------------------------
 
@@ -1452,6 +1755,8 @@ export const register: Register = (on, options) => {
     // A (re)load starts with no handover queued: the state must not say otherwise.
     await update($, queuedAtom, () => false)
     $.clock.every(SYNC_MS, () => void sync($))
+    // Runs even with polling off: the shell deadlines ride it too.
+    $.clock.every((cfg.shellPollSeconds || 30) * 1000, () => void shellTick($))
     return next(e)
   })
 
@@ -1515,6 +1820,8 @@ export const register: Register = (on, options) => {
  }).catch(($, e, next) => next(e)) // tracking failed: the spawn goes ahead either way
 
   on('turn.step', async function* ($, e, next) {
+    // A shell that ends after this, during the step, had no notice in the prompt the step answers.
+    const stepStart = await $.clock.now()
     const res = yield* next(e)
     if (!res.usage) return res
     try {
@@ -1534,7 +1841,15 @@ export const register: Register = (on, options) => {
       const tokens = contextOf(res.usage)
       // The answering model wins over the requested one; an engine without effort leaves it out.
       const ran = { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }
-      await update($, agentsAtom, l => patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran))
+      const before = (await read($, agentsAtom)).find(a => a.id === id)
+      // A new run (its first step since a turn end: a status recordStep revives; main at any step) has seen its
+      // finished shells' notices. A stalled handover's step is the same run.
+      const newRun = before !== undefined && (['idle', 'done', 'respawn-failed'] as AgentRow['status'][]).includes(before.status)
+      const pickUp = (id === 'main' || newRun) && !!before?.shells?.some(s => s.exit !== undefined)
+      await update($, agentsAtom, l => {
+        const stepped = patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran)
+        return pickUp ? pickUpShells(stepped, id, undefined, newRun ? stepStart : undefined) : stepped
+      })
       try {
         // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
         if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now, true)
@@ -1621,6 +1936,11 @@ export const register: Register = (on, options) => {
       return res
     }
     let out = redirected === undefined ? res : { ...res, context: [...(res.context ?? []), redirected] }
+    try {
+      await noteShell($, e.agentId ?? 'main', e.tool, argsOf(call), res)
+    } catch (err) {
+      $.ui.log(`orchestrator: shell not tracked: ${String(err)}`)
+    }
     if (e.agentId === undefined) return out
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
@@ -1680,6 +2000,10 @@ export const register: Register = (on, options) => {
   // under auto mode the classifier refuses them. Allow exactly those, while in flight.
   on('tool.check', { tool: 'Agent' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
   on('tool.check', { tool: 'TaskStop' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
+
+  // A turn end lists the session's background work still running: a tracked shell missing from it has ended.
+  on('classic.SubagentStop', reconcileAtStop).catch(($, e, next) => next(e))
+  on('classic.Stop', reconcileAtStop).catch(($, e, next) => next(e))
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.
   on('turn.start', ($, e, next) => {

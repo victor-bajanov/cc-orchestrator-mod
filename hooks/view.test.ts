@@ -44,6 +44,8 @@ import {
   toolBrief,
   transcriptItems,
   transcriptView,
+  watchdogDue,
+  watchdogTurnEnded,
 } from './view'
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import type { AgentRow, AgentStatus, TranscriptItem } from '../types'
@@ -893,6 +895,56 @@ describe('checkinDue', () => {
     const rows = [row({ id: 'a', checkinAt: 100 }), row({ id: 'b', checkinAt: 101 }), row({ id: 'c' })]
     expect(checkinDue(rows, 100).map(r => r.id)).toEqual(['a'])
     expect(checkinDue(rows, 200).map(r => r.id)).toEqual(['a', 'b'])
+  })
+})
+
+describe('watchdogDue', () => {
+  const MIN = 60_000
+  const idle = (over: Partial<AgentRow> = {}) => row({ id: 'a', status: 'idle', lastActive: 0, ...over })
+  const listed = (entries: Record<string, string>) => new Map(Object.entries(entries))
+
+  test('an idle row the engine lists idle, past idleMs, is due', () => {
+    const a = idle()
+    expect(watchdogDue([main(), a], listed({ a: 'idle' }), 5 * MIN, 5 * MIN).map(r => r.id)).toEqual(['a'])
+  })
+
+  test('not main, not engine completed/waiting/unlisted, not with busy children, not with shells, not before idleMs', () => {
+    const m = main({ status: 'idle' })
+    expect(watchdogDue([m], listed({ main: 'idle' }), 10 * MIN, 5 * MIN)).toEqual([])
+    for (const s of ['completed', 'waiting', 'running', 'failed', 'killed']) {
+      expect(watchdogDue([idle()], listed({ a: s }), 10 * MIN, 5 * MIN)).toEqual([])
+    }
+    expect(watchdogDue([idle()], listed({}), 10 * MIN, 5 * MIN)).toEqual([])
+    const p = idle()
+    const kid = row({ id: 'c', parentId: 'a', status: 'idle', lastActive: 0 })
+    expect(watchdogDue([p, kid], listed({ a: 'idle' }), 10 * MIN, 5 * MIN)).toEqual([])
+    const settled = row({ id: 'c', parentId: 'a', status: 'done' })
+    expect(watchdogDue([p, settled], listed({ a: 'idle' }), 10 * MIN, 5 * MIN).map(r => r.id)).toEqual(['a'])
+    const shell = { id: 'b1', outputPath: '', description: 'x', command: 'x', startedAt: 0 }
+    expect(watchdogDue([idle({ shells: [shell] })], listed({ a: 'idle' }), 10 * MIN, 5 * MIN)).toEqual([])
+    expect(watchdogDue([idle({ shells: [] })], listed({ a: 'idle' }), 10 * MIN, 5 * MIN).map(r => r.id)).toEqual(['a'])
+    expect(watchdogDue([idle({ lastActive: 6 * MIN })], listed({ a: 'idle' }), 10 * MIN, 5 * MIN)).toEqual([])
+    for (const s of ['running', 'done', 'handing-over'] as const) {
+      expect(watchdogDue([idle({ status: s })], listed({ a: 'idle' }), 10 * MIN, 5 * MIN)).toEqual([])
+    }
+  })
+
+  test('nudged: not due until two turns have ended', () => {
+    const at = (ends: number) => watchdogDue([idle({ watchdog: { t: 0, ends } })], listed({ a: 'idle' }), 10 * MIN, 5 * MIN)
+    expect(at(0)).toEqual([])
+    expect(at(1)).toEqual([])
+    expect(at(2).map(r => r.id)).toEqual(['a'])
+  })
+
+  test('idleMs 0: none', () => {
+    expect(watchdogDue([idle()], listed({ a: 'idle' }), 10 * MIN, 0)).toEqual([])
+  })
+
+  test('watchdogTurnEnded counts one more turn end on the watchdog given, and nothing without one', () => {
+    expect(watchdogTurnEnded({ t: 5, ends: 0 })).toEqual({ watchdog: { t: 5, ends: 1 } })
+    expect(watchdogTurnEnded({ t: 5, ends: 1 })).toEqual({ watchdog: { t: 5, ends: 2 } })
+    expect(watchdogTurnEnded(undefined)).toBeUndefined()
+    expect({ a: 1, ...watchdogTurnEnded(undefined) }).toEqual({ a: 1 })
   })
 })
 

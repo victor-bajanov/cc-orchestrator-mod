@@ -2,6 +2,8 @@
 
 **Versions:** Claude Code 2.1.296 (terminal) and 2.1.295 (the desktop app's bundled engine). Both reproduce.
 
+See also [engine-bug-bg-shell-wake.md](engine-bug-bg-shell-wake.md): an idle agent isn't woken by its own background shell's completion notice. The mod's workaround for that bug runs into this one.
+
 Finding 1 is the bug to file. Finding 2 is documented behaviour that is easy to trip over across a send; it is here because it shapes the workaround, and because it shows finding 1 isn't the same rule.
 
 ## Finding 1: a run started from a `$.clock` timer has no `tool.call` or `turn.step` hooks

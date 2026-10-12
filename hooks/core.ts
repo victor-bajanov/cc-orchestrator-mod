@@ -1,6 +1,9 @@
-import type { AgentRow, Brief, Sample } from '../types'
+import type { AgentRow, Brief, Sample, Shell, ShellExit } from '../types'
 
 export const MAX_SAMPLES = 180
+
+/** The UTC hh:mm of a time, as the terminal pane shows it. */
+export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 16)
 
 type Usage = {
   input_tokens?: number
@@ -277,3 +280,167 @@ export const ACTIVITY_MAX = 2000
 /** One activity.log line: UTC ISO time, level, the text on one line. */
 export const activityLine = (t: number, level: 'info' | 'warn', text: string): string =>
   `${new Date(t).toISOString()} ${level === 'warn' ? 'WARN' : 'info'} ${text.replace(/\r?\n/g, ' ⏎ ')}`
+
+// ---- background shells
+
+/** A number setting: the value when finite and not negative, else the default. */
+export const numberSetting = (v: unknown, d: number): number => {
+  const n = Number(v ?? d)
+  return Number.isFinite(n) && n >= 0 ? n : d
+}
+
+/** Where a backgrounded Bash call's result text says its output goes. */
+export const OUTPUT_PATH = /Output is being written to: (.+?\.output)\.(?:\s|$)/
+
+/**
+ * The shell a Bash call sent to the background, explicitly or by the engine: its id and output path ('' when the
+ * text names none). None for a deny, an error, a foreground call, or one that dies with its caller's final response.
+ */
+export const backgroundedShell = (res: unknown): { id: string; outputPath: string } | undefined => {
+  if (!res || typeof res !== 'object') return undefined
+  const r = res as { deny?: unknown; isError?: unknown; result?: unknown; text?: unknown }
+  if (r.deny || r.isError) return undefined
+  const result = (r.result ?? {}) as { backgroundTaskId?: unknown; backgroundEndsWithFinalResponse?: unknown }
+  const id = result.backgroundTaskId
+  if (typeof id !== 'string' || !id || result.backgroundEndsWithFinalResponse === true) return undefined
+  const m = typeof r.text === 'string' ? OUTPUT_PATH.exec(r.text) : null
+  return { id, outputPath: m?.[1] ?? '' }
+}
+
+/** The exit marker the engine appends to an output file, read at its end: a code, `killed`, or none yet. */
+export const shellExit = (text: string): number | 'killed' | undefined => {
+  const m = /\n\[(?:exited with code (\d+)|killed)\]\n$/.exec(text.slice(-256))
+  if (!m) return undefined
+  return m[1] === undefined ? 'killed' : Number(m[1])
+}
+
+export const shellEndWords = (exit: ShellExit): string =>
+  exit === 'killed' ? 'was killed' : exit === 'unknown' ? 'finished (exit code unknown)' : `exited with code ${exit}`
+
+export const openShells = (r: AgentRow): Shell[] => (r.shells ?? []).filter(s => s.exit === undefined)
+
+/** Tracks a shell on its agent's row (replacing one with the same id); a new shell re-arms the idle watchdog. */
+export const addShell = (rows: AgentRow[], agentId: string, shell: Shell): AgentRow[] =>
+  rows.some(r => r.id === agentId)
+    ? rows.map(r =>
+        r.id !== agentId
+          ? r
+          : { ...r, shells: [...(r.shells ?? []).filter(s => s.id !== shell.id), shell], watchdog: undefined },
+      )
+    : rows
+
+/** Ends an open shell, wherever it is tracked; its row's shellsDoneAt is set once no shell there is open. */
+export const endShell = (rows: AgentRow[], shellId: string, exit: ShellExit, t: number): AgentRow[] =>
+  rows.map(r => {
+    if (!r.shells?.some(s => s.id === shellId && s.exit === undefined)) return r
+    const shells = r.shells.map(s => (s.id === shellId ? { ...s, endedAt: t, exit } : s))
+    return { ...r, shells, ...(shells.some(s => s.exit === undefined) ? {} : { shellsDoneAt: t }) }
+  })
+
+/**
+ * Keeps only `keep`'s shells. shellsDoneAt goes with the last finished one; once none is open (the last open one
+ * dropped) and finished ones remain, an unset shellsDoneAt is their latest end. One already set is kept.
+ */
+const keepShells = (r: AgentRow, keep: (s: Shell) => boolean): AgentRow => {
+  const shells = (r.shells ?? []).filter(keep)
+  const finished = shells.filter(s => s.exit !== undefined)
+  if (!finished.length) return { ...r, shells, shellsDoneAt: undefined }
+  if (r.shellsDoneAt !== undefined || finished.length < shells.length) return { ...r, shells }
+  return { ...r, shells, shellsDoneAt: Math.max(...finished.map(s => s.endedAt ?? 0)) }
+}
+
+/** Stops tracking a shell, wherever it is (TaskStop). */
+export const dropShell = (rows: AgentRow[], shellId: string): AgentRow[] =>
+  rows.map(r => (r.shells?.some(s => s.id === shellId) ? keepShells(r, s => s.id !== shellId) : r))
+
+/**
+ * The agent picked up its finished shells: all of them, or with `mention` those whose id or output path it names.
+ * With `endedBy`, one that ended after it is kept: its notice came too late for the run that picked up.
+ */
+export const pickUpShells = (rows: AgentRow[], agentId: string, mention?: string, endedBy?: number): AgentRow[] =>
+  rows.map(r =>
+    r.id !== agentId
+      ? r
+      : keepShells(
+          r,
+          s =>
+            s.exit === undefined ||
+            (endedBy !== undefined && (s.endedAt ?? 0) > endedBy) ||
+            (mention !== undefined && !mention.includes(s.id) && !(s.outputPath && mention.includes(s.outputPath))),
+        ),
+  )
+
+/** The engine has finished this agent: it lists it ended, or no longer lists it (never main). No list: none. */
+const engineEnded = (r: AgentRow, engine?: ReadonlyMap<string, string>): boolean => {
+  if (!engine || r.id === 'main') return false
+  const status = engine.get(r.id)
+  return status === undefined || status === 'completed' || status === 'failed' || status === 'killed'
+}
+
+/** Idle agents (never main) whose shells have all finished and gone unpicked for the grace, counted from the later of their end and the agent's last activity. */
+export const graceDue = (rows: readonly AgentRow[], now: number, graceMs: number, engine?: ReadonlyMap<string, string>): AgentRow[] =>
+  graceMs <= 0
+    ? []
+    : rows.filter(
+        r =>
+          r.id !== 'main' &&
+          r.status === 'idle' &&
+          !engineEnded(r, engine) &&
+          r.shellsDoneAt !== undefined &&
+          openShells(r).length === 0 &&
+          (r.shells ?? []).some(s => s.exit !== undefined) &&
+          now - Math.max(r.shellsDoneAt, r.lastActive) >= graceMs,
+      )
+
+/** How a shell is named to its agent and in the log: its description, else its command cut to 80 characters. */
+export const shellName = (s: Shell): string => s.description || s.command.slice(0, 80)
+const shellEnd = (s: Shell) => `${shellEndWords(s.exit ?? 'unknown')} at ${hhmm(s.endedAt ?? 0)} UTC`
+const outputOf = (s: Shell) => (s.outputPath ? `; output: ${s.outputPath}` : '')
+
+/** Tells an agent which of its background commands finished without it picking them up. */
+export const shellNudge = (shells: readonly Shell[]): string =>
+  shells.length === 1 && shells[0]
+    ? `[orchestrator mod] your background command "${shellName(shells[0])}" (id ${shells[0].id}) ${shellEnd(shells[0])} and you haven't picked it up${outputOf(shells[0])}`
+    : [
+        "[orchestrator mod] your background commands finished and you haven't picked them up:",
+        ...shells.map(s => `- "${shellName(s)}" (id ${s.id}) ${shellEnd(s)}${outputOf(s)}`),
+      ].join('\n')
+
+/** Open shells running past the ceiling, not yet nudged, on live rows (main included). */
+export const ceilingDue = (
+  rows: readonly AgentRow[],
+  now: number,
+  ceilingMs: number,
+  engine?: ReadonlyMap<string, string>,
+): { row: AgentRow; shell: Shell }[] =>
+  ceilingMs <= 0
+    ? []
+    : rows
+        .filter(r => (r.status === 'running' || r.status === 'idle' || r.status === 'handing-over') && !engineEnded(r, engine))
+        .flatMap(r =>
+          openShells(r)
+            .filter(s => !s.ceilingNudged && now - s.startedAt >= ceilingMs)
+            .map(shell => ({ row: r, shell })),
+        )
+
+export const markCeiling = (rows: AgentRow[], shellId: string): AgentRow[] =>
+  rows.map(r =>
+    r.shells?.some(s => s.id === shellId)
+      ? { ...r, shells: r.shells.map(s => (s.id === shellId ? { ...s, ceilingNudged: true as const } : s)) }
+      : r,
+  )
+
+export const ceilingNudge = (shell: Shell, minutes: number): string =>
+  `[orchestrator mod] your background command "${shellName(shell)}" (id ${shell.id}) is still running after ${minutes} min; check it (e.g. a suspended process) or stop it (TaskStop).${shell.outputPath ? ` Output: ${shell.outputPath}` : ''}`
+
+/** Open tracked shells the engine's `background_tasks` list no longer names; nothing unless it is a list. */
+export const goneShells = (rows: readonly AgentRow[], tasks: unknown): { agentId: string; shell: Shell }[] => {
+  if (!Array.isArray(tasks)) return []
+  const listed = new Set(
+    tasks.map(t => (t && typeof t === 'object' ? (t as { id?: unknown }).id : undefined)).filter(id => typeof id === 'string'),
+  )
+  return rows.flatMap(r => openShells(r).filter(s => !listed.has(s.id)).map(shell => ({ agentId: r.id, shell })))
+}
+
+export const watchdogNudge = (minutes: number): string =>
+  `[orchestrator mod] you've been idle ${minutes} min with no running children or background commands; if you're waiting on something, check it; otherwise carry on or report.`

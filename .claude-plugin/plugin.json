@@ -1,6 +1,6 @@
 {
   "name": "orchestrator",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "author": { "name": "Victor Bajanov" },
   "license": "MIT",
   "description": "Watches every agent's context, hands over and respawns agents near the ceiling, restarts the main thread from a handover note, and charts it all in a pane.",
@@ -42,6 +42,30 @@
       "title": "Add the HANDOVER clause to every subagent brief",
       "description": "Appends the cold-restart instructions to each Agent prompt so any agent can be handed over.",
       "default": true
+    },
+    "shellPollSeconds": {
+      "type": "number",
+      "title": "Background command poll (seconds)",
+      "description": "How often background command output files are checked for their exit; 0: never.",
+      "default": 15
+    },
+    "shellGraceSeconds": {
+      "type": "number",
+      "title": "Background command grace (seconds)",
+      "description": "An idle agent that hasn't picked up its finished background commands within this is nudged; 0: never.",
+      "default": 60
+    },
+    "idleWatchdogMinutes": {
+      "type": "number",
+      "title": "Idle watchdog (minutes)",
+      "description": "An idle agent with no running children or background commands this long is nudged once; 0: never.",
+      "default": 5
+    },
+    "shellCeilingMinutes": {
+      "type": "number",
+      "title": "Background command ceiling (minutes)",
+      "description": "A background command still running this long gets its agent one nudge; 0: never.",
+      "default": 60
     }
   }
 }

@@ -27,7 +27,7 @@ const world = (on: On) => {
     /** Runs while /clear is in flight, as a turn the person starts before the restart finishes. */
     duringClear: undefined as (() => Promise<unknown>) | undefined,
     /** What `$.agent.list()` answers. */
-    agents: [] as { id: string; name?: string; teammateId?: string }[],
+    agents: [] as { id: string; name?: string; teammateId?: string; status?: string }[],
     /** The `teammateId` the next `agent.spawn` answers with, once (the list need not give it). */
     nextTeammateId: undefined as string | undefined,
     closed: [] as string[],
@@ -103,6 +103,14 @@ const world = (on: On) => {
     sessionId: 'S1',
     /** `fs.write` to this path throws ('' none). */
     fsFails: '' as string,
+    /** The next `fs.read` throws, once. */
+    readFailsOnce: false,
+    /** Each path `process.run` tailed, in order. */
+    tails: [] as string[],
+    /** Paths whose `tail` rejects (it cannot start, or timed out). */
+    tailFails: new Set<string>(),
+    /** Each path `fs.read` was asked for, in order. */
+    reads: [] as string[],
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -199,9 +207,29 @@ const world = (on: On) => {
   })
   on('fs.exists', ($, e) => ({ value: w.files.has(e.path) }))
   on('fs.read', ($, e) => {
+    w.reads.push(e.path)
+    if (w.readFailsOnce) {
+      w.readFailsOnce = false
+      throw new Error('EIO: read failed')
+    }
     const text = w.files.get(e.path)
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: text }
+  })
+  // `tail -c 256 <path>` on the files above: a missing file exits 1, as tail does.
+  on('process.run', ($, e) => {
+    const path = String(e.argv.at(-1))
+    if (e.argv[0] !== 'tail') throw new Error(`unexpected command ${e.argv.join(' ')}`)
+    w.tails.push(path)
+    if (w.tailFails.has(path)) throw new Error('tail timed out')
+    const text = w.files.get(path)
+    if (text === undefined) return { value: { exitCode: 1, stdout: '', stderr: `tail: ${path}: No such file or directory` } } as never
+    return { value: { exitCode: 0, stdout: text.slice(-256), stderr: '' } } as never
+  })
+  on('fs.stat', ($, e) => {
+    const text = w.files.get(e.path)
+    if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
+    return { value: { kind: 'file', size: text.length, mtimeMs: 0, isLink: false } }
   })
   on('ui.log', ($, e) => {
     if (w.logFails) throw new Error('log broke')
@@ -2315,6 +2343,58 @@ const family = async ($: Engine, w: World) => {
   w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
 }
 
+/** Where the engine writes background commands' output in these tests. */
+const TASKS = '/private/tmp/claude-501/-repo/S1/tasks'
+
+/**
+ * An agent's (or main's) Bash call sent to the background, as the engine answers it: an empty output file, its id,
+ * and the text naming the file; `auto` when the engine moved it there at its timeout.
+ */
+const bgBash = async (
+  $: Engine,
+  w: World,
+  agentId: string | undefined,
+  id: string,
+  o: { description?: string; command?: string; auto?: boolean; endsWithFinal?: boolean; isError?: boolean } = {},
+) => {
+  const path = `${TASKS}/${id}.output`
+  w.files.set(path, '')
+  const text = o.auto
+    ? `Command did not complete within its 3s timeout and was moved to the background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.`
+    : `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.`
+  const before = w.toolAnswer
+  w.toolAnswer = e =>
+    e.tool === 'Bash'
+      ? {
+          result: {
+            stdout: '',
+            stderr: '',
+            interrupted: false,
+            backgroundTaskId: id,
+            ...(o.auto && { timedOutAfterMs: 3000 }),
+            ...(o.endsWithFinal && { backgroundEndsWithFinalResponse: true }),
+          },
+          text,
+          ...(o.isError && { isError: true }),
+        }
+      : before?.(e)
+  try {
+    return await call($, agentId, 'Bash', {
+      command: o.command ?? 'npm test',
+      description: o.description ?? 'run the tests',
+      ...(!o.auto && { run_in_background: true }),
+    })
+  } finally {
+    w.toolAnswer = before
+  }
+}
+
+/** The engine appends a background command's exit marker to its output file. */
+const endOutput = (w: World, id: string, code: number | 'killed') => {
+  const path = `${TASKS}/${id}.output`
+  w.files.set(path, (w.files.get(path) ?? '') + (code === 'killed' ? '\n[killed]\n' : `\n[exited with code ${code}]\n`))
+}
+
 describe('check-in', () => {
   const MIN = 60_000
   const CHECKIN = 'mcp__orchestrator__checkin'
@@ -2520,6 +2600,151 @@ describe('check-in', () => {
     await $.command.run({ command: 'orch', args: 'handover impl-2' } as never)
     await call($, 'agent1', CHECKIN, { agent: 'impl-2', minutes: 30 })
     expect((await tool($, 'agent2')).context?.[0]).toContain('HANDOVER')
+  })
+})
+
+describe('idle watchdog', () => {
+  const MIN = 60_000
+  /** Time passes, then a turn ends (main's), which delivers what the timers queued. */
+  const later = async ($: Engine, w: World, ms: number) => {
+    await w.clock.advance(ms)
+    await complete($, undefined)
+    await w.clock.settle()
+  }
+  const nudges = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes("you've been idle"))
+  /** A teammate under main that ran once and went idle; the engine lists it idle. */
+  const idleMate = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'mate', isTeammate: true })
+    await step($, 'agent1')
+    await complete($, 'agent1', 'waiting')
+    w.agents = [{ id: 'agent1', name: 'mate', status: 'idle' }]
+  }
+
+  test('an idle teammate with nothing running is nudged once after idleWatchdogMinutes', async ($, on) => {
+    const w = world(on)
+    await idleMate($, w)
+    await later($, w, 4 * MIN)
+    expect(nudges(w)).toHaveLength(0)
+    await later($, w, MIN + 30_000)
+    expect(nudges(w)).toHaveLength(1)
+    expect(nudges(w)[0]!.text).toContain('[orchestrator mod]')
+    expect(nudges(w)[0]!.text).toContain('5 min')
+    expect(row(w, 'agent1')!.watchdog).toEqual(expect.objectContaining({ ends: 0 }))
+    expect(JSON.stringify(w.files.get(`${RUN_DIR}/activity.log`) ?? '')).toContain('idle 5 min with nothing running: nudged')
+    await later($, w, 20 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('after the nudge\'s run ends, not again; after another run and the idle time, again', async ($, on) => {
+    const w = world(on)
+    await idleMate($, w)
+    await later($, w, 6 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+    // The nudge's own run.
+    await step($, 'agent1')
+    await complete($, 'agent1', 'still waiting')
+    expect(row(w, 'agent1')!.watchdog).toEqual(expect.objectContaining({ ends: 1 }))
+    await later($, w, 10 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+    // A run besides it (a message woke it): the next idle stretch is watched again.
+    await step($, 'agent1')
+    await complete($, 'agent1', 'did more')
+    expect(row(w, 'agent1')!.watchdog).toEqual(expect.objectContaining({ ends: 2 }))
+    await later($, w, 4 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+    await later($, w, MIN + 30_000)
+    expect(nudges(w)).toHaveLength(2)
+  })
+
+  test('a completed one-shot subagent, an agent waiting on children and an agent with a background shell are never nudged', async ($, on) => {
+    const w = world(on)
+    await start($)
+    // agent1: a one-shot subagent, ended; the engine lists it completed.
+    await spawn($, { prompt: 'P', name: 'once' })
+    await step($, 'agent1')
+    await complete($, 'agent1', 'R')
+    // agent2: a teammate waiting on its running child agent3.
+    await spawn($, { prompt: 'P', name: 'boss', isTeammate: true })
+    await step($, 'agent2')
+    await spawn($, { prompt: 'P', name: 'kid', parentAgentId: 'agent2' })
+    await step($, 'agent3')
+    await complete($, 'agent2', 'waiting')
+    // agent4: a teammate whose background command still runs.
+    await spawn($, { prompt: 'P', name: 'shelly', isTeammate: true })
+    await step($, 'agent4')
+    await bgBash($, w, 'agent4', 'b1')
+    await complete($, 'agent4', 'waiting')
+    w.agents = [
+      { id: 'agent1', name: 'once', status: 'completed' },
+      { id: 'agent2', name: 'boss', status: 'idle' },
+      { id: 'agent3', name: 'kid', status: 'running' },
+      { id: 'agent4', name: 'shelly', status: 'idle' },
+    ]
+    await later($, w, 15 * MIN)
+    expect(w.sent.filter(m => m.text.includes("you've been idle"))).toHaveLength(0)
+    expect(row(w, 'agent1')!.watchdog).toBeUndefined()
+  })
+
+  test('idleWatchdogMinutes 0 never nudges', { options: { idleWatchdogMinutes: 0 } }, async ($, on) => {
+    const w = world(on)
+    await idleMate($, w)
+    await later($, w, 60 * MIN)
+    expect(nudges(w)).toHaveLength(0)
+  })
+})
+
+describe('check-in on a teammate', () => {
+  const MIN = 60_000
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  const later = async ($: Engine, w: World, ms: number) => {
+    await w.clock.advance(ms)
+    await complete($, undefined)
+    await w.clock.settle()
+  }
+  const fired = (w: World) => w.prompts.filter(p => p.includes('check-in') && p.includes('mate'))
+  /** Main's teammate `mate` (agent1), listed by the engine, with main's 5-minute check-in on it. */
+  const armed = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'mate', isTeammate: true })
+    await step($, 'agent1')
+    w.agents = [{ id: 'agent1', name: 'mate' }]
+    await call($, undefined, CHECKIN, { agent: 'mate', minutes: 5 })
+    expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+  }
+
+  test("main's check-in on a teammate survives its turn ends and fires", async ($, on) => {
+    const w = world(on)
+    await armed($, w)
+    await complete($, 'agent1', 'waiting for my children')
+    expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+    await step($, 'agent1')
+    await complete($, 'agent1', 'still waiting')
+    expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+    await later($, w, 6 * MIN)
+    expect(fired(w)).toHaveLength(1)
+  })
+
+  test('its SendMessage to main disarms it', async ($, on) => {
+    const w = world(on)
+    await armed($, w)
+    await complete($, 'agent1', 'waiting')
+    await step($, 'agent1')
+    await call($, 'agent1', 'SendMessage', { to: 'main', message: 'all done' })
+    expect(row(w, 'agent1')!.checkinAt).toBeUndefined()
+    await later($, w, 6 * MIN)
+    expect(fired(w)).toHaveLength(0)
+  })
+
+  test('sync marking it done disarms it', async ($, on) => {
+    const w = world(on)
+    await armed($, w)
+    w.agents = []
+    await w.clock.advance(30_000)
+    expect(row(w, 'agent1')!.status).toBe('done')
+    expect(row(w, 'agent1')!.checkinAt).toBeUndefined()
+    await later($, w, 6 * MIN)
+    expect(fired(w)).toHaveLength(0)
   })
 })
 
@@ -2971,6 +3196,205 @@ describe('repeated answers', () => {
     expect(text).toContain(`${hhmm(t1)} Still working`)
     expect(text).toContain(`${hhmm(t2)} Still working`)
     await ui.unmount()
+  })
+})
+
+describe('background shells: reconciled at turn ends', () => {
+  const opts = { options: { shellPollSeconds: 0 } }
+  const out = (id: string) => `${TASKS}/${id}.output`
+  /** A background task as `background_tasks` lists it: session-wide, still running. */
+  const task = (id: string) => ({ id, type: 'shell', status: 'running', description: 'run the tests', command: 'npm test' })
+  /** A subagent's turn end as the classic hook sees it; `tasks` absent as an older engine sends it. */
+  const subagentStop = ($: Engine, agentId: string, tasks?: unknown[]) =>
+    $.classic.SubagentStop({
+      stop_hook_active: false,
+      agent_id: agentId,
+      agent_transcript_path: `/t/${agentId}.jsonl`,
+      agent_type: 'general-purpose',
+      ...(tasks && { background_tasks: tasks }),
+    } as never)
+  const exits = (w: World, id = 'agent2') => row(w, id)!.shells!.map(s => [s.id, s.exit])
+  /** The world, with the engine's own answers to both turn-end hooks beneath the plugin. */
+  const stopWorld = (on: On, sub: object | (() => Promise<object>) = {}, stop: object | (() => Promise<object>) = {}) => {
+    on('classic.SubagentStop', () => (typeof sub === 'function' ? sub() : sub))
+    on('classic.Stop', () => (typeof stop === 'function' ? stop() : stop))
+    return world(on)
+  }
+
+  test("a tracked shell missing from SubagentStop's background_tasks is ended with the code its file holds", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    endOutput(w, 'b1', 3)
+    const t = w.clock.now()
+    await subagentStop($, 'agent2', [task('b2')])
+    expect(exits(w)).toEqual([
+      ['b1', 3],
+      ['b2', undefined],
+    ])
+    expect(row(w, 'agent2')!.shells![0]!.endedAt).toBe(t)
+    await w.clock.settle()
+    expect(w.files.get(`${RUN_DIR}/activity.log`)).toContain('impl-2: background command "run the tests" (b1) exited with code 3')
+    // Saved, and nothing sent.
+    const saved = JSON.parse(w.writes.at(-1)!) as { agents: AgentRow[] }
+    expect(saved.agents.find(a => a.id === 'agent2')!.shells![0]!.exit).toBe(3)
+    expect(w.sent).toEqual([])
+  })
+
+  test("reconcile reads a big file's code from its tail, not unknown", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 10))
+    endOutput(w, 'b1', 7)
+    await subagentStop($, 'agent2', [])
+    expect(exits(w)).toEqual([['b1', 7]])
+    expect(w.tails).toEqual([out('b1')])
+    expect(w.reads.filter(p => p === out('b1'))).toEqual([])
+  })
+
+  test('with no marker it is ended as unknown', opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'partial output\n')
+    await subagentStop($, 'agent2', [])
+    expect(exits(w)).toEqual([['b1', 'unknown']])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBe(w.clock.now())
+    await w.clock.settle()
+    expect(w.files.get(`${RUN_DIR}/activity.log`)).toContain('(b1) finished (exit code unknown)')
+  })
+
+  test('a shell still listed stays open', opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    const writes = w.writes.length
+    // The list is session-wide: other agents' work is in it too.
+    await subagentStop($, 'agent2', [task('b1'), { id: 'a9', type: 'subagent', status: 'running', description: 'x' }])
+    expect(exits(w)).toEqual([['b1', undefined]])
+    expect(w.writes.length).toBe(writes)
+  })
+
+  test("main's Stop reconciles too", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    endOutput(w, 'm1', 0)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w, 'main')).toEqual([['m1', 0]])
+  })
+
+  test("another agent's shell started 5 s earlier stays open", opts, async ($, on) => {
+    // The session-wide list may predate another agent's new shell: only the stopping agent's own are ended at once.
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent1', 'a1')
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await w.clock.advance(5_000)
+    await subagentStop($, 'agent1', [])
+    expect(exits(w, 'agent1')).toEqual([['a1', 'unknown']])
+    expect(exits(w)).toEqual([['b1', undefined]])
+    // The same at main's Stop.
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    await w.clock.advance(5_000)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w, 'main')).toEqual([['m1', 'unknown']])
+    expect(exits(w)).toEqual([['b1', undefined]])
+  })
+
+  test("another agent's shell at exactly 30 s is ended", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await w.clock.advance(30_000)
+    await subagentStop($, 'agent1', [])
+    expect(exits(w)).toEqual([['b1', 'unknown']])
+  })
+
+  test("another agent's shell started over 30 s earlier and missing from background_tasks is ended", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await w.clock.advance(31_000)
+    await subagentStop($, 'agent1', [])
+    expect(exits(w)).toEqual([['b1', 0]])
+    // The same at main's Stop.
+    await step($)
+    await bgBash($, w, 'agent2', 'b2')
+    await w.clock.advance(31_000)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w)).toEqual([
+      ['b1', 0],
+      ['b2', 'unknown'],
+    ])
+  })
+
+  test('no background_tasks field changes nothing', opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    const writes = w.writes.length
+    await subagentStop($, 'agent2')
+    await $.classic.Stop({ stop_hook_active: false } as never)
+    // a background_tasks that isn't a list is ignored too
+    await subagentStop($, 'agent2', 'junk' as never)
+    expect(exits(w)).toEqual([['b1', undefined]])
+    expect(w.writes.length).toBe(writes)
+  })
+
+  test("an unreadable file still ends it as unknown, and the hook answers next's result", opts, async ($, on) => {
+    const w = stopWorld(on, { block: 'keep going' }, { block: 'not yet' })
+    await family($, w)
+    await step($)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, undefined, 'm1')
+    endOutput(w, 'b1', 0)
+    w.readFailsOnce = true
+    w.files.delete(out('b2'))
+    expect(await subagentStop($, 'agent2', [task('m1')])).toEqual({ block: 'keep going' })
+    expect(exits(w)).toEqual([
+      ['b1', 'unknown'],
+      ['b2', 'unknown'],
+    ])
+    expect(await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)).toEqual({ block: 'not yet' })
+    expect(exits(w, 'main')).toEqual([['m1', 'unknown']])
+    // A failing state write in the mod's own bookkeeping still answers next's result.
+    await bgBash($, w, 'agent2', 'b3')
+    w.fsFails = STATE
+    expect(await subagentStop($, 'agent2', [])).toEqual({ block: 'keep going' })
+  })
+
+  test('a shell tracked while SubagentStop runs is not ended by its background_tasks', opts, async ($, on) => {
+    // The list was taken before the hook ran: a shell backgrounded meanwhile is missing from it, not gone.
+    let w: World
+    w = stopWorld(on, async () => {
+      await bgBash($, w, 'agent2', 'b9')
+      return {}
+    })
+    await family($, w)
+    await subagentStop($, 'agent2', [])
+    expect(exits(w)).toEqual([['b9', undefined]])
+  })
+
+  test('a shell tracked while Stop runs is not ended by its background_tasks', opts, async ($, on) => {
+    let w: World
+    w = stopWorld(on, {}, async () => {
+      await bgBash($, w, undefined, 'm9')
+      return {}
+    })
+    await family($, w)
+    await step($)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w, 'main')).toEqual([['m9', undefined]])
   })
 })
 
@@ -4722,5 +5146,610 @@ describe('activity.log', () => {
     expect(l.some(x => x.includes('already starting'))).toBe(false)
     expect(l.some(x => x.includes('HANDOVER sent'))).toBe(true)
     await ui.unmount()
+  })
+})
+
+describe('background shells: tracking', () => {
+  const ACT = `${RUN_DIR}/activity.log`
+  const logged = async (w: World, text: string) => {
+    await w.clock.settle()
+    return (w.files.get(ACT) ?? '').includes(text)
+  }
+  const out = (id: string) => `${TASKS}/${id}.output`
+  /** One poll interval (15 s by default) passes and the poll's reads settle. */
+  const poll = async (w: World, ms = 15_000) => {
+    await w.clock.advance(ms)
+    await w.clock.settle()
+  }
+
+  test("a subagent's backgrounded Bash call is tracked on its row and logged", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    const now = w.clock.now()
+    await bgBash($, w, 'agent2', 'b1', { description: 'run the tests', command: 'npm test' })
+    expect(row(w, 'agent2')!.shells).toEqual([
+      { id: 'b1', outputPath: out('b1'), description: 'run the tests', command: 'npm test', startedAt: now },
+    ])
+    expect(row(w, 'agent1')!.shells).toBeUndefined()
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) started')).toBe(true)
+  })
+
+  test('a command the engine moved to the background is tracked too', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b2', { auto: true, description: 'build' })
+    expect(row(w, 'agent2')!.shells).toEqual([expect.objectContaining({ id: 'b2', outputPath: out('b2'), description: 'build' })])
+    // With no description, the log names it by its command, cut to 80 characters.
+    await bgBash($, w, 'agent2', 'b3', { auto: true, description: '', command: 'x'.repeat(100) })
+    expect(await logged(w, `impl-2: background command "${'x'.repeat(80)}" (b3) started`)).toBe(true)
+  })
+
+  test("main's backgrounded call is tracked on main's row", async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    expect(row(w, 'main')!.shells).toEqual([expect.objectContaining({ id: 'm1', outputPath: out('m1') })])
+    expect(await logged(w, 'main thread: background command "run the tests" (m1) started')).toBe(true)
+  })
+
+  test('foreground, failed and ends-with-final-response calls are not tracked', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await call($, 'agent2', 'Bash', { command: 'ls', description: 'list' })
+    await bgBash($, w, 'agent2', 'b1', { isError: true })
+    await bgBash($, w, 'agent2', 'b2', { endsWithFinal: true })
+    expect(row(w, 'agent2')!.shells).toBeUndefined()
+    expect(await logged(w, 'background command')).toBe(false)
+  })
+
+  test('TaskStop of a tracked shell (task_id or shell_id) drops it and logs the stop; an unknown id changes nothing', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2', { description: 'build' })
+    await bgBash($, w, 'agent2', 'b3')
+    await call($, 'agent2', 'TaskStop', { task_id: 'b1' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b2', 'b3'])
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) stopped (TaskStop)')).toBe(true)
+    // The model's stop of its parent's shell, by the deprecated alias, still finds it.
+    await call($, 'agent1', 'TaskStop', { shell_id: 'b2' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b3'])
+    expect(await logged(w, 'impl-2: background command "build" (b2) stopped (TaskStop)')).toBe(true)
+    const writes = w.writes.length
+    await call($, 'agent2', 'TaskStop', { task_id: 'nope' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b3'])
+    expect(w.writes.length).toBe(writes)
+  })
+
+  test('the poll records the exit code and its time from the output file and logs it', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'all 12 passed')
+    endOutput(w, 'b1', 0)
+    const t = w.clock.now() + 15_000
+    await poll(w)
+    const r = row(w, 'agent2')!
+    expect(r.shells).toEqual([expect.objectContaining({ id: 'b1', exit: 0, endedAt: t })])
+    expect(r.shellsDoneAt).toBe(t)
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) exited with code 0')).toBe(true)
+  })
+
+  test('a killed marker is recorded as killed; no marker or a marker mid-file leaves it open', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, 'agent2', 'b3')
+    endOutput(w, 'b1', 'killed')
+    w.files.set(out('b2'), 'still working\n')
+    w.files.set(out('b3'), '\n[exited with code 0]\nand more output\n')
+    await poll(w)
+    const shells = row(w, 'agent2')!.shells!
+    expect(shells.map(s => [s.id, s.exit])).toEqual([
+      ['b1', 'killed'],
+      ['b2', undefined],
+      ['b3', undefined],
+    ])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBeUndefined()
+    expect(await logged(w, '(b1) was killed')).toBe(true)
+  })
+
+  test('an unchanged file is not read again', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    const reads = () => w.reads.filter(p => p === out('b1')).length
+    // Empty as it was backgrounded: nothing to read.
+    await poll(w)
+    expect(reads()).toBe(0)
+    w.files.set(out('b1'), 'some output\n')
+    await poll(w)
+    expect(reads()).toBe(1)
+    await poll(w)
+    await poll(w)
+    expect(reads()).toBe(1)
+    endOutput(w, 'b1', 3)
+    await poll(w)
+    expect(reads()).toBe(2)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(3)
+    // Ended: no longer polled.
+    w.files.set(out('b1'), 'changed again')
+    await poll(w)
+    expect(reads()).toBe(2)
+  })
+
+  test('a missing or over-64 KiB output file is not read and stays open; the poll keeps going', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, 'agent2', 'b3')
+    w.files.delete(out('b1'))
+    w.files.set(out('b2'), 'x'.repeat(64 * 1024 + 1) + '\n[exited with code 0]\n')
+    // Its tail fails too: nothing settles it.
+    w.tailFails.add(out('b2'))
+    endOutput(w, 'b3', 0)
+    await poll(w)
+    expect(w.reads.filter(p => p === out('b1') || p === out('b2'))).toEqual([])
+    expect(row(w, 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', undefined],
+      ['b2', undefined],
+      ['b3', 0],
+    ])
+    endOutput(w, 'b1', 2)
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(2)
+  })
+
+  test('a shell whose output file passed 64 KiB is ended from its tail', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    const big = 'x'.repeat(64 * 1024 + 10)
+    w.files.set(out('b1'), big)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+    // Unchanged: not tailed again.
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    endOutput(w, 'b1', 4)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1'), out('b1')])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(4)
+    expect(w.reads.filter(p => p === out('b1'))).toEqual([])
+  })
+
+  test('a file over 64 KiB is checked by its tail, not read whole; one of 64 KiB is read whole', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    const marker = '\n[exited with code 0]\n'
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 1 - marker.length) + marker)
+    w.files.set(out('b2'), 'x'.repeat(64 * 1024 - marker.length) + marker)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    expect(w.reads.filter(p => p === out('b1') || p === out('b2'))).toEqual([out('b2')])
+    expect(row(w, 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', 0],
+      ['b2', 0],
+    ])
+  })
+
+  test('a tail that fails leaves the big shell open, no throw', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 10) + '\n[exited with code 0]\n')
+    w.tailFails.add(out('b1'))
+    endOutput(w, 'b2', 1)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    expect(row(w, 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', undefined],
+      ['b2', 1],
+    ])
+  })
+
+  test('a tail that fails once is retried on the next poll', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 10) + '\n[exited with code 0]\n')
+    w.tailFails.add(out('b1'))
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+    w.tailFails.clear()
+    // The file has not grown: the failed tail is retried anyway.
+    await poll(w)
+    expect(w.tails).toEqual([out('b1'), out('b1')])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(0)
+  })
+
+  test('a failed read is retried on the next poll', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    w.readFailsOnce = true
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(0)
+  })
+
+  test('shellPollSeconds 0 polls nothing', { options: { shellPollSeconds: 0 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await poll(w, 120_000)
+    expect(w.reads.filter(p => p === out('b1'))).toEqual([])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+  })
+
+  test('tracked shells survive in state.json', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    endOutput(w, 'b2', 1)
+    await poll(w)
+    const saved = JSON.parse(w.writes.at(-1)!) as { agents: AgentRow[] }
+    expect(saved.agents.find(a => a.id === 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', undefined],
+      ['b2', 1],
+    ])
+    expect(row(w, 'agent2')!.shells).toHaveLength(2)
+  })
+})
+
+describe('background shells: grace and ceiling nudges', () => {
+  const ACT = `${RUN_DIR}/activity.log`
+  const logged = async (w: World, text: string) => {
+    await w.clock.settle()
+    return (w.files.get(ACT) ?? '').includes(text)
+  }
+  const out = (id: string) => `${TASKS}/${id}.output`
+  const poll = async (w: World, ms = 15_000) => {
+    await w.clock.advance(ms)
+    await w.clock.settle()
+  }
+  /** A turn end (main's) delivers what the timers queued. */
+  const drained = async ($: Engine, w: World) => {
+    await complete($, undefined)
+    await w.clock.settle()
+  }
+  const nudges = (w: World, to = 'agent2') => w.sent.filter(m => m.to.includes(to) && m.text.includes('background command'))
+  const at = (t: number) => new Date(t).toISOString().slice(11, 16)
+  /** agent2 (impl-2) backgrounds `id`, ends its turn (idle), and the poll sees the command exit with `code`. */
+  const idleWithEnded = async ($: Engine, w: World, id: string, code: number | 'killed' = 0) => {
+    await family($, w)
+    await bgBash($, w, 'agent2', id)
+    await complete($, 'agent2')
+    endOutput(w, id, code)
+    await poll(w)
+    expect(row(w, 'agent2')!.status).toBe('idle')
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(code)
+    return row(w, 'agent2')!.shells![0]!.endedAt!
+  }
+
+  test('an idle agent whose last shell exited is nudged once after the grace, with the code, time and output path', async ($, on) => {
+    const w = world(on)
+    const t = await idleWithEnded($, w, 'b1', 0)
+    await poll(w, 45_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    await poll(w, 15_000)
+    // Queued, not sent: nothing reaches the agent before a turn end.
+    expect(nudges(w)).toEqual([])
+    await drained($, w)
+    expect(nudges(w).map(m => m.text)).toEqual([
+      `[orchestrator mod] your background command "run the tests" (id b1) exited with code 0 at ${at(t)} UTC and you haven't picked it up; output: ${out('b1')}`,
+    ])
+    expect(await logged(w, 'impl-2: nudged about finished background command(s) b1')).toBe(true)
+    expect(row(w, 'agent2')!.shells).toEqual([])
+    await poll(w, 300_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('a step that starts a new run within the grace picks it up: no nudge', async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await step($, 'agent2')
+    expect(row(w, 'agent2')!.shells).toEqual([])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBeUndefined()
+    await complete($, 'agent2')
+    await poll(w, 120_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+  })
+
+  test("a busy agent's steps don't pick it up; the grace runs from its turn end", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    await poll(w, 30_000)
+    // Still in the same run: it may not have seen the notice.
+    await step($, 'agent2')
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+    await complete($, 'agent2')
+    await poll(w, 45_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    await poll(w, 15_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test("a tool call naming the shell's id or output path picks it up", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, 'agent2', 'b3')
+    endOutput(w, 'b1', 0)
+    endOutput(w, 'b2', 0)
+    await poll(w)
+    await call($, 'agent2', 'Read', { file_path: out('b1') })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b2', 'b3'])
+    // Naming an open shell picks up nothing.
+    await call($, 'agent2', 'TaskOutput', { task_id: 'b3' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b2', 'b3'])
+    await call($, 'agent2', 'TaskOutput', { task_id: 'b2' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b3'])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBeUndefined()
+  })
+
+  test('with another shell still open, no nudge; when that one ends too, one nudge lists both', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2', { description: 'build' })
+    await complete($, 'agent2')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    await poll(w, 120_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    endOutput(w, 'b2', 2)
+    await poll(w)
+    const t1 = row(w, 'agent2')!.shells![0]!.endedAt!
+    const t2 = row(w, 'agent2')!.shells![1]!.endedAt!
+    await poll(w, 60_000)
+    await drained($, w)
+    expect(nudges(w).map(m => m.text)).toEqual([
+      [
+        "[orchestrator mod] your background commands finished and you haven't picked them up:",
+        `- "run the tests" (id b1) exited with code 0 at ${at(t1)} UTC; output: ${out('b1')}`,
+        `- "build" (id b2) exited with code 2 at ${at(t2)} UTC; output: ${out('b2')}`,
+      ].join('\n'),
+    ])
+    expect(await logged(w, 'impl-2: nudged about finished background command(s) b1, b2')).toBe(true)
+  })
+
+  test("a killed shell's nudge says it was killed", async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1', 'killed')
+    await poll(w, 60_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+    expect(nudges(w)[0]!.text).toContain('(id b1) was killed at ')
+  })
+
+  test('main is never nudged; its finished shells are dropped at its next step', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    await complete($, undefined)
+    endOutput(w, 'm1', 0)
+    await poll(w)
+    expect(row(w, 'main')!.shells![0]!.exit).toBe(0)
+    await poll(w, 300_000)
+    await drained($, w)
+    expect(w.sent.filter(m => m.text.includes('background command'))).toEqual([])
+    expect(w.prompts.filter(p => p.includes('background command'))).toEqual([])
+    await step($)
+    expect(row(w, 'main')!.shells).toEqual([])
+  })
+
+  test('shellGraceSeconds 0 never nudges', { options: { shellGraceSeconds: 0 } }, async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+  })
+
+  test('a shell open past shellCeilingMinutes nudges its agent once', { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await poll(w, 105_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    await poll(w, 15_000)
+    expect(nudges(w)).toEqual([])
+    await drained($, w)
+    expect(nudges(w).map(m => m.text)).toEqual([
+      `[orchestrator mod] your background command "run the tests" (id b1) is still running after 2 min; check it (e.g. a suspended process) or stop it (TaskStop). Output: ${out('b1')}`,
+    ])
+    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBe(true)
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) still running after 2 min: nudged')).toBe(true)
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test("main's shell past the ceiling is a warning toast, not a prompt", { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    await poll(w, 120_000)
+    await drained($, w)
+    const warned = (id: string) => w.toasts.filter(t => t.includes(`main thread: background command "run the tests" (${id}) still running after 2 min`))
+    expect(warned('m1')).toHaveLength(1)
+    expect(w.prompts.filter(p => p.includes('background command'))).toEqual([])
+    expect(w.sent.filter(m => m.text.includes('background command'))).toEqual([])
+    await poll(w, 600_000)
+    expect(warned('m1')).toHaveLength(1)
+  })
+
+  test('shellCeilingMinutes 0 never nudges', { options: { shellCeilingMinutes: 0 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await poll(w, 24 * 3_600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBeUndefined()
+  })
+
+  test('a nudge for an agent no longer live is dropped unsent', async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await poll(w, 60_000)
+    const outbox = () => (JSON.parse(w.files.get(STATE)!) as { outbox: { text: string }[] }).outbox
+    expect(outbox().some(d => d.text.includes('(id b1)'))).toBe(true)
+    // The engine no longer lists it: sync marks it done before any turn end delivers.
+    w.agents = [{ id: 'agent1', name: 'impl-1' }]
+    await poll(w, 30_000)
+    expect(row(w, 'agent2')!.status).toBe('done')
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+  })
+
+  test("a stalled agent's step keeps its finished shells", async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    await step($, 'agent1')
+    await bgBash($, w, 'agent1', 'b1')
+    endOutput(w, 'b1', 0)
+    // Past the threshold, its HANDOVER carried by a tool result, then left past the stall time.
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    await poll(w, 20 * 60_000 + 30_000)
+    expect(row(w, 'agent1')!.status).toBe('stalled')
+    expect(row(w, 'agent1')!.shells!.map(s => [s.id, s.exit])).toEqual([['b1', 0]])
+    await step($, 'agent1')
+    expect(row(w, 'agent1')!.shells!.map(s => s.id)).toEqual(['b1'])
+  })
+
+  test('a failed tool call naming a finished shell\'s output path does not pick it up', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    w.toolAnswer = e => (e.tool === 'Read' ? { isError: true, result: 'ENOENT' } : undefined)
+    await call($, 'agent2', 'Read', { file_path: out('b1') })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+    await complete($, 'agent2')
+    await poll(w, 60_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('a tool call that names no finished shell writes no state', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    const writes = w.writes.length
+    await call($, 'agent2', 'Bash', { command: 'ls', description: 'list' })
+    expect(w.writes.length).toBe(writes)
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+  })
+
+  test("a shell that ends during a new run's first step is not picked up; with no further step, the grace nudge still fires", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await complete($, 'agent2')
+    // Woken by something else; while its first step runs, the command exits and the poll sees it.
+    let release = () => {}
+    w.holdNext = new Promise<void>(r => (release = r))
+    const stepping = step($, 'agent2')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(0)
+    w.holdNext = undefined
+    release()
+    await stepping
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+    await complete($, 'agent2')
+    await poll(w, 60_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('a completed one-shot subagent with an unpicked finished shell is never nudged', async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2', status: 'completed' }]
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+  })
+
+  test("a completed subagent's shell past the ceiling is not nudged", { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await complete($, 'agent2')
+    w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2', status: 'completed' }]
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    // Settled without a nudge, so later ticks don't ask the engine about it again.
+    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBe(true)
+  })
+
+  test("a failing agent list still nudges an idle agent's finished shell", async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await poll(w, 45_000)
+    // Only at the grace's tick (75 s from the start, between two syncs) does the engine's list fail.
+    const broken = Promise.reject(new Error('list broke'))
+    broken.catch(() => undefined)
+    w.holdList = broken
+    await poll(w, 15_000)
+    w.holdList = undefined
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test("an engine-ended row's shells are settled once, so the next tick lists the engine no more", { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent1', 'b2')
+    await complete($, 'agent2')
+    await complete($, 'agent1')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    w.agents = [
+      { id: 'agent1', name: 'impl-1', status: 'killed' },
+      { id: 'agent2', name: 'impl-2', status: 'completed' },
+    ]
+    await poll(w, 120_000)
+    await drained($, w)
+    expect(nudges(w, 'agent')).toEqual([])
+    // Nothing left due: the finished shell is dropped, the open one marked past its ceiling.
+    expect(row(w, 'agent2')!.shells).toEqual([])
+    expect(row(w, 'agent1')!.shells!.map(s => [s.id, s.ceilingNudged])).toEqual([['b2', true]])
   })
 })
