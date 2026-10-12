@@ -61,7 +61,7 @@ The engine sometimes never wakes an idle agent when its own background shell exi
   - `now - lastActive ≥ idleWatchdogMinutes`.
 
   Once per idle stretch: the nudge sets `watchdog = { t, ends: 0 }`, and each `onAgentEnd` adds one to `ends`. It is re-armed when `ends ≥ 2`: a run besides the nudge's own. Tracking a new shell also re-arms it (`addShell` clears it). In practice this targets idle teammates and background agents the engine keeps `idle`. Main is never nagged.
-- **Reconciliation is in (Task B).** It's cheap: two classic registrations with no sends. At a `Stop` or `SubagentStop` whose `background_tasks` is an array, any tracked open shell whose id isn't listed is ended. The code comes from its file, and with no marker it is `unknown`. A missing field (an older engine) does nothing.
+- **Reconciliation is in (Task B).** It's cheap: two classic registrations with no sends. At a `Stop` or `SubagentStop` whose `background_tasks` is an array, any tracked open shell whose id isn't listed is ended: the stopping agent's (main at `Stop`) at once, another agent's once it started at least 30 s before the turn end. The code comes from its file, and with no marker it is `unknown`. A missing field (an older engine) does nothing.
 - **A teammate's check-in survives its turn ends (Task C).** It's small and safe: a SendMessage report still disarms it, and so does ending, now including `sync`'s `done` (R:1300 gets `...DISARMED`). A teammate ends a turn every time it waits for its children. Today that disarms main's check-in on a teammate orchestrator at its first turn end, so it can never fire. Plain subagents keep today's rule: a run end is their report (forwarded or told to main).
 - **Pane display of open shells goes to the backlog.** Both pane trees (R:1847+) are large render code that every task would collide in. The activity log and `state.json` carry the information.
 - **Ownership on handover goes to the backlog.** A replaced agent's open shells stay on its row and are never nudged, since it isn't `idle`.
@@ -319,6 +319,7 @@ It returns `[]` when `idleMs <= 0`. Otherwise every row where all of these hold:
 - A busy agent whose notice was absorbed mid-run but who never named the shell gets one possibly redundant nudge.
 - A file over 64 KiB is checked through `tail -c 256`. One whose tail fails, or a hard crash with no marker, is caught only by reconciliation (`unknown`) or the ceiling.
 - Teammates running in their own terminal pane make no `tool.call` in this process: their shells aren't tracked.
+- Reconciliation (code-review #2): a turn end ends the stopping agent's unlisted shells at once (`SubagentStop` that agent's, `Stop` main's), and another agent's only when it started at least 30 s (`RECONCILE_MARGIN_MS`) before the turn end. The session-wide `background_tasks` is a snapshot that can predate another agent's new shell, so ending a just-started one from it could end a running shell. The trade-off: another agent's shell gone at a turn end less than 30 s after it started is left to the poll or a later turn end; if the poll can't read its file (polling off, or the file is missing or unreadable) and no turn end comes, only the ceiling nudge catches it.
 - Backlog: pane display of open shells; moving open shells to a replacement on handover.
 
 ## Manual checks (final reviewer)

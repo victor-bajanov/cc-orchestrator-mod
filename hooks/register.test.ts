@@ -3288,28 +3288,52 @@ describe('background shells: reconciled at turn ends', () => {
     expect(exits(w, 'main')).toEqual([['m1', 0]])
   })
 
-  test("another agent's tracked shell missing from background_tasks at this agent's SubagentStop stays open", opts, async ($, on) => {
-    // Only the stopping agent's own shells are reconciled at its turn end.
+  test("another agent's shell started 5 s earlier stays open", opts, async ($, on) => {
+    // The session-wide list may predate another agent's new shell: only the stopping agent's own are ended at once.
     const w = stopWorld(on)
     await family($, w)
     await bgBash($, w, 'agent1', 'a1')
     await bgBash($, w, 'agent2', 'b1')
     endOutput(w, 'b1', 0)
+    await w.clock.advance(5_000)
     await subagentStop($, 'agent1', [])
     expect(exits(w, 'agent1')).toEqual([['a1', 'unknown']])
     expect(exits(w)).toEqual([['b1', undefined]])
-  })
-
-  test("a subagent's shell missing at main's Stop stays open", opts, async ($, on) => {
-    const w = stopWorld(on)
-    await family($, w)
+    // The same at main's Stop.
     await step($)
     await bgBash($, w, undefined, 'm1')
-    await bgBash($, w, 'agent2', 'b1')
-    endOutput(w, 'b1', 0)
+    await w.clock.advance(5_000)
     await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
     expect(exits(w, 'main')).toEqual([['m1', 'unknown']])
     expect(exits(w)).toEqual([['b1', undefined]])
+  })
+
+  test("another agent's shell at exactly 30 s is ended", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await w.clock.advance(30_000)
+    await subagentStop($, 'agent1', [])
+    expect(exits(w)).toEqual([['b1', 'unknown']])
+  })
+
+  test("another agent's shell started over 30 s earlier and missing from background_tasks is ended", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await w.clock.advance(31_000)
+    await subagentStop($, 'agent1', [])
+    expect(exits(w)).toEqual([['b1', 0]])
+    // The same at main's Stop.
+    await step($)
+    await bgBash($, w, 'agent2', 'b2')
+    await w.clock.advance(31_000)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w)).toEqual([
+      ['b1', 0],
+      ['b2', 'unknown'],
+    ])
   })
 
   test('no background_tasks field changes nothing', opts, async ($, on) => {

@@ -1115,16 +1115,24 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
   }
 }
 
+/** How long before a turn end another agent's shell must have started for that turn end's list to cover it. */
+const RECONCILE_MARGIN_MS = 30_000
+
 /**
  * Ends every tracked open shell a turn end's `background_tasks` no longer lists (the engine drops a finished one):
  * with the code its file holds, else `unknown`. It catches what polling missed. A missing list does nothing.
  * `rows` are those read before the hook's `next`: a shell tracked while it ran is missing from the list, not gone.
- * Only `agentId`'s own shells: the stopping agent's.
+ * The stopping agent's (`agentId`) shells are ended at once. Another agent's only once started at least
+ * RECONCILE_MARGIN_MS before the turn end (`at`): the session-wide list can predate that agent's new shell. So
+ * another agent's shell gone at a turn end less than 30 s after it started is left to the poll or a later turn end;
+ * if the poll can't read its file (polling off, the file missing or unreadable) and no turn end comes, only the
+ * ceiling nudge catches it.
  */
-async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] | undefined, agentId: string) {
+async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] | undefined, agentId: string, at: number) {
   if (!rows) return
   try {
-    for (const { shell } of goneShells(rows, tasks).filter(g => g.agentId === agentId)) {
+    const gone = goneShells(rows, tasks).filter(g => g.agentId === agentId || at - g.shell.startedAt >= RECONCILE_MARGIN_MS)
+    for (const { shell } of gone) {
       await shellEnded($, shell.id, (await readExit($, shell.outputPath)) ?? 'unknown')
     }
   } catch (err) {
@@ -1135,7 +1143,7 @@ async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] |
 /**
  * The hook on both turn ends (`classic.Stop`, `classic.SubagentStop`): bookkeeping after `next`, never a send, and it
  * never changes the answer. The rows are read before `next`, as the list was taken: a shell tracked while the hooks
- * beneath ran is not in it, yet still running. Only the stopping agent's shells: `agent_id`, absent on main's Stop.
+ * beneath ran is not in it, yet still running. The stopping agent is `agent_id`, absent on main's Stop.
  */
 async function reconcileAtStop<E extends { background_tasks?: unknown; agent_id?: string }, R>(
   $: $,
@@ -1143,14 +1151,16 @@ async function reconcileAtStop<E extends { background_tasks?: unknown; agent_id?
   next: (e: E) => Promise<R>,
 ) {
   let before: AgentRow[] | undefined
+  let at = 0
   try {
+    at = await $.clock.now()
     before = await read($, agentsAtom)
   } catch {
-    // nothing to reconcile against
+    before = undefined // nothing to reconcile against
   }
   const res = await next(e)
   try {
-    await reconcileShells($, e.background_tasks, before, e.agent_id ?? 'main')
+    await reconcileShells($, e.background_tasks, before, e.agent_id ?? 'main', at)
   } catch {
     // see above
   }
