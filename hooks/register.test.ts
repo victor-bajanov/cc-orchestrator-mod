@@ -105,6 +105,10 @@ const world = (on: On) => {
     fsFails: '' as string,
     /** The next `fs.read` throws, once. */
     readFailsOnce: false,
+    /** Each path `process.run` tailed, in order. */
+    tails: [] as string[],
+    /** Paths whose `tail` rejects (it cannot start, or timed out). */
+    tailFails: new Set<string>(),
     /** Each path `fs.read` was asked for, in order. */
     reads: [] as string[],
   }
@@ -211,6 +215,16 @@ const world = (on: On) => {
     const text = w.files.get(e.path)
     if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
     return { value: text }
+  })
+  // `tail -c 256 <path>` on the files above: a missing file exits 1, as tail does.
+  on('process.run', ($, e) => {
+    const path = String(e.argv.at(-1))
+    if (e.argv[0] !== 'tail') throw new Error(`unexpected command ${e.argv.join(' ')}`)
+    w.tails.push(path)
+    if (w.tailFails.has(path)) throw new Error('tail timed out')
+    const text = w.files.get(path)
+    if (text === undefined) return { value: { exitCode: 1, stdout: '', stderr: `tail: ${path}: No such file or directory` } } as never
+    return { value: { exitCode: 0, stdout: text.slice(-256), stderr: '' } } as never
   })
   on('fs.stat', ($, e) => {
     const text = w.files.get(e.path)
@@ -3228,6 +3242,18 @@ describe('background shells: reconciled at turn ends', () => {
     expect(w.sent).toEqual([])
   })
 
+  test("reconcile reads a big file's code from its tail, not unknown", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'x'.repeat(4 * 1024 * 1024 + 10))
+    endOutput(w, 'b1', 7)
+    await subagentStop($, 'agent2', [])
+    expect(exits(w)).toEqual([['b1', 7]])
+    expect(w.tails).toEqual([out('b1')])
+    expect(w.reads.filter(p => p === out('b1'))).toEqual([])
+  })
+
   test('with no marker it is ended as unknown', opts, async ($, on) => {
     const w = stopWorld(on)
     await family($, w)
@@ -5216,6 +5242,8 @@ describe('background shells: tracking', () => {
     await bgBash($, w, 'agent2', 'b3')
     w.files.delete(out('b1'))
     w.files.set(out('b2'), 'x'.repeat(4 * 1024 * 1024) + '\n[exited with code 0]\n')
+    // Its tail fails too: nothing settles it.
+    w.tailFails.add(out('b2'))
     endOutput(w, 'b3', 0)
     await poll(w)
     expect(w.reads.filter(p => p === out('b1') || p === out('b2'))).toEqual([])
@@ -5227,6 +5255,41 @@ describe('background shells: tracking', () => {
     endOutput(w, 'b1', 2)
     await poll(w)
     expect(row(w, 'agent2')!.shells![0]!.exit).toBe(2)
+  })
+
+  test('a shell whose output file passed 4 MiB is ended from its tail', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    const big = 'x'.repeat(4 * 1024 * 1024 + 10)
+    w.files.set(out('b1'), big)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+    // Unchanged: not tailed again.
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    endOutput(w, 'b1', 4)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1'), out('b1')])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(4)
+    expect(w.reads.filter(p => p === out('b1'))).toEqual([])
+  })
+
+  test('a tail that fails leaves the big shell open, no throw', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    w.files.set(out('b1'), 'x'.repeat(4 * 1024 * 1024 + 10) + '\n[exited with code 0]\n')
+    w.tailFails.add(out('b1'))
+    endOutput(w, 'b2', 1)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    expect(row(w, 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', undefined],
+      ['b2', 1],
+    ])
   })
 
   test('a failed read is retried on the next poll', async ($, on) => {

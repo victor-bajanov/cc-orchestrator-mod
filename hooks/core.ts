@@ -2,6 +2,9 @@ import type { AgentRow, Brief, Sample, Shell, ShellExit } from '../types'
 
 export const MAX_SAMPLES = 180
 
+/** The UTC hh:mm of a time, as the terminal pane shows it. */
+export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 16)
+
 type Usage = {
   input_tokens?: number
   cache_creation_input_tokens?: number | null
@@ -287,7 +290,7 @@ export const numberSetting = (v: unknown, d: number): number => {
 }
 
 /** Where a backgrounded Bash call's result text says its output goes. */
-export const OUTPUT_PATH = /Output is being written to: (\S+?\.output)\./
+export const OUTPUT_PATH = /Output is being written to: (.+?\.output)\.(?:\s|$)/
 
 /**
  * The shell a Bash call sent to the background, explicitly or by the engine: its id and output path ('' when the
@@ -379,8 +382,7 @@ export const graceDue = (rows: readonly AgentRow[], now: number, graceMs: number
 
 /** How a shell is named to its agent and in the log: its description, else its command cut to 80 characters. */
 export const shellName = (s: Shell): string => s.description || s.command.slice(0, 80)
-const shellEnd = (s: Shell) =>
-  `${shellEndWords(s.exit ?? 'unknown')} at ${new Date(s.endedAt ?? 0).toISOString().slice(11, 16)} UTC`
+const shellEnd = (s: Shell) => `${shellEndWords(s.exit ?? 'unknown')} at ${hhmm(s.endedAt ?? 0)} UTC`
 const outputOf = (s: Shell) => (s.outputPath ? `; output: ${s.outputPath}` : '')
 
 /** Tells an agent which of its background commands finished without it picking them up. */

@@ -1,7 +1,7 @@
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 
 import type { AgentRow, AgentStatus, DisplayStatus, LogEntry, MainPhase, Sample, Transcript, TranscriptItem } from '../types'
-import { fmtTokens, label } from './core'
+import { fmtTokens, hhmm, label } from './core'
 
 export type { DisplayStatus }
 
@@ -41,8 +41,8 @@ export const seriesColors = (rows: readonly AgentRow[]): Map<string, string> => 
   return out
 }
 
-/** The UTC hh:mm of a time, as the terminal pane shows it. */
-export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 16)
+/** Moved to core (shell nudges use it); still exported here for the pane's callers. */
+export { hhmm }
 
 /** An activity line cut to `fits` characters, ending in an ellipsis. */
 export const cut = (text: string, fits: number): string => `${text.slice(0, Math.max(1, fits - 1))}…`

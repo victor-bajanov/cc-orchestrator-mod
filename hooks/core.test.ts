@@ -362,6 +362,14 @@ describe('backgroundedShell', () => {
     expect(backgroundedShell('text')).toBeUndefined()
     expect(OUTPUT_PATH.exec(text('b8'))?.[1]).toBe('/t/b8.output')
   })
+
+  test('an output path with spaces is parsed whole', () => {
+    const path = '/Users/a b/tmp/claude-501/-my project/S1/tasks/b9.output'
+    const moved = `Command did not complete within its 3s timeout and was moved to the background with ID: b9. Output is being written to: ${path}. You will be notified when it completes.`
+    const running = `Command running in background with ID: b9. Output is being written to: ${path}.`
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b9' }, text: moved })).toEqual({ id: 'b9', outputPath: path })
+    expect(backgroundedShell({ result: { backgroundTaskId: 'b9' }, text: running })).toEqual({ id: 'b9', outputPath: path })
+  })
 })
 
 describe('shellExit', () => {
