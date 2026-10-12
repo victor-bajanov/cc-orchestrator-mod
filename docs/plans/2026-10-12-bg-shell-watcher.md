@@ -35,7 +35,7 @@ The engine sometimes never wakes an idle agent when its own background shell exi
 
 **T** is `.claude-plugin/types/claude-code/index.d.ts`, **R** `hooks/register.tsx`, **RT** `hooks/register.test.ts`, **C** `hooks/core.ts`, **CT** `hooks/core.test.ts`, **V** `hooks/view.ts`, **VT** `hooks/view.test.ts`, **TY** `types/index.d.ts`, **P** `.claude-plugin/plugin.json`.
 
-- **F1. Bash result.** Results come from live probes and T:20195-20214. `res.result.backgroundTaskId` is set for every kind of backgrounding. `backgroundEndsWithFinalResponse: true` (T:20212-20214) means the command dies with its caller's final response, so no notice can follow: don't track it. `res.text` (T:12750-12756) names the output path: `/Output is being written to: (\S+?\.output)\./`. `e.description` and `e.command` sit flat beside `tool`. `e.agentId` is absent on main.
+- **F1. Bash result.** Results come from live probes and T:20195-20214. `res.result.backgroundTaskId` is set for every kind of backgrounding. `backgroundEndsWithFinalResponse: true` (T:20212-20214) means the command dies with its caller's final response, so no notice can follow: don't track it. `res.text` (T:12750-12756) names the output path: `/Output is being written to: (.+?\.output)\.(?:\s|$)/`. `e.description` and `e.command` sit flat beside `tool`. `e.agentId` is absent on main.
 - **F2. TaskStop.** The input is `{ task_id?, shell_id? }`; `shell_id` is the deprecated alias (T:16716-16721). The result is `{ message, task_id, task_type: 'local_bash', command }`.
 - **F3. Output file.** It is 0 bytes when the command is backgrounded. On exit the engine appends `\n[exited with code N]\n`. TaskStop, or claude ending gracefully on SIGTERM, appends `\n[killed]\n`. A hard crash appends nothing. Read the marker anchored at EOF, over the last 256 characters.
 - **F4. `$.fs`.** `read` rejects a missing file or one over 4 MiB, and there is no partial read (T:3230-3249). `stat` gives `{ kind, size, mtimeMs, isLink }` and rejects a missing file (T:3328, T:4995-5013). So poll by `stat` and `read` only when the size has changed.
@@ -51,7 +51,7 @@ The engine sometimes never wakes an idle agent when its own background shell exi
 
 - **Main's shells are tracked, never nudged.** The engine wakes main itself: interactive main isn't in the bug's table, and headless delivery happens at main's turn end. A mod nudge to main would be a `$.prompt.submit` the user sees. Main's shells are logged. They are dropped at main's next step after they end. Past the ceiling, main gets a `warn` log line (a toast), not a prompt.
 - **"Picked up" means one of two things.** (a) The agent's first step of a new run after the shell finished. The bug doc shows a woken run absorbs the held notice (`absorbed_mid_turn`). (b) Any tool call by the agent whose args contain the shell's id or output path (Read, TaskOutput, `cat`). A step in the same busy run doesn't count: it's unknown whether a busy teammate gets the notice. So grace runs from `max(shellsDoneAt, lastActive)`, which is the busy agent's turn end. A duplicate costs less than a lost wake.
-- **Grace and the ceiling only nudge rows with status `idle`** (grace) or a live status (ceiling). Messages are `liveOnly`, so `drain` drops them once the agent isn't live.
+- **Grace and the ceiling only nudge rows with status `idle`** (grace) or a live status (ceiling). Messages are `liveOnly`, so `drain` drops them once the agent isn't live. Both also skip a row the engine lists as `completed`, `failed` or `killed`, or doesn't list at all (main excepted). `shellDeadlines` settles such a row's shells without a nudge. If the agent list fails, every row stays eligible.
 - **Watchdog eligibility.** A row qualifies when all of these hold:
   - its id isn't `main`;
   - its mod status is `idle`;
@@ -119,7 +119,7 @@ Add to `AgentRow`:
 **C.** Append a section with these exports:
 
 - `numberSetting(v: unknown, d: number): number`: `Number(v ?? d)` when it is finite and ≥ 0, else `d`.
-- `OUTPUT_PATH = /Output is being written to: (\S+?\.output)\./`
+- `OUTPUT_PATH = /Output is being written to: (.+?\.output)\.(?:\s|$)/`
 - `backgroundedShell(res: unknown): { id: string; outputPath: string } | undefined`: undefined when `res.deny` or `res.isError` is set, when `result.backgroundTaskId` isn't a non-empty string, or when `result.backgroundEndsWithFinalResponse === true`. The path comes from `OUTPUT_PATH` on `res.text`, else `''`.
 - `shellExit(text: string): number | 'killed' | undefined`: `/\n\[(?:exited with code (\d+)|killed)\]\n$/` on `text.slice(-256)`.
 - `shellEndWords(exit: ShellExit): string`: `exited with code N`, `was killed` or `finished (exit code unknown)`.
@@ -127,7 +127,7 @@ Add to `AgentRow`:
 - `addShell(rows, agentId, shell): AgentRow[]`: replaces any shell with the same id and clears `watchdog`. An unknown agent leaves `rows` unchanged.
 - `endShell(rows, shellId, exit, t): AgentRow[]`: finds the shell in any row. Only an open one changes: it gets `endedAt = t` and `exit`. When that row has no open shell left, `shellsDoneAt = t`.
 - `dropShell(rows, shellId): AgentRow[]`: removes the shell from any row, and clears `shellsDoneAt` when no finished shell remains there.
-- `pickUpShells(rows, agentId, mention?: string): AgentRow[]`: drops the agent's finished shells: all of them, or with `mention` only those whose `id` or non-empty `outputPath` occurs in it. It clears `shellsDoneAt` when none remain.
+- `pickUpShells(rows, agentId, mention?: string, endedBy?: number): AgentRow[]`: drops the agent's finished shells: all of them, or with `mention` only those whose `id` or non-empty `outputPath` occurs in it. With `endedBy`, a shell that ended after it is kept. It clears `shellsDoneAt` when none remain.
 - `graceDue(rows, now, graceMs): AgentRow[]`: returns `[]` when `graceMs <= 0`. Otherwise it returns rows where all of these hold:
   - the id isn't `main`;
   - the status is `idle`;
@@ -192,7 +192,7 @@ Add to `AgentRow`:
 
 **R.**
 
-- `turn.step` at R:1537: read the row before `recordStep`. Let `newRun = before && before.status !== 'running' && before.status !== 'handing-over'`. When `id === 'main' || newRun` and the row has a finished shell, apply `pickUpShells(…, id)` in the same `update`.
+- `turn.step` at R:1537: read the row before `recordStep`. Let `newRun = before && before.status` is `idle`, `done` or `respawn-failed` (the statuses `recordStep` revives). When `id === 'main' || newRun` and the row has a finished shell, apply `pickUpShells(…, id, undefined, newRun ? stepStart : undefined)` in the same `update`.
 - `noteShell` (from Task 0): when the agent's row has a finished shell, apply `pickUpShells(rows, agentId, JSON.stringify(args))` and persist on a change.
 - `async function shellDeadlines($: $, now: number)`, appended to the shells section:
   - For each `graceDue(rows, now, cfg.shellGraceSeconds * 1000)` row: take its finished shells, `enqueue({ agentId: r.id, text: shellNudge(finished), what: \`shell nudge for ${label(r)} not delivered\`, liveOnly: true })`, then apply `pickUpShells(rows, r.id)` so the nudge is sent once. Log `<label>: nudged about finished background command(s) <ids>`.
@@ -320,7 +320,7 @@ It returns `[]` when `idleMs <= 0`. Otherwise every row where all of these hold:
 - A file over 64 KiB is checked through `tail -c 256`. One whose tail fails, or a hard crash with no marker, is caught only by reconciliation (`unknown`) or the ceiling.
 - Teammates running in their own terminal pane make no `tool.call` in this process: their shells aren't tracked.
 - Reconciliation (code-review #2): a turn end ends the stopping agent's unlisted shells at once (`SubagentStop` that agent's, `Stop` main's), and another agent's only when it started at least 30 s (`RECONCILE_MARGIN_MS`) before the turn end. The session-wide `background_tasks` is a snapshot that can predate another agent's new shell, so ending a just-started one from it could end a running shell. The trade-off: another agent's shell gone at a turn end less than 30 s after it started is left to the poll or a later turn end; if the poll can't read its file (polling off, or the file is missing or unreadable) and no turn end comes, only the ceiling nudge catches it.
-- Backlog: pane display of open shells; moving open shells to a replacement on handover.
+- Backlog: pane display of open shells; moving open shells to a replacement on handover; a duplicate grace nudge when the engine wakes an agent before the poll sees the exit, since `endedAt` is when the poll noticed it. Fix idea: take `endedAt` from the output file's stat `mtimeMs`, and record `runStartedAt` on the row.
 
 ## Manual checks (final reviewer)
 
