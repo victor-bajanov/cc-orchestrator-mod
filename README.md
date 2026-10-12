@@ -43,10 +43,10 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 - a tree of agents (main, then each agent under its parent); the agent you opened from `/tasks` is shown inverted
 - each row's status glyph and status word in the status colour: running `●` bright green, waiting `◐` teal, idle `○` faint orange, handing over `↻` blue, stalled `!` red, done `✓` faint green, replaced `⤳` grey, respawn failed `✗` red. The colours are theme keys, so they follow your theme
 - each row's model and effort, such as `Sonnet 5.5 med` (the model alone when the engine reports no effort)
-- click a subagent's name to show its transcript in a box beneath it: its last six entries, each with its time. A long entry ends in `…`; hovering it shows the full text in a card, and a click pins it open. Click the name again to close the box. The box takes its rows from the activity log
+- click a subagent's name to show its transcript in a box beneath it: its last six entries, each with its time. A long entry ends in `…`; a click shows its full text beneath it, pushing the rest down (as many lines as the pane has room for), and a second click hides it. Click the name again to close the box. The box takes its rows from the activity log
 - a `▾` before a row with finished agents beneath it (main included) collapses them into `+N done`; the `▸` it becomes expands them again. With the pane focused, `c` collapses or expands the selected row (main when none is selected)
 - each agent's context drawn on one shared time axis, so you can see when each agent was active and how close it is to its limit (green, then amber from 60%, red at the threshold)
-- an activity log; a line too long for the pane ends in `…`, and hovering it shows the full text in a card (a click pins it open)
+- an activity log; a line too long for the pane ends in `…`, and a click shows its full text beneath it (a second click hides it); the log gives up the rows it takes
 
 *Desktop app.* The pane has:
 - a chart of each agent's context over time, one coloured line per agent, with the limits as dashed red lines; hover a line for the agent's name, context and status

@@ -3,7 +3,7 @@ import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
 import { PEEK_TIMEOUT_MS, isOwnCall, isOwnOrigin, isOwnSend, liveSelection } from './register'
-import { hhmm } from './view'
+import { expandCap, hhmm, terminalBase } from './view'
 import { ACTIVITY_MAX, HANDOVER_CLAUSE, nameNotice, replacementPrompt } from './core'
 import { PEEK_DENIED as DENIED, runnerFor } from './view'
 
@@ -667,42 +667,70 @@ describe('pane', () => {
     }
   })
 
-  test('a truncated activity line shows its full text in a card on hover, pinned by a click', async ($, on) => {
-    const w = world(on)
+  test('terminal: a truncated activity line expands in flow beneath it on a press; no card covers other lines', async ($, on) => {
+    world(on)
     await start($)
     const name = 'a-rather-long-agent-name-that-will-not-fit-in-a-narrow-pane'
-    await spawn($, { prompt: 'P', name })
+    // Eight agent rows on 25 rows: base = 25 - 8 - 8 - 1 = 8 rows, as many as the eight spawn lines.
+    // The names differ in length: lines logged at one time are told apart by their length.
+    for (let i = 1; i <= 8; i++) await spawn($, { prompt: 'P', name: `${name}-${'x'.repeat(i)}` })
     const ui = await $.ui.mount({
       plugin: 'orchestrator',
       surface: 'terminal',
       component: 'Pane',
       requestId: 'orchestrator',
       props: { bodyColumns: 40 } as never,
+      viewport: { columns: 40, rows: 25 },
     })
-    const line = (await ui.findAll({ type: 'Button' })).find(b => b.text.includes('spawned'))!
+    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
+    expect(agents).toBe(8)
+    const base = terminalBase({ rows: 25, agents, peekRows: 0, buttonRow: true })
+    const line = (await ui.findAll({ type: 'Button' })).filter(b => b.text.includes('spawned')).at(-1)!
     expect(line).toBeDefined()
     expect(line.text).toContain('…')
     expect(line.text).not.toContain(name)
 
-    type Drawn = { type: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
+    type Drawn = { type: string; key?: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
     const walk = (n: unknown): Drawn[] =>
       n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
-    const card = async () =>
-      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('spawned'))!
-
-    expect((await card()).props!.display).toBe('none')
-    expect((await card()).hover).toMatchObject({ display: 'flex' })
-    // it overlays other lines: every cell inside the border is painted, so nothing shows through
-    const rowsOf = JSON.stringify((await card()).children).match(/"[^"]*"/g)!.map(t => JSON.parse(t) as string)
-    const painted = rowsOf.filter(t => t.length > 10)
-    expect(painted.length).toBeGreaterThan(1)
-    expect(new Set(painted.map(t => t.length)).size).toBe(1)
-    expect((await card()).props!.paddingX).toBeUndefined()
+    const isActivity = (c: unknown) =>
+      (c as Drawn)?.type === 'Text' && ((c as Drawn).children ?? []).some(t => t === 'Activity')
+    /** The activity lines drawn: the pane's children after the `Activity` header. */
+    const activity = async () => {
+      const pane = walk(await ui.drawn()).find(b => (b.children ?? []).some(isActivity))!
+      const kids = (pane.children ?? []).filter(c => c && typeof c === 'object')
+      return kids.slice(kids.findIndex(isActivity) + 1)
+    }
+    const noCards = async () => {
+      const all = walk(await ui.drawn())
+      expect(all.some(b => b.props?.position === 'absolute')).toBe(false)
+      expect(all.some(b => 'hover' in b || (b.props !== undefined && 'hover' in b.props))).toBe(false)
+    }
+    await noCards()
+    expect(await ui.find({ key: `full:${line.key}` })).toBeUndefined()
+    const before = (await activity()).length
+    expect(before).toBe(base)
 
     await ui.press({ key: line.key! })
-    expect((await card()).props!.display).toBe('flex')
+    await noCards()
+    const full = (await ui.find({ key: `full:${line.key}` }))!
+    expect(full).toBeDefined()
+    // The expansion wraps at its width (read it with the line breaks taken out), capped to the rows the pane has.
+    expect(full.text.replace(/\s+/g, '')).toContain('spawneda-rather-long-agent-name-that-will')
+    const keyOf = (c: unknown) => (c as Drawn)?.props?.key ?? (c as Drawn)?.key
+    const column = walk(await ui.drawn()).find(b => (b.children ?? []).some(c => keyOf(c) === line.key))!
+    expect(column.props?.flexDirection).toBe('column')
+    const at = column.children!.findIndex(c => keyOf(c) === line.key)
+    expect(keyOf(column.children![at + 1])).toBe(`full:${line.key}`)
+    const fullNode = column.children![at + 1] as Drawn
+    const fullLines = (fullNode.children ?? []).filter(c => (c as Drawn)?.type === 'Text').length
+    expect(fullLines).toBe(expandCap(base))
+    expect((await activity()).length).toBe(Math.max(3, before - (fullLines + 2)))
+    expect((await activity()).length).toBeLessThan(before)
+
     await ui.press({ key: line.key! })
-    expect((await card()).props!.display).toBe('none')
+    expect(await ui.find({ key: `full:${line.key}` })).toBeUndefined()
+    expect((await activity()).length).toBe(before)
     await ui.unmount()
   })
 
@@ -1754,7 +1782,26 @@ describe('timestamped transcript', () => {
   const stepButton = async (ui: Awaited<ReturnType<typeof mountPane>>) =>
     (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
 
-  test('terminal: a long text is cut, and its card shows on hover, pinned by a press', async ($, on) => {
+  /** Rows a drawn node takes: a Text or Button one, a column its children's sum, a row its tallest (a wrapping row two), a border two more. */
+  const height = (n: Drawn): number => {
+    if (n.type === 'Text' || n.type === 'Button') return 1
+    const kids = (n.children ?? []).filter(c => c && typeof c === 'object') as Drawn[]
+    const hs = kids.map(height)
+    const inner =
+      n.props?.flexDirection === 'column'
+        ? hs.reduce((a, b) => a + b, 0)
+        : n.props?.flexWrap === 'wrap' && kids.length > 1
+          ? Math.max(0, ...hs) + 1
+          : Math.max(0, ...hs)
+    return inner + (n.props?.borderStyle ? 2 : 0)
+  }
+  const noCards = async (ui: Awaited<ReturnType<typeof mountPane>>) => {
+    const all = walk(await ui.drawn())
+    expect(all.some(b => b.props?.position === 'absolute')).toBe(false)
+    expect(all.some(b => 'hover' in b || (b.props !== undefined && 'hover' in b.props))).toBe(false)
+  }
+
+  test('terminal: a long transcript text expands in flow on a press, and no card covers the rows beneath', async ($, on) => {
     const w = world(on)
     longStub(on)
     await running($, w)
@@ -1763,31 +1810,85 @@ describe('timestamped transcript', () => {
     expect(button).toBeDefined()
     expect(button.text).toContain('…')
     expect(button.text).not.toContain('END')
-    const card = async () =>
-      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('END'))!
-    expect((await card()).props!.display).toBe('none')
-    expect((await card()).hover).toMatchObject({ display: 'flex' })
+    await noCards(ui)
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
     await ui.press({ key: button.key! })
-    expect((await card()).props!.display).toBe('flex')
+    const full = (await ui.find({ key: `full:${button.key}` }))!
+    expect(full).toBeDefined()
+    expect(full.text).toContain('END')
+    await noCards(ui)
     await ui.press({ key: button.key! })
-    expect((await card()).props!.display).toBe('none')
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
     await ui.unmount()
   })
 
-  test('terminal: a long text card opens downward inside the border, its lines capped to the room', async ($, on) => {
+  test('terminal: an expansion never outgrows the pane', async ($, on) => {
     const w = world(on)
     const HUGE = `${'word '.repeat(390)}END`
     on('session.messages', () => ({ value: [brief, { role: 'assistant', text: HUGE, toolUses: [] }] as never }))
     await running($, w)
     const ui = await open($, w, 'terminal', 40)
-    const card = walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('word'))!
-    expect(card.props!.top as number).toBeGreaterThanOrEqual(0)
-    expect(card.props!.left).toBe(-1)
-    const lines = (card.children as Drawn[]).filter(c => c.type === 'Text')
-    // 30 rows (no viewport given): far fewer than the ~55 lines the text wraps to.
-    expect(lines.length).toBeLessThan(30)
+    const button = await stepButton(ui)
+    await ui.press({ key: button.key! })
+    const drawn = walk(await ui.drawn())
+    const box = drawn.find(b => b.props?.key === 'transcript:agent1')!
+    const peekRows = (box.children ?? []).filter(c => c && typeof c === 'object').length + 2
+    const full = drawn.find(b => b.props?.key === `full:${button.key}`)!
+    expect(full).toBeDefined()
+    const lines = (full.children as Drawn[]).filter(c => c.type === 'Text')
+    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
+    expect(lines.length).toBeLessThanOrEqual(expandCap(terminalBase({ rows: 30, agents, peekRows, buttonRow: true })))
     expect(JSON.stringify(lines[lines.length - 1]!.children)).toContain('…')
-    expect(JSON.stringify(card.children)).not.toContain('END')
+    expect(JSON.stringify(full.children)).not.toContain('END')
+    // The frame's budget reserves 5 rows of slack: the pane draws at most the viewport less those.
+    expect(height(walk(await ui.drawn())[0]!)).toBeLessThanOrEqual(30 - 5)
+    await ui.unmount()
+  })
+
+  test('terminal: a pane too small for an expansion shows none, and stays inside the pane', async ($, on) => {
+    const w = world(on)
+    longStub(on)
+    await running($, w)
+    // agent1's row, the button row and the transcript box (brief and text: 2 items + border) on 18 rows: base 4.
+    const ROWS = 18
+    const ui = await $.ui.mount({
+      plugin: 'orchestrator',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'orchestrator',
+      props: { bodyColumns: 40 } as never,
+      viewport: { columns: 40, rows: ROWS },
+    })
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    const box = walk(await ui.drawn()).find(b => b.props?.key === 'transcript:agent1')!
+    const peekRows = (box.children ?? []).filter(c => c && typeof c === 'object').length + 2
+    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
+    expect(terminalBase({ rows: ROWS, agents, peekRows, buttonRow: true })).toBe(4)
+    const button = (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
+    await ui.press({ key: button.key! })
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
+    expect(height(walk(await ui.drawn())[0]!)).toBeLessThanOrEqual(ROWS - 5)
+    await ui.unmount()
+  })
+
+  test('terminal: with a text expanded, the tool call beneath it still presses to its detail', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => ({
+      value: [
+        brief,
+        { role: 'assistant', text: LONG, toolUses: [] },
+        { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS' }] },
+      ] as never,
+    }))
+    await running($, w)
+    const ui = await open($, w, 'terminal', 80)
+    const button = await stepButton(ui)
+    await ui.press({ key: button.key! })
+    expect(await ui.find({ key: `full:${button.key}` })).toBeDefined()
+    await ui.press({ key: 'tool:agent1:b' })
+    expect(w.opened).toContain('orchestrator-tool')
+    expect(await ui.find({ key: `full:${button.key}` })).toBeDefined()
     await ui.unmount()
   })
 

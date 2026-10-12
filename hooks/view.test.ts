@@ -9,6 +9,7 @@ import {
   addressFor,
   ceilingOf,
   canFold,
+  capLines,
   cleanBlock,
   chartWidthPx,
   contextChart,
@@ -17,6 +18,7 @@ import {
   collapseHidden,
   cut,
   displayStatus,
+  expandCap,
   foldGlyph,
   forwardTarget,
   effortAbbrev,
@@ -37,6 +39,7 @@ import {
   seriesColors,
   statusEmoji,
   statusStyle,
+  terminalBase,
   textKey,
   toolBrief,
   transcriptItems,
@@ -1085,5 +1088,23 @@ describe('redirectTarget', () => {
     expect(addressFor(r2, 'probe')).toBe('probe-2')
     expect(addressFor({ ...r2, teammateId: 'probe-2@team' }, 'probe@team')).toBe('probe-2@team')
     expect(addressFor({ ...r2, name: undefined }, 'probe')).toBe('a2')
+  })
+})
+
+describe('terminal budget', () => {
+  test('terminalBase: viewport rows less agent rows, the frame, the button row and the open transcript box', () => {
+    expect(terminalBase({ rows: 30, agents: 2, peekRows: 5, buttonRow: true })).toBe(14)
+    expect(terminalBase({ rows: 30, agents: 2, peekRows: 5, buttonRow: false })).toBe(15)
+  })
+  test('expandCap leaves the activity at least 3 lines beside the border; a pane too small shows none', () => {
+    expect(expandCap(14)).toBe(9)
+    expect(expandCap(6)).toBe(1)
+    expect(expandCap(5)).toBe(0)
+    expect(expandCap(4)).toBe(0)
+  })
+  test('capLines keeps lines that fit and ends a cut list in …', () => {
+    expect(capLines(['a', 'b'], 3)).toEqual(['a', 'b'])
+    expect(capLines(['a', 'b', 'c', 'd'], 3)).toEqual(['a', 'b', '…'])
+    expect(capLines(['a', 'b'], 1)).toEqual(['…'])
   })
 })

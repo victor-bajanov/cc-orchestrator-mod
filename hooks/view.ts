@@ -47,6 +47,15 @@ export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 1
 /** An activity line cut to `fits` characters, ending in an ellipsis. */
 export const cut = (text: string, fits: number): string => `${text.slice(0, Math.max(1, fits - 1))}…`
 
+/** The terminal pane's rows left for an open expansion and the activity: viewport rows less the agent rows, the open transcript box and the frame (header, axis line, `Activity`, slack). */
+export const terminalBase = (o: { rows: number; agents: number; peekRows: number; buttonRow: boolean }): number =>
+  o.rows - o.agents - 8 - (o.buttonRow ? 1 : 0) - o.peekRows
+/** The most text lines an expansion may show: it and its border leave the activity at least 3 lines; 0 (none shown) when the pane is too small. */
+export const expandCap = (base: number): number => Math.max(0, base - 3 - 2)
+/** At most `max` lines; when cut, the last kept line is `…`. */
+export const capLines = (lines: readonly string[], max: number): string[] =>
+  lines.length <= max ? [...lines] : [...lines.slice(0, Math.max(0, max - 1)), '…']
+
 /** Text safe for one pane line: ANSI escapes and control characters removed. */
 const clean = (s: string): string =>
   s.replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '')

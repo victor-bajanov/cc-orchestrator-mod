@@ -31,11 +31,13 @@ import {
 import {
   LIVE,
   addressFor,
+  capLines,
   ceilingOf,
   chartWidthPx,
   contextChart,
   cut,
   displayStatus,
+  expandCap,
   hhmm,
   logId,
   mainButtonShown,
@@ -54,6 +56,7 @@ import {
   seriesColors,
   statusEmoji,
   statusStyle,
+  terminalBase,
   textKey,
   transcriptItems,
   transcriptView,
@@ -76,7 +79,7 @@ const agentsAtom = atom({ plugin: 'orchestrator', key: 'agents' } as const, [] a
 const logAtom = atom({ plugin: 'orchestrator', key: 'log' } as const, [] as LogEntry[])
 const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'idle' as MainPhase)
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
-/** The activity line whose full-text card a click pinned open ('' for none). */
+/** The line (activity or transcript text) whose full text a press shows beneath it, in flow ('' for none). */
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
@@ -2097,7 +2100,29 @@ export const register: Register = (on, options) => {
     // A session that places no dialog (too narrow, or no surface places panes) shows the open call's detail in flow.
     const tv = await read($, toolViewAtom)
     const ui = $.ui.resolve(e)
-    /** One transcript row: a tool call opens its detail; a cut text shows whole in a card on hover, pinned by a press. */
+    // Rows left for an open expansion and the activity; the activity gives up exactly the rows an expansion takes.
+    // The header's button can wrap onto a row of its own.
+    const base = terminalBase({ rows: e.viewport?.rows ?? 30, agents: ordered.length, peekRows, buttonRow: shown })
+    // A pane too small for an expansion (cap 0) shows none: a press then only pins.
+    const cap = expandCap(base)
+    const fits = cols - 6
+    // Inside the transcript box's border, the expansion's border, its padding spaces and slack.
+    const textLines = (full: string) => capLines(wrapFill(full, Math.max(10, cols - 8)), cap)
+    // Inside the expansion's border, its padding spaces and slack.
+    const logLines = (text: string) => capLines(wrapFill(text, Math.max(10, cols - 6)), cap)
+    const pinOf = (agentId: string, it: TranscriptLine) => it.id.replace(/^step-/, `step-${agentId}-`)
+    const expRows = (() => {
+      if (pinned === '' || cap === 0) return 0
+      if (peek && 'items' in peek && selected) {
+        const it = peek.items.find(it => it.kind !== 'tool' && it.full !== undefined && pinOf(selected, it) === pinned)
+        if (it) return textLines(it.full!).length + 2
+      }
+      const l = entries.slice(-Math.max(3, base)).find(l => l.text.length > fits && logId(l) === pinned)
+      return l ? logLines(l.text).length + 2 : 0
+    })()
+    // A pinned line that falls outside the shrunk room is not drawn; its rows still count, so the pane only shows fewer.
+    const room = Math.max(3, base - expRows)
+    /** One transcript row: a tool call opens its detail; a press on a cut text shows its full text beneath it, in flow. */
     const item = (agentId: string, it: TranscriptLine) => {
       const time = <Text dimColor>{it.time} </Text>
       if (it.kind === 'tool') {
@@ -2129,38 +2154,25 @@ export const register: Register = (on, options) => {
           </Text>
         )
       }
-      const pin = it.id.replace(/^step-/, `step-${agentId}-`)
-      // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
-      // It opens downward, over the activity (the top of the pane would clip it), with as many lines as fit there.
-      const all = wrapFill(it.full, Math.max(10, cols - 4))
-      const fit = Math.max(1, room)
-      const wrapped = all.length > fit ? [...all.slice(0, fit - 1), '…'] : all
+      const pin = pinOf(agentId, it)
+      // A press shows the full text beneath it, in flow: it pushes the rows beneath down and never covers them.
       return (
-        <Box key={it.id}>
+        <Box key={it.id} flexDirection="column">
           <Button key={pin} plain onPress={() => togglePinned($, pin)}>
             {time}
             {who}
             <Text>{it.short}</Text>
           </Button>
-          <Box
-            position="absolute"
-            top={1}
-            left={-1}
-            width={cols}
-            borderStyle="round"
-            flexDirection="column"
-            display={pinned === pin ? 'flex' : 'none'}
-            hover={pinned === pin ? undefined : { display: 'flex' }}
-          >
-            {wrapped.map((w, j) => (
-              <Text key={`w${j}`} wrap="truncate">{` ${w} `}</Text>
-            ))}
-          </Box>
+          {pinned === pin && cap > 0 && (
+            <Box key={`full:${pin}`} borderStyle="round" flexDirection="column" width={cols - 2}>
+              {textLines(it.full).map((w, j) => (
+                <Text key={`w${j}`} wrap="truncate">{` ${w}`}</Text>
+              ))}
+            </Box>
+          )}
         </Box>
       )
     }
-    // The header's button can wrap onto a row of its own.
-    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0) - peekRows)
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -2249,7 +2261,6 @@ export const register: Register = (on, options) => {
         {entries.length === 0 && <Text dimColor>Nothing yet.</Text>}
         {entries.slice(-room).map((l, i) => {
           const color = l.level === 'warn' ? 'warning' : undefined
-          const fits = cols - 6
           if (l.text.length <= fits) {
             return (
               <Text key={`l${i}`} color={color} wrap="truncate">
@@ -2258,31 +2269,21 @@ export const register: Register = (on, options) => {
               </Text>
             )
           }
-          // Too long: cut with an ellipsis; the full text shows in a card above while hovered, or pinned by a click.
+          // Too long: cut with an ellipsis; a press shows the full text beneath it, in flow, and a second press hides it.
           const id = logId(l)
-          // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
-          const inner = Math.max(10, cols - 4)
-          const wrapped = wrapFill(l.text, inner)
           return (
-            <Box key={`l${i}`}>
+            <Box key={`l${i}`} flexDirection="column">
               <Button key={id} plain onPress={() => togglePinned($, id)}>
                 <Text dimColor>{hhmm(l.t)} </Text>
                 <Text color={color}>{cut(l.text, fits)}</Text>
               </Button>
-              <Box
-                position="absolute"
-                top={-(wrapped.length + 2)}
-                left={0}
-                width={cols}
-                borderStyle="round"
-                flexDirection="column"
-                display={pinned === id ? 'flex' : 'none'}
-                hover={pinned === id ? undefined : { display: 'flex' }}
-              >
-                {wrapped.map((w, j) => (
-                  <Text key={`w${j}`} color={color} wrap="truncate">{` ${w} `}</Text>
-                ))}
-              </Box>
+              {pinned === id && cap > 0 && (
+                <Box key={`full:${id}`} borderStyle="round" flexDirection="column" width={cols}>
+                  {logLines(l.text).map((w, j) => (
+                    <Text key={`w${j}`} color={color} wrap="truncate">{` ${w}`}</Text>
+                  ))}
+                </Box>
+              )}
             </Box>
           )
         })}
