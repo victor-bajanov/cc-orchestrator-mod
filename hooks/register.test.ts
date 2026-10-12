@@ -2,9 +2,9 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
-import { PEEK_TIMEOUT_MS, isOwnOrigin, isOwnSend, liveSelection } from './register'
+import { PEEK_TIMEOUT_MS, isOwnCall, isOwnOrigin, isOwnSend, liveSelection } from './register'
 import { hhmm } from './view'
-import { nameNotice } from './core'
+import { HANDOVER_CLAUSE, nameNotice, replacementPrompt } from './core'
 import { PEEK_DENIED as DENIED, runnerFor } from './view'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
@@ -81,6 +81,12 @@ const world = (on: On) => {
     duringSend: undefined as
       | ((check: (input: { to: unknown; message: unknown }) => Promise<string>, e: { to: string; text: string }) => Promise<unknown>)
       | undefined,
+    /** The verdict of each mod spawn's Agent check (auto mode), in order. */
+    spawnChecks: [] as string[],
+    /** Runs inside the mod's spawn, after its check: `check` asks tool.check about any Agent input. */
+    duringSpawn: undefined as ((check: (input: Record<string, unknown>) => Promise<string>) => Promise<unknown>) | undefined,
+    /** The next spawn is refused with this reason ('' none); 'throw' makes it throw. Refused spawns are not recorded. */
+    spawnDeny: '' as string,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -127,7 +133,31 @@ const world = (on: On) => {
     if (e.command === 'clear') await w.duringClear?.()
     return { text: '' }
   })
-  on('agent.spawn', ($, e) => {
+  on('agent.spawn', async ($, e) => {
+    // Auto mode judges a spawn with no Agent tool call behind it (the mod's own; the model's carry a tool_use_id).
+    if (w.checkSends && !e.tool_use_id) {
+      const check = async (input: Record<string, unknown>) =>
+        (await w.engine!.tool.check({ tool: 'Agent', input } as never)).decision
+      const verdict = await check({
+        prompt: e.prompt,
+        description: e.description,
+        subagent_type: e.subagentType,
+        name: e.name,
+        model: e.model,
+      })
+      w.spawnChecks.push(verdict)
+      await w.duringSpawn?.(check)
+      if (verdict !== 'allow') return { deny: 'The server-side auto mode classifier gave no verdict for Agent' } as never
+    }
+    if (w.spawnDeny === 'throw') {
+      w.spawnDeny = ''
+      throw new Error('spawn broke')
+    }
+    if (w.spawnDeny) {
+      const deny = w.spawnDeny
+      w.spawnDeny = ''
+      return { deny } as never
+    }
     const raw = e as typeof e & { subagent_type?: string }
     w.spawns.push({ ...e, subagentType: e.subagentType ?? raw.subagent_type ?? '' })
     if (w.hangSpawn) {
@@ -3253,6 +3283,7 @@ describe("auto mode: the mod's own sends", () => {
     w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
     await complete($, 'agent2', 'HANDED OVER')
     await w.clock.settle()
+    expect(w.spawnChecks).toEqual(['allow'])
     expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('agent3') && m.text.includes('handed over'))).toBe(true)
     expect(w.checks.length).toBeGreaterThan(0)
     expect(w.checks.every(c => c === 'allow')).toBe(true)
@@ -3485,6 +3516,97 @@ describe("auto mode: the mod's own sends, review fixes", () => {
     expect(checkins[0]!.text).toBe(checkins[1]!.text)
     expect(late).toEqual(['allow'])
     expect(w.checks).toEqual(['allow', 'allow'])
+  })
+})
+
+describe("auto mode: the mod's own spawn", () => {
+  const NOTE = `${RUN_DIR}/handover/impl-1-agent1-1.md`
+  /** impl-1 at 460k is sent HANDOVER, writes its note and ends: the mod respawns it. */
+  const handOver = async ($: Engine, w: World, beforeEnd?: () => void) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(NOTE, 'x')
+    beforeEnd?.()
+    return complete($, 'agent1', 'HANDED OVER')
+  }
+
+  test('a respawn under auto mode is allowed and spawned', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await handOver($, w)
+    await w.clock.settle()
+    expect(w.spawnChecks).toEqual(['allow'])
+    expect(w.spawns).toHaveLength(2)
+    expect(row(w, 'agent2')!.replaces).toBe('agent1')
+    expect(w.toasts.some(t => t.includes('respawn refused'))).toBe(false)
+  })
+
+  test('the prompt with and without the HANDOVER clause is the mod\'s; anything else is not', () => {
+    const P = 'Do it.\n\n---\nYou replace…'
+    const inFlight = [{ tool: 'Agent' as const, prompt: P }]
+    expect(isOwnCall({ prompt: P }, inFlight)).toBe(true)
+    expect(isOwnCall({ prompt: P + HANDOVER_CLAUSE }, inFlight)).toBe(true)
+    expect(isOwnCall({ prompt: P + ' ' }, inFlight)).toBe(false)
+    expect(isOwnCall({ prompt: 'other' }, inFlight)).toBe(false)
+    expect(isOwnCall({ prompt: 42 }, inFlight)).toBe(false)
+    expect(isOwnCall(null, inFlight)).toBe(false)
+    expect(isOwnCall(42, inFlight)).toBe(false)
+    expect(isOwnCall({ prompt: P }, [])).toBe(false)
+    const stops = [{ tool: 'TaskStop' as const, taskId: 'agent1' }]
+    expect(isOwnCall({ task_id: 'agent1' }, stops)).toBe(true)
+    expect(isOwnCall({ shell_id: 'agent1' }, stops)).toBe(true)
+    expect(isOwnCall({ task_id: 'agent2' }, stops)).toBe(false)
+  })
+
+  test('the same spawn checked after it settled is ask', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await handOver($, w)
+    await w.clock.settle()
+    expect(w.spawns).toHaveLength(2)
+    const after = await $.tool.check({ tool: 'Agent', input: { prompt: w.spawns[1]!.prompt } } as never)
+    expect(after.decision).toBe('ask')
+  })
+
+  test("a different prompt during the mod's spawn is ask; the mod's own is allow", async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    const mine =
+      replacementPrompt({ prompt: 'P', subagentType: 'general-purpose', description: 'implement task', name: 'impl-1' }, NOTE) +
+      HANDOVER_CLAUSE
+    const probes: string[] = []
+    w.duringSpawn = async check => {
+      probes.push(await check({ prompt: 'P' }), await check({ prompt: mine }))
+    }
+    await handOver($, w)
+    await w.clock.settle()
+    expect(probes).toEqual(['ask', 'allow'])
+  })
+
+  test('a spawn that never answers allows nothing past the drain timeout', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    void handOver($, w, () => {
+      w.hangSpawn = true
+    }).catch(() => undefined)
+    // the hanging spawn is recorded once its check has passed: its prompt is the one checked
+    for (let i = 0; i < 100 && w.spawns.length < 2; i++) await w.clock.advance(1)
+    expect(w.spawns).toHaveLength(2)
+    const captured = w.spawns[1]!.prompt
+    expect((await $.tool.check({ tool: 'Agent', input: { prompt: captured } } as never)).decision).toBe('allow')
+    await w.clock.advance(11_000)
+    expect((await $.tool.check({ tool: 'Agent', input: { prompt: captured } } as never)).decision).toBe('ask')
+  })
+
+  test('the Agent check hook never throws', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await start($)
+    expect((await $.tool.check({ tool: 'Agent', input: null } as never)).decision).toBe('ask')
+    expect((await $.tool.check({ tool: 'Agent', input: { prompt: 7 } } as never)).decision).toBe('ask')
   })
 })
 

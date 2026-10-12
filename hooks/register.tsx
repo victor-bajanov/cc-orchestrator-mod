@@ -136,6 +136,24 @@ export const isOwnSend = (o: {
   return o.inFlight.some(s => toward(s) && (own || (typeof o.message === 'string' && s.text === o.message)))
 }
 
+/** One of the mod's own tool calls in flight, other than a send: a respawn's Agent call, or a TaskStop of a replaced agent. */
+export type OwnCall = { tool: 'Agent'; prompt: string } | { tool: 'TaskStop'; taskId: string }
+
+/**
+ * Whether a tool.check input is one of the mod's own calls in flight: an Agent call with the exact prompt the mod
+ * spawned with, or that prompt with the HANDOVER clause the mod's own agent.spawn hook appends; a TaskStop of
+ * exactly the agent it is stopping. Anything malformed is not.
+ */
+export const isOwnCall = (input: unknown, inFlight: readonly OwnCall[]): boolean => {
+  if (typeof input !== 'object' || input === null) return false
+  const i = input as { prompt?: unknown; task_id?: unknown; shell_id?: unknown }
+  return inFlight.some(c =>
+    c.tool === 'Agent'
+      ? typeof i.prompt === 'string' && (i.prompt === c.prompt || i.prompt === c.prompt + HANDOVER_CLAUSE)
+      : i.task_id === c.taskId || i.shell_id === c.taskId,
+  )
+}
+
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
@@ -180,6 +198,13 @@ let nudgedSinceDrain = false
 const ownSends: OwnSend[] = []
 /** A SendMessage check went unmatched while the mod had a send in flight, and was logged: once per load. */
 let checkMissLogged = false
+/**
+ * The mod's own tool calls in flight other than sends (a respawn's Agent call, a TaskStop): under auto mode the
+ * classifier refuses them, as it does the mod's sends. tool.check allows exactly these, and only while in flight.
+ */
+const ownCalls: OwnCall[] = []
+/** An Agent or TaskStop check went unmatched while the mod had a call in flight, and was logged: once per load. */
+let callMissLogged = false
 /**
  * When the mod saw each transcript entry, per agent: a call's `tool_use_id` → ms, or a text's
  * `textKey` → each time it was seen, oldest first (a repeated text takes its own). Module-level,
@@ -649,6 +674,49 @@ async function sendOwn($: $, agentId: string, text: string) {
   }
 }
 
+/** Runs one of the mod's own calls, marked for tool.check while in flight (at most DRAIN_TIMEOUT_MS). */
+async function callOwn<T>($: $, mark: OwnCall, run: () => Promise<T>): Promise<T> {
+  const unmark = () => {
+    const i = ownCalls.indexOf(mark)
+    if (i >= 0) ownCalls.splice(i, 1)
+  }
+  ownCalls.push(mark) // synchronously, before any await
+  let timer: { cancel: () => void } | undefined
+  try {
+    timer = $.clock.after(DRAIN_TIMEOUT_MS, unmark)
+  } catch {
+    // no timer: the mark lasts as long as the call
+  }
+  try {
+    return await run()
+  } finally {
+    timer?.cancel()
+    unmark()
+  }
+}
+
+/**
+ * tool.check's verdict for an Agent or TaskStop call: allow when it is one of the mod's own in flight, else
+ * undefined (the engine decides). Logs the first miss while a call is in flight, by length only. Never throws.
+ */
+function ownCallVerdict($: $, tool: string, input: unknown) {
+  try {
+    if (ownCalls.length === 0) return undefined
+    if (isOwnCall(input, ownCalls)) return { decision: 'allow' as const, reason: 'orchestrator mod: its own call' }
+    if (!callMissLogged) {
+      callMissLogged = true
+      // No prompt text: the debug log may be shared.
+      const p = typeof input === 'object' && input !== null ? (input as { prompt?: unknown }).prompt : undefined
+      $.ui.log(`orchestrator: ${tool} check not matched: prompt=${typeof p === 'string' ? `${p.length} chars` : typeof p}`, {
+        to: 'debug',
+      })
+    }
+  } catch {
+    // fall through to the engine's verdict
+  }
+  return undefined
+}
+
 async function tellParent($: $, parentId: string | undefined, text: string) {
   if (parentId === undefined || parentId === 'main') {
     await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
@@ -706,13 +774,14 @@ async function respawn($: $, old: AgentRow) {
     return
   }
   lastSpawned = undefined
-  const res = await $.agent.spawn({
+  const args = {
     prompt: replacementPrompt(brief, old.notePath),
     subagentType: brief.subagentType,
     description: brief.description,
     model: brief.model,
     name: brief.name,
-  })
+  }
+  const res = await callOwn($, { tool: 'Agent', prompt: args.prompt }, () => $.agent.spawn(args))
   const newId = res.agentId ?? lastSpawned
   if (res.deny !== undefined || !newId) {
     await log($, `${label(old)}: respawn refused (${res.deny ?? 'no agent id'})`, 'warn')
@@ -1161,6 +1230,8 @@ export const register: Register = (on, options) => {
   toolReads.again.clear()
   ownSends.length = 0
   checkMissLogged = false
+  ownCalls.length = 0
+  callMissLogged = false
   draining = false
   nudgedSinceDrain = false
 
@@ -1384,6 +1455,11 @@ export const register: Register = (on, options) => {
     }
     return next(e)
   })
+
+  // The mod's own respawn (Agent) and its stop of a replaced agent (TaskStop) are tool calls no request asked for;
+  // under auto mode the classifier refuses them. Allow exactly those, while in flight.
+  on('tool.check', { tool: 'Agent' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
+  on('tool.check', { tool: 'TaskStop' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.
   on('turn.start', ($, e, next) => {

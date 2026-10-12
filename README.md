@@ -25,6 +25,8 @@ If the agent ends again without writing its note, it is marked `done` and not re
 
 **HANDOVER clause.** Every Agent call has the cold-restart clause appended to its prompt (`injectClause`), so orchestrators no longer have to paste it into each brief.
 
+**Auto mode.** The mod's own messages, its spawn of a replacement, and its stop of a replaced agent are tool calls no request of yours asked for, so auto mode's classifier would refuse them. The mod allows exactly those calls while they are in flight (10 seconds at most), and nothing else.
+
 **Main-thread restart.** When the main thread crosses `mainThreshold`:
 
 1. It writes a handover note.
