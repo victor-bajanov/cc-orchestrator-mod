@@ -77,6 +77,7 @@ import {
   textKey,
   transcriptItems,
   transcriptView,
+  watchdogDue,
 } from './view'
 import type { TranscriptLine } from './view'
 
@@ -1265,6 +1266,24 @@ async function fireCheckins($: $, now: number) {
 }
 
 /**
+ * Nudges each agent idle with nothing running past `idleWatchdogMinutes`, once per idle stretch: the nudge
+ * is recorded first, and queued, live only, for the next turn end to deliver.
+ */
+async function fireWatchdog($: $, now: number, engine: ReadonlyMap<string, string>) {
+  for (const r of watchdogDue(await read($, agentsAtom), engine, now, cfg.idleWatchdogMinutes * 60_000)) {
+    await update($, agentsAtom, l => patch(l, r.id, { watchdog: { t: now, ends: 0 } }))
+    await enqueue($, {
+      agentId: r.id,
+      text: watchdogNudge(cfg.idleWatchdogMinutes),
+      what: `idle nudge for ${label(r)} not delivered`,
+      liveOnly: true,
+    })
+    await log($, `${label(r)}: idle ${cfg.idleWatchdogMinutes} min with nothing running: nudged`)
+    await persist($)
+  }
+}
+
+/**
  * Forwards a child's final answer to its parent agent when `forwardTarget` says so, which wakes or
  * resumes that parent. A failure is warned, never thrown.
  */
@@ -1287,7 +1306,10 @@ async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
   if (!r) return
   // Its run is over: its next run reports afresh. Its check-in is spent only when it truly ends below; a
   // handover keeps it, for the replacement to inherit (or for the note-writing run it is woken for).
-  await update($, agentsAtom, l => patch(l, id, { report: undefined }))
+  // A turn ended since the idle watchdog's nudge: one besides the nudge's own run re-arms it.
+  await update($, agentsAtom, l =>
+    patch(l, id, { report: undefined, ...(r.watchdog && { watchdog: { ...r.watchdog, ends: r.watchdog.ends + 1 } }) }),
+  )
   // A stalled handover is settled by its end like any other: by the note, if it wrote one late.
   if (r.status === 'handing-over' || r.status === 'stalled') {
     if (r.notePath && (await $.fs.exists(r.notePath))) {
@@ -1307,7 +1329,8 @@ async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
       await log($, `${label(r)} ended without writing its handover note`, 'warn')
     }
   } else if (isActive(r)) {
-    await update($, agentsAtom, l => patch(l, id, { status: 'idle', ...DISARMED }))
+    // A teammate ends a turn whenever it waits on its children: only its report or its end disarms its check-in.
+    await update($, agentsAtom, l => patch(l, id, { status: 'idle', ...(r.isTeammate ? {} : DISARMED) }))
     if (r.isOurs && !r.isTeammate && r.parentId === 'main') {
       // The engine does not tell main of an agent the mod spawned: its replacement's report is submitted.
       const text = `[orchestrator mod] ${label(r)} (id ${id}, replacement for ${r.replaces}) reports:\n\n${answer}`
@@ -1326,7 +1349,9 @@ const resumedRunning = (r: AgentRow, now: number) =>
 
 /** Marks agents the engine no longer lists as done, and handovers that hang as stalled. */
 async function sync($: $) {
-  const listed = new Set((await $.agent.list()).map(a => a.id))
+  const listedAgents = await $.agent.list()
+  const listed = new Set(listedAgents.map(a => a.id))
+  const engineStatus = new Map(listedAgents.map(a => [a.id, String(a.status)]))
   const now = await $.clock.now()
   const rows = await read($, agentsAtom)
   let changed = false
@@ -1338,7 +1363,7 @@ async function sync($: $) {
       void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' }).catch(() => undefined)
       changed = true
     } else if (isActive(r) && !listed.has(r.id) && !resumedRunning(r, now)) {
-      await update($, agentsAtom, l => patch(l, r.id, { status: 'done' }))
+      await update($, agentsAtom, l => patch(l, r.id, { status: 'done', ...DISARMED }))
       changed = true
     }
   }
@@ -1353,6 +1378,11 @@ async function sync($: $) {
     await fireCheckins($, now)
   } catch (err) {
     $.ui.log(`orchestrator: check-ins not fired: ${String(err)}`)
+  }
+  try {
+    await fireWatchdog($, now, engineStatus)
+  } catch (err) {
+    $.ui.log(`orchestrator: idle watchdog not run: ${String(err)}`)
   }
   // The open transcript is read again now and then, so one left loading (a reload, a lost read) settles.
   const selected = liveSelection(await read($, agentsAtom), await read($, selectedAtom))

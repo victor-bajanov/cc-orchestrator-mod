@@ -2589,6 +2589,151 @@ describe('check-in', () => {
   })
 })
 
+describe('idle watchdog', () => {
+  const MIN = 60_000
+  /** Time passes, then a turn ends (main's), which delivers what the timers queued. */
+  const later = async ($: Engine, w: World, ms: number) => {
+    await w.clock.advance(ms)
+    await complete($, undefined)
+    await w.clock.settle()
+  }
+  const nudges = (w: World, to = 'agent1') => w.sent.filter(m => m.to.includes(to) && m.text.includes("you've been idle"))
+  /** A teammate under main that ran once and went idle; the engine lists it idle. */
+  const idleMate = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'mate', isTeammate: true })
+    await step($, 'agent1')
+    await complete($, 'agent1', 'waiting')
+    w.agents = [{ id: 'agent1', name: 'mate', status: 'idle' }]
+  }
+
+  test('an idle teammate with nothing running is nudged once after idleWatchdogMinutes', async ($, on) => {
+    const w = world(on)
+    await idleMate($, w)
+    await later($, w, 4 * MIN)
+    expect(nudges(w)).toHaveLength(0)
+    await later($, w, MIN + 30_000)
+    expect(nudges(w)).toHaveLength(1)
+    expect(nudges(w)[0]!.text).toContain('[orchestrator mod]')
+    expect(nudges(w)[0]!.text).toContain('5 min')
+    expect(row(w, 'agent1')!.watchdog).toEqual(expect.objectContaining({ ends: 0 }))
+    expect(JSON.stringify(w.files.get(`${RUN_DIR}/activity.log`) ?? '')).toContain('idle 5 min with nothing running: nudged')
+    await later($, w, 20 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('after the nudge\'s run ends, not again; after another run and the idle time, again', async ($, on) => {
+    const w = world(on)
+    await idleMate($, w)
+    await later($, w, 6 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+    // The nudge's own run.
+    await step($, 'agent1')
+    await complete($, 'agent1', 'still waiting')
+    expect(row(w, 'agent1')!.watchdog).toEqual(expect.objectContaining({ ends: 1 }))
+    await later($, w, 10 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+    // A run besides it (a message woke it): the next idle stretch is watched again.
+    await step($, 'agent1')
+    await complete($, 'agent1', 'did more')
+    expect(row(w, 'agent1')!.watchdog).toEqual(expect.objectContaining({ ends: 2 }))
+    await later($, w, 4 * MIN)
+    expect(nudges(w)).toHaveLength(1)
+    await later($, w, MIN + 30_000)
+    expect(nudges(w)).toHaveLength(2)
+  })
+
+  test('a completed one-shot subagent, an agent waiting on children and an agent with a background shell are never nudged', async ($, on) => {
+    const w = world(on)
+    await start($)
+    // agent1: a one-shot subagent, ended; the engine lists it completed.
+    await spawn($, { prompt: 'P', name: 'once' })
+    await step($, 'agent1')
+    await complete($, 'agent1', 'R')
+    // agent2: a teammate waiting on its running child agent3.
+    await spawn($, { prompt: 'P', name: 'boss', isTeammate: true })
+    await step($, 'agent2')
+    await spawn($, { prompt: 'P', name: 'kid', parentAgentId: 'agent2' })
+    await step($, 'agent3')
+    await complete($, 'agent2', 'waiting')
+    // agent4: a teammate whose background command still runs.
+    await spawn($, { prompt: 'P', name: 'shelly', isTeammate: true })
+    await step($, 'agent4')
+    await bgBash($, w, 'agent4', 'b1')
+    await complete($, 'agent4', 'waiting')
+    w.agents = [
+      { id: 'agent1', name: 'once', status: 'completed' },
+      { id: 'agent2', name: 'boss', status: 'idle' },
+      { id: 'agent3', name: 'kid', status: 'running' },
+      { id: 'agent4', name: 'shelly', status: 'idle' },
+    ]
+    await later($, w, 15 * MIN)
+    expect(w.sent.filter(m => m.text.includes("you've been idle"))).toHaveLength(0)
+    expect(row(w, 'agent1')!.watchdog).toBeUndefined()
+  })
+
+  test('idleWatchdogMinutes 0 never nudges', { options: { idleWatchdogMinutes: 0 } }, async ($, on) => {
+    const w = world(on)
+    await idleMate($, w)
+    await later($, w, 60 * MIN)
+    expect(nudges(w)).toHaveLength(0)
+  })
+})
+
+describe('check-in on a teammate', () => {
+  const MIN = 60_000
+  const CHECKIN = 'mcp__orchestrator__checkin'
+  const later = async ($: Engine, w: World, ms: number) => {
+    await w.clock.advance(ms)
+    await complete($, undefined)
+    await w.clock.settle()
+  }
+  const fired = (w: World) => w.prompts.filter(p => p.includes('check-in') && p.includes('mate'))
+  /** Main's teammate `mate` (agent1), listed by the engine, with main's 5-minute check-in on it. */
+  const armed = async ($: Engine, w: World) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'mate', isTeammate: true })
+    await step($, 'agent1')
+    w.agents = [{ id: 'agent1', name: 'mate' }]
+    await call($, undefined, CHECKIN, { agent: 'mate', minutes: 5 })
+    expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+  }
+
+  test("main's check-in on a teammate survives its turn ends and fires", async ($, on) => {
+    const w = world(on)
+    await armed($, w)
+    await complete($, 'agent1', 'waiting for my children')
+    expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+    await step($, 'agent1')
+    await complete($, 'agent1', 'still waiting')
+    expect(row(w, 'agent1')!.checkinAt).toBeDefined()
+    await later($, w, 6 * MIN)
+    expect(fired(w)).toHaveLength(1)
+  })
+
+  test('its SendMessage to main disarms it', async ($, on) => {
+    const w = world(on)
+    await armed($, w)
+    await complete($, 'agent1', 'waiting')
+    await step($, 'agent1')
+    await call($, 'agent1', 'SendMessage', { to: 'main', message: 'all done' })
+    expect(row(w, 'agent1')!.checkinAt).toBeUndefined()
+    await later($, w, 6 * MIN)
+    expect(fired(w)).toHaveLength(0)
+  })
+
+  test('sync marking it done disarms it', async ($, on) => {
+    const w = world(on)
+    await armed($, w)
+    w.agents = []
+    await w.clock.advance(30_000)
+    expect(row(w, 'agent1')!.status).toBe('done')
+    expect(row(w, 'agent1')!.checkinAt).toBeUndefined()
+    await later($, w, 6 * MIN)
+    expect(fired(w)).toHaveLength(0)
+  })
+})
+
 describe('auto-forward', () => {
   const end = ($: Engine, agentId: string, answer: string, reason: 'answer' | 'aborted' | 'error' = 'answer') =>
     $.turn.complete({ answer, durationMs: 5, isAborted: reason === 'aborted', turnId: 'T', agentId, reason })

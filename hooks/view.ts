@@ -617,6 +617,25 @@ export const checkinDue = (rows: readonly AgentRow[], now: number): AgentRow[] =
   rows.filter(r => r.checkinAt !== undefined && r.checkinAt <= now)
 
 /**
+ * Idle agents the idle watchdog nudges: never main, only one the engine too lists idle (not ended, not
+ * held on its own work), with no busy child and no background command, idle `idleMs` or longer. Once
+ * nudged, not again until a run besides the nudge's own has ended (`ends` 2). `idleMs` 0: none.
+ */
+export const watchdogDue = (rows: readonly AgentRow[], engine: ReadonlyMap<string, string>, now: number, idleMs: number): AgentRow[] =>
+  idleMs <= 0
+    ? []
+    : rows.filter(
+        r =>
+          r.id !== 'main' &&
+          r.status === 'idle' &&
+          engine.get(r.id) === 'idle' &&
+          displayStatus(r, rows) === 'idle' &&
+          !r.shells?.length &&
+          now - r.lastActive >= idleMs &&
+          (r.watchdog === undefined || r.watchdog.ends >= 2),
+      )
+
+/**
  * Whether a child's final answer goes to its parent agent, and whether it may repeat what the child
  * already sent. Skipped: a parent that is main or unknown (the engine tells main), a teammate or a
  * foreground child (its answer is delivered), a handover, an empty or unfinished answer, and a run
