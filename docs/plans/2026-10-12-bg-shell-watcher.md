@@ -146,8 +146,8 @@ Add to `AgentRow`:
 - Import all of the above in the core block. tsc has no `noUnusedLocals`, so A, B and C add no core imports.
 - Add the four keys to `cfg`, with the defaults above, read through `numberSetting(options.x, default)`.
 - New section `// ---- background shells`, holding:
-  - `const FS_READ_MAX = 4 * 1024 * 1024`, `const shellSizes = new Map<string, number>()` and `let shellTicking = false`, all reset in `register()`;
-  - `async function readExit($: $, path: string): Promise<number | 'killed' | undefined>`: `''` gives undefined. It calls `stat`, returns undefined when the size is over `FS_READ_MAX`, then `read`s and returns `shellExit`. Any rejection gives undefined.
+  - `const FULL_READ_MAX = 64 * 1024` (shipped as `FS_READ_MAX = 4 * 1024 * 1024`, lowered in review: a bigger file is checked through `tail -c 256`), `const shellSizes = new Map<string, number>()` and `let shellTicking = false`, all reset in `register()`;
+  - `async function readExit($: $, path: string): Promise<number | 'killed' | undefined>`: `''` gives undefined. It calls `stat`, takes the marker from `tail -c 256` when the size is over `FULL_READ_MAX` (64 KiB), else `read`s and returns `shellExit`. Any rejection gives undefined.
   - `async function shellEnded($: $, shellId: string, exit: ShellExit)`: does nothing unless the shell is open. It applies `endShell(…, await $.clock.now())`, logs `<label>: background command "<d>" (<id>) <shellEndWords>` and persists.
   - `async function noteShell($: $, agentId: string, tool: string, args: Record<string, unknown>, res: object)`:
     - Bash with `backgroundedShell(res)`: `addShell` with `description: String(args.description ?? '')`, `command: String(args.command ?? '')` and `startedAt` now. Log `<label>: background command "<d>" (<id>) started`, then persist.
@@ -221,7 +221,7 @@ Add to `AgentRow`:
 
 ### Task B: reconcile at turn ends via `background_tasks` (R, RT)
 
-**Goal.** A shell the engine no longer lists is ended, even when polling missed it (polling off, a file over 4 MiB, a missing file).
+**Goal.** A shell the engine no longer lists is ended, even when polling missed it (polling off, a file whose tail can't be read, a missing file).
 
 **R.**
 
@@ -317,7 +317,7 @@ It returns `[]` when `idleMs <= 0`. Otherwise every row where all of these hold:
 
 - There is no `turn.start` for subagents (F5): the first step of a new run stands in.
 - A busy agent whose notice was absorbed mid-run but who never named the shell gets one possibly redundant nudge.
-- A file over 4 MiB, or a hard crash with no marker, is caught only by reconciliation (`unknown`) or the ceiling.
+- A file over 64 KiB is checked through `tail -c 256`. One whose tail fails, or a hard crash with no marker, is caught only by reconciliation (`unknown`) or the ceiling.
 - Teammates running in their own terminal pane make no `tool.call` in this process: their shells aren't tracked.
 - Backlog: pane display of open shells; moving open shells to a replacement on handover.
 

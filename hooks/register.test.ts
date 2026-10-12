@@ -3246,7 +3246,7 @@ describe('background shells: reconciled at turn ends', () => {
     const w = stopWorld(on)
     await family($, w)
     await bgBash($, w, 'agent2', 'b1')
-    w.files.set(out('b1'), 'x'.repeat(4 * 1024 * 1024 + 10))
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 10))
     endOutput(w, 'b1', 7)
     await subagentStop($, 'agent2', [])
     expect(exits(w)).toEqual([['b1', 7]])
@@ -5234,14 +5234,14 @@ describe('background shells: tracking', () => {
     expect(reads()).toBe(2)
   })
 
-  test('a missing or over-4 MiB output file is not read and stays open; the poll keeps going', async ($, on) => {
+  test('a missing or over-64 KiB output file is not read and stays open; the poll keeps going', async ($, on) => {
     const w = world(on)
     await family($, w)
     await bgBash($, w, 'agent2', 'b1')
     await bgBash($, w, 'agent2', 'b2')
     await bgBash($, w, 'agent2', 'b3')
     w.files.delete(out('b1'))
-    w.files.set(out('b2'), 'x'.repeat(4 * 1024 * 1024) + '\n[exited with code 0]\n')
+    w.files.set(out('b2'), 'x'.repeat(64 * 1024 + 1) + '\n[exited with code 0]\n')
     // Its tail fails too: nothing settles it.
     w.tailFails.add(out('b2'))
     endOutput(w, 'b3', 0)
@@ -5257,11 +5257,11 @@ describe('background shells: tracking', () => {
     expect(row(w, 'agent2')!.shells![0]!.exit).toBe(2)
   })
 
-  test('a shell whose output file passed 4 MiB is ended from its tail', async ($, on) => {
+  test('a shell whose output file passed 64 KiB is ended from its tail', async ($, on) => {
     const w = world(on)
     await family($, w)
     await bgBash($, w, 'agent2', 'b1')
-    const big = 'x'.repeat(4 * 1024 * 1024 + 10)
+    const big = 'x'.repeat(64 * 1024 + 10)
     w.files.set(out('b1'), big)
     await poll(w)
     expect(w.tails).toEqual([out('b1')])
@@ -5276,12 +5276,29 @@ describe('background shells: tracking', () => {
     expect(w.reads.filter(p => p === out('b1'))).toEqual([])
   })
 
+  test('a file over 64 KiB is checked by its tail, not read whole; one of 64 KiB is read whole', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    const marker = '\n[exited with code 0]\n'
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 1 - marker.length) + marker)
+    w.files.set(out('b2'), 'x'.repeat(64 * 1024 - marker.length) + marker)
+    await poll(w)
+    expect(w.tails).toEqual([out('b1')])
+    expect(w.reads.filter(p => p === out('b1') || p === out('b2'))).toEqual([out('b2')])
+    expect(row(w, 'agent2')!.shells!.map(s => [s.id, s.exit])).toEqual([
+      ['b1', 0],
+      ['b2', 0],
+    ])
+  })
+
   test('a tail that fails leaves the big shell open, no throw', async ($, on) => {
     const w = world(on)
     await family($, w)
     await bgBash($, w, 'agent2', 'b1')
     await bgBash($, w, 'agent2', 'b2')
-    w.files.set(out('b1'), 'x'.repeat(4 * 1024 * 1024 + 10) + '\n[exited with code 0]\n')
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 10) + '\n[exited with code 0]\n')
     w.tailFails.add(out('b1'))
     endOutput(w, 'b2', 1)
     await poll(w)
@@ -5296,7 +5313,7 @@ describe('background shells: tracking', () => {
     const w = world(on)
     await family($, w)
     await bgBash($, w, 'agent2', 'b1')
-    w.files.set(out('b1'), 'x'.repeat(4 * 1024 * 1024 + 10) + '\n[exited with code 0]\n')
+    w.files.set(out('b1'), 'x'.repeat(64 * 1024 + 10) + '\n[exited with code 0]\n')
     w.tailFails.add(out('b1'))
     await poll(w)
     expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
