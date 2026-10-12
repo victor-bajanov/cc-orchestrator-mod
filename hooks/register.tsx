@@ -1113,6 +1113,20 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
   }
 }
 
+/**
+ * Ends every tracked open shell a turn end's `background_tasks` no longer lists (the engine drops a finished one):
+ * with the code its file holds, else `unknown`. It catches what polling missed. A missing list does nothing.
+ */
+async function reconcileShells($: $, tasks: unknown) {
+  try {
+    for (const { shell } of goneShells(await read($, agentsAtom), tasks)) {
+      await shellEnded($, shell.id, (await readExit($, shell.outputPath)) ?? 'unknown')
+    }
+  } catch (err) {
+    $.ui.log(`orchestrator: shells not reconciled: ${String(err)}`)
+  }
+}
+
 // ---- delivery from timers ---------------------------------------------
 //
 // A run woken by `$.session.send` (or started by `$.agent.spawn`) from a `$.clock` callback runs
@@ -1883,6 +1897,27 @@ export const register: Register = (on, options) => {
   // under auto mode the classifier refuses them. Allow exactly those, while in flight.
   on('tool.check', { tool: 'Agent' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
   on('tool.check', { tool: 'TaskStop' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
+
+  // A turn end lists the session's background work still running: a tracked shell missing from it has ended.
+  // Bookkeeping after `next`, never a send, and it never changes the answer.
+  on('classic.SubagentStop', async ($, e, next) => {
+    const res = await next(e)
+    try {
+      await reconcileShells($, e.background_tasks)
+    } catch {
+      // see above
+    }
+    return res
+  }).catch(($, e, next) => next(e))
+  on('classic.Stop', async ($, e, next) => {
+    const res = await next(e)
+    try {
+      await reconcileShells($, e.background_tasks)
+    } catch {
+      // see above
+    }
+    return res
+  }).catch(($, e, next) => next(e))
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.
   on('turn.start', ($, e, next) => {

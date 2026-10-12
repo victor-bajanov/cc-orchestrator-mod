@@ -3040,6 +3040,122 @@ describe('repeated answers', () => {
   })
 })
 
+describe('background shells: reconciled at turn ends', () => {
+  const opts = { options: { shellPollSeconds: 0 } }
+  const out = (id: string) => `${TASKS}/${id}.output`
+  /** A background task as `background_tasks` lists it: session-wide, still running. */
+  const task = (id: string) => ({ id, type: 'shell', status: 'running', description: 'run the tests', command: 'npm test' })
+  /** A subagent's turn end as the classic hook sees it; `tasks` absent as an older engine sends it. */
+  const subagentStop = ($: Engine, agentId: string, tasks?: unknown[]) =>
+    $.classic.SubagentStop({
+      stop_hook_active: false,
+      agent_id: agentId,
+      agent_transcript_path: `/t/${agentId}.jsonl`,
+      agent_type: 'general-purpose',
+      ...(tasks && { background_tasks: tasks }),
+    } as never)
+  const exits = (w: World, id = 'agent2') => row(w, id)!.shells!.map(s => [s.id, s.exit])
+  /** The world, with the engine's own answers to both turn-end hooks beneath the plugin. */
+  const stopWorld = (on: On, sub: object = {}, stop: object = {}) => {
+    on('classic.SubagentStop', () => sub)
+    on('classic.Stop', () => stop)
+    return world(on)
+  }
+
+  test("a tracked shell missing from SubagentStop's background_tasks is ended with the code its file holds", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    endOutput(w, 'b1', 3)
+    const t = w.clock.now()
+    await subagentStop($, 'agent2', [task('b2')])
+    expect(exits(w)).toEqual([
+      ['b1', 3],
+      ['b2', undefined],
+    ])
+    expect(row(w, 'agent2')!.shells![0]!.endedAt).toBe(t)
+    await w.clock.settle()
+    expect(w.files.get(`${RUN_DIR}/activity.log`)).toContain('impl-2: background command "run the tests" (b1) exited with code 3')
+    // Saved, and nothing sent.
+    const saved = JSON.parse(w.writes.at(-1)!) as { agents: AgentRow[] }
+    expect(saved.agents.find(a => a.id === 'agent2')!.shells![0]!.exit).toBe(3)
+    expect(w.sent).toEqual([])
+  })
+
+  test('with no marker it is ended as unknown', opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'partial output\n')
+    await subagentStop($, 'agent2', [])
+    expect(exits(w)).toEqual([['b1', 'unknown']])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBe(w.clock.now())
+    await w.clock.settle()
+    expect(w.files.get(`${RUN_DIR}/activity.log`)).toContain('(b1) finished (exit code unknown)')
+  })
+
+  test('a shell still listed stays open', opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    const writes = w.writes.length
+    // Listed by another agent's turn end: the list is session-wide.
+    await subagentStop($, 'agent1', [task('b1'), { id: 'a9', type: 'subagent', status: 'running', description: 'x' }])
+    expect(exits(w)).toEqual([['b1', undefined]])
+    expect(w.writes.length).toBe(writes)
+  })
+
+  test("main's Stop reconciles too", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'm1', 0)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w, 'main')).toEqual([['m1', 0]])
+    expect(exits(w)).toEqual([['b1', 'unknown']])
+  })
+
+  test('no background_tasks field changes nothing', opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    const writes = w.writes.length
+    await subagentStop($, 'agent2')
+    await $.classic.Stop({ stop_hook_active: false } as never)
+    await subagentStop($, 'agent2', 'junk' as never)
+    expect(exits(w)).toEqual([['b1', undefined]])
+    expect(w.writes.length).toBe(writes)
+  })
+
+  test("an unreadable file still ends it as unknown, and the hook answers next's result", opts, async ($, on) => {
+    const w = stopWorld(on, { block: 'keep going' }, { block: 'not yet' })
+    await family($, w)
+    await step($)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, undefined, 'm1')
+    endOutput(w, 'b1', 0)
+    w.readFailsOnce = true
+    w.files.delete(out('b2'))
+    expect(await subagentStop($, 'agent2', [task('m1')])).toEqual({ block: 'keep going' })
+    expect(exits(w)).toEqual([
+      ['b1', 'unknown'],
+      ['b2', 'unknown'],
+    ])
+    expect(await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)).toEqual({ block: 'not yet' })
+    expect(exits(w, 'main')).toEqual([['m1', 'unknown']])
+    // A failing state write in the mod's own bookkeeping still answers next's result.
+    await bgBash($, w, 'agent2', 'b3')
+    w.fsFails = STATE
+    expect(await subagentStop($, 'agent2', [])).toEqual({ block: 'keep going' })
+  })
+})
+
 describe('delivery from timers', () => {
   const MIN = 60_000
   const CHECKIN = 'mcp__orchestrator__checkin'
