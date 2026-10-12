@@ -1379,9 +1379,9 @@ async function shellEnded($: $, shellId: string, exit: ShellExit) {
 
 /** Tracks a Bash call an agent (or main) sent to the background, and drops a shell a TaskStop stopped. */
 async function noteShell($: $, agentId: string, tool: string, args: Record<string, unknown>, res: object) {
-  // A call naming a finished shell's id or output path (Read, TaskOutput, cat) picked it up.
+  // A call naming a finished shell's id or output path (Read, TaskOutput, cat) picked it up; a failed one did not.
   const own = (await read($, agentsAtom)).find(a => a.id === agentId)
-  if (own?.shells?.some(s => s.exit !== undefined)) {
+  if (!(res as { isError?: unknown }).isError && own?.shells?.some(s => s.exit !== undefined)) {
     const mention = JSON.stringify(args)
     const kept = own.shells.length
     let left = kept
@@ -1725,8 +1725,9 @@ export const register: Register = (on, options) => {
       // The answering model wins over the requested one; an engine without effort leaves it out.
       const ran = { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }
       const before = (await read($, agentsAtom)).find(a => a.id === id)
-      // A new run (its first step since a turn end; main at any step) has seen its finished shells' notices.
-      const newRun = before !== undefined && before.status !== 'running' && before.status !== 'handing-over'
+      // A new run (its first step since a turn end: a status recordStep revives; main at any step) has seen its
+      // finished shells' notices. A stalled handover's step is the same run.
+      const newRun = before !== undefined && (['idle', 'done', 'respawn-failed'] as AgentRow['status'][]).includes(before.status)
       const pickUp = (id === 'main' || newRun) && !!before?.shells?.some(s => s.exit !== undefined)
       await update($, agentsAtom, l => {
         const stepped = patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran)
