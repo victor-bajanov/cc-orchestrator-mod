@@ -270,3 +270,10 @@ export const wrapFill = (text: string, width: number): string[] => {
   if (line || lines.length === 0) lines.push(line)
   return lines.map(l => l.padEnd(width))
 }
+
+/** The most lines activity.log keeps; the oldest go first. */
+export const ACTIVITY_MAX = 2000
+
+/** One activity.log line: UTC ISO time, level, the text on one line. */
+export const activityLine = (t: number, level: 'info' | 'warn', text: string): string =>
+  `${new Date(t).toISOString()} ${level === 'warn' ? 'WARN' : 'info'} ${text.replace(/\r?\n/g, ' ⏎ ')}`

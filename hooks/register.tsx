@@ -5,7 +5,9 @@ import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, 
 import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
+  ACTIVITY_MAX,
   HANDOVER_CLAUSE,
+  activityLine,
   adoptChildren,
   briefPathFor,
   contextOf,
@@ -224,6 +226,16 @@ const STAMPS_MAX = 500
 let lastSpawned: string | undefined
 /** Agents already told their registered name: one notice each, however many paths learn the rename. */
 const noticed = new Set<string>()
+/** activity.log's lines, read back once per load (undefined: not read yet). */
+let activity: string[] | undefined
+/** The path `activity` was read from: another path is read afresh. */
+let activityPath = ''
+/** Lines logged before the run folder was known; they go in with the next line written. */
+const activityPending: string[] = []
+/** activity.log writes, one after another. */
+let activityChain: Promise<void> = Promise.resolve()
+/** Agents whose Hand over is being set up: a second start in the meantime is refused. */
+const handoverStarting = new Set<string>()
 
 async function runDir($: $) {
   let id = await read($, runAtom)
@@ -266,9 +278,55 @@ async function restore($: $) {
   await update($, outboxAtom, q => [...(saved.outbox ?? []).filter(d => !done.has(d.id)), ...q])
 }
 
+/**
+ * Appends a line to <run>/activity.log, keeping the last ACTIVITY_MAX (earlier lines read back once per load and
+ * per path). Never throws. Uses the run folder already known, never runDir: that writes the run id when it is
+ * empty, and after a /clear that would fork the run before restore. A line before the folder is known waits.
+ */
+async function writeActivity($: $, line: string) {
+  const run = activityChain.then(async () => {
+    try {
+      if (!runDirCache) {
+        activityPending.push(line)
+        activityPending.splice(0, Math.max(0, activityPending.length - ACTIVITY_MAX))
+        return
+      }
+      const path = `${runDirCache}/activity.log`
+      if (path !== activityPath) {
+        activity = undefined
+        activityPath = path
+      }
+      if (activity === undefined) {
+        activity = (await $.fs.exists(path)) ? (await $.fs.read(path)).split('\n').filter(Boolean) : []
+      }
+      activity.push(...activityPending.splice(0), line)
+      activity.splice(0, Math.max(0, activity.length - ACTIVITY_MAX))
+      await $.fs.write(path, `${activity.join('\n')}\n`)
+    } catch (err) {
+      try {
+        $.ui.log(`orchestrator: activity.log not written: ${String(err)}`, { to: 'debug' })
+      } catch {
+        // Nothing more to do.
+      }
+    }
+  })
+  activityChain = run
+  return run
+}
+
+/** Writes a line to activity.log only, not to the pane. Never throws. */
+async function trace($: $, text: string) {
+  try {
+    await writeActivity($, activityLine(await $.clock.now(), 'info', text))
+  } catch {
+    // The file is a record; a lost line breaks nothing.
+  }
+}
+
 async function log($: $, text: string, lvl: LogEntry['level'] = 'info') {
   const t = await $.clock.now()
   await update($, logAtom, l => [...l, { t, text, level: lvl }].slice(-200))
+  await writeActivity($, activityLine(t, lvl, text))
   if (lvl === 'warn') $.ui.toast(`orchestrator: ${text}`)
 }
 
@@ -595,19 +653,36 @@ function toolBody($: $, ui: Ui, v: ToolView | null, copyable: boolean) {
 // ---- subagents -------------------------------------------------------
 
 async function startHandover($: $, id: string, why: string) {
-  const r = (await read($, agentsAtom)).find(a => a.id === id)
-  if (!r || !canHandOver(r)) return false
-  const attempt = (r.handovers ?? 0) + 1
-  const notePath = notePathFor(await runDir($), r, attempt)
-  const now = await $.clock.now()
-  await update($, agentsAtom, l =>
-    patch(l, id, { status: 'handing-over', notePath, handoverAt: now, handovers: attempt, handoverVia: undefined }),
-  )
-  if (r.status === 'idle') return sendHandover($, id, why)
-  // A message would wait in a busy teammate's inbox until its turn ends: it rides on the next tool result instead.
-  await log($, `${label(r)} ${why}: HANDOVER goes with its next tool result`)
-  await persist($)
-  return true
+  // Checked and taken before any await: two presses in the same tick both pass canHandOver otherwise.
+  if (handoverStarting.has(id)) {
+    await log($, `${id}: Hand over not started (already starting; ${why})`)
+    return false
+  }
+  handoverStarting.add(id)
+  try {
+    const r = (await read($, agentsAtom)).find(a => a.id === id)
+    if (!r) {
+      await log($, `${id}: Hand over not started (no such agent; ${why})`)
+      return false
+    }
+    if (!canHandOver(r)) {
+      await log($, `${label(r)}: Hand over not started (status ${r.status}; ${why})`)
+      return false
+    }
+    const attempt = (r.handovers ?? 0) + 1
+    const notePath = notePathFor(await runDir($), r, attempt)
+    const now = await $.clock.now()
+    await update($, agentsAtom, l =>
+      patch(l, id, { status: 'handing-over', notePath, handoverAt: now, handovers: attempt, handoverVia: undefined }),
+    )
+    if (r.status === 'idle') return await sendHandover($, id, why)
+    // A message would wait in a busy teammate's inbox until its turn ends: it rides on the next tool result instead.
+    await log($, `${label(r)} ${why}: HANDOVER goes with its next tool result`)
+    await persist($)
+    return true
+  } finally {
+    handoverStarting.delete(id)
+  }
 }
 
 /**
@@ -631,7 +706,14 @@ async function sendHandover($: $, id: string, why: string, queue = false) {
 async function deliverHandover($: $, id: string, why: string, text: string) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   // Rechecked at delivery: a tool result may have carried it since it was queued, or the agent been replaced.
-  if (r?.status !== 'handing-over' || r.handoverVia !== undefined) return false
+  if (r?.status !== 'handing-over' || r.handoverVia !== undefined) {
+    // A routine skip: to the file only, not the pane.
+    await trace(
+      $,
+      `${r ? label(r) : id}: HANDOVER not sent (status ${r?.status ?? 'gone'}${r?.handoverVia ? `, already via ${r.handoverVia}` : ''})`,
+    )
+    return false
+  }
   const sent = await sendOwn($, id, text)
   if (sent.isDelivered) {
     const now = await $.clock.now()
@@ -1324,6 +1406,11 @@ export const register: Register = (on, options) => {
   callMissLogged = false
   draining = false
   nudgedSinceDrain = false
+  activity = undefined
+  activityPath = ''
+  activityPending.length = 0
+  activityChain = Promise.resolve()
+  handoverStarting.clear()
 
   // ---- events ----------------------------------------------------------
 
@@ -1709,6 +1796,14 @@ export const register: Register = (on, options) => {
   // A pane Hand over press is handled here, in hook context: a send from the button's own closure runs in
   // the plugin's environment like a timer's, and could wake the agent without the mod's hooks.
   on('ui.press', async ($, e, next) => {
+    // Every press on the mod's surfaces goes to activity.log (not the pane): a lost press shows as a missing line.
+    if (e.plugin === 'orchestrator') {
+      try {
+        await trace($, `press ${e.element} (${e.surface}, ${e.requestId})`)
+      } catch {
+        // A record only.
+      }
+    }
     const id = e.element.startsWith('handover:') ? e.element.slice('handover:'.length) : ''
     if (e.plugin !== 'orchestrator' || e.requestId !== PANE || id === '' || id === 'main') return next(e)
     try {

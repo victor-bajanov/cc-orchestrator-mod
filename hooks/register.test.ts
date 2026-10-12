@@ -4,7 +4,7 @@ import type { On } from 'claude-code'
 import type { AgentRow } from '../types'
 import { PEEK_TIMEOUT_MS, isOwnCall, isOwnOrigin, isOwnSend, liveSelection } from './register'
 import { hhmm } from './view'
-import { HANDOVER_CLAUSE, nameNotice, replacementPrompt } from './core'
+import { ACTIVITY_MAX, HANDOVER_CLAUSE, nameNotice, replacementPrompt } from './core'
 import { PEEK_DENIED as DENIED, runnerFor } from './view'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
@@ -95,12 +95,16 @@ const world = (on: On) => {
     stopChecks: [] as string[],
     /** How TaskStop fails: not at all, by throwing, never answering ('hang'), or refused with this reason. */
     stopFails: '' as '' | 'throw' | 'hang' | string,
+    /** What `session.id` answers: a /clear changes it. */
+    sessionId: 'S1',
+    /** `fs.write` to this path throws ('' none). */
+    fsFails: '' as string,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
   const session = mock.session(on)
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: 'S1' }))
+  on('session.id', () => ({ value: w.sessionId }))
   on('session.root', () => ({ value: '/repo' }))
   on('agent.list', async () => {
     if (w.holdList) await w.holdList
@@ -178,6 +182,7 @@ const world = (on: On) => {
     return { model: 'opus', agentId, ...(teammateId && { teammateId }) }
   })
   on('fs.write', ($, e) => {
+    if (w.fsFails && e.path === w.fsFails) throw new Error('disk full')
     if (e.path === STATE) w.writes.push(e.text)
     w.files.set(e.path, e.text)
     return { value: undefined }
@@ -3089,6 +3094,17 @@ describe('delivery from timers: hardening', () => {
       await complete($, undefined)
       await w.clock.settle()
       expect(w.sent.filter(m => m.text === 'HANDOVER queued')).toHaveLength(sends)
+      if (sends === 0 && 'handoverVia' in change) {
+        // A routine skip: recorded in activity.log, not drawn in the pane's activity.
+        const ui = await mountPane($, 'desktop')
+        const strip = (n: unknown): string =>
+          typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as { children?: unknown[] }).children ?? []).map(strip).join('') : ''
+        const drawn = (await ui.findAll({ type: 'Text' })).map(strip).join('\n')
+        expect(drawn).toContain('impl-1')
+        expect(drawn).not.toContain('HANDOVER not sent')
+        await ui.unmount()
+        expect(w.files.get(`${RUN_DIR}/activity.log`)).toContain('HANDOVER not sent')
+      }
     })
   }
 })
@@ -4366,5 +4382,151 @@ describe('engine-assigned names', () => {
     await renamed($, w)
     const outbox = (JSON.parse(w.files.get(STATE)!) as { outbox?: { agentId: string; text: string }[] }).outbox ?? []
     expect(outbox).toEqual([expect.objectContaining({ agentId: 'agent1', text: NOTICE })])
+  })
+})
+
+describe('activity.log', () => {
+  const ACT = `${RUN_DIR}/activity.log`
+  const lines = (w: World) => (w.files.get(ACT) ?? '').split('\n').filter(Boolean)
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+
+  test('every activity line is written to the run folder', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    expect(w.files.get(ACT)).toContain('info spawned impl-1 (agent1)')
+  })
+
+  test('a warn is marked WARN', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.spawnDeny = 'nope'
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(lines(w).some(l => / WARN .*no replacement started \(nope\)/.test(l))).toBe(true)
+  })
+
+  test('the file keeps the last ACTIVITY_MAX lines, earlier lines read back after a reload', async ($, on) => {
+    const w = world(on)
+    w.files.set(ACT, Array.from({ length: ACTIVITY_MAX }, (_, i) => `old ${i}`).join('\n') + '\n')
+    await running($, w)
+    const l = lines(w)
+    expect(l).toHaveLength(ACTIVITY_MAX)
+    expect(l[0]).toBe('old 1')
+    expect(l.at(-1)).toContain('spawned impl-1')
+    expect(w.files.get(ACT)!.endsWith('\n')).toBe(true)
+  })
+
+  test('a pane press is recorded in the file, not the pane', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    expect(w.files.get(ACT)).toContain('press agent:agent1 (desktop, orchestrator)')
+    const drawn = (await ui.findAll({ type: 'Text' })).map(t => textOf(t)).join('\n')
+    expect(drawn).not.toContain('press agent:')
+    await ui.unmount()
+  })
+
+  test('two Hand over presses at once start one handover, and the second says why', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await Promise.all([ui.press({ key: 'handover:agent1' }), ui.press({ key: 'handover:agent1' })])
+    await w.clock.settle()
+    expect(row(w, 'agent1')!.handovers).toBe(1)
+    const l = lines(w)
+    expect(l.filter(x => x.includes('press handover:agent1 (desktop'))).toHaveLength(2)
+    expect(l.filter(x => x.includes('Hand over not started ('))).toHaveLength(1)
+    expect(l.filter(x => x.includes('HANDOVER goes with its next tool result'))).toHaveLength(1)
+    await ui.unmount()
+  })
+
+  test('a failing write never breaks logging', async ($, on) => {
+    const w = world(on)
+    w.fsFails = ACT
+    await running($, w)
+    expect(row(w, 'agent1')).toBeDefined()
+    expect(w.logSinks.some(s => s.to === 'debug' && s.text.includes('activity.log not written'))).toBe(true)
+  })
+
+  /** A /clear: the next read of each key finds nothing, until the plugin writes it again. */
+  const wipeable = (on: Parameters<typeof world>[0]) => {
+    let wiped: Set<string> | undefined
+    on('state.get', async ($, e, next) => {
+      const res = (await next(e)) as { value?: { value: unknown; version: number } }
+      const k = (e as unknown as { key: string }).key
+      if (!wiped?.has(k) || !res.value) return res as never
+      return { value: { value: undefined, version: res.value.version } } as never
+    })
+    on('state.set', async ($, e, next) => {
+      const res = await next(e)
+      wiped?.delete((e as unknown as { key: string }).key)
+      return res
+    })
+    return () => {
+      wiped = new Set(['agents', 'log', 'mainPhase', 'runId', 'outbox', 'selectedAgent', 'transcripts', 'collapsed', 'toolView', 'pinnedLog', 'mainQueued'])
+    }
+  }
+  type Mounted = Awaited<ReturnType<typeof mountPane>>
+  /** A press whose rejection (a start that throws) is the test's to ignore. */
+  const pressAnyway = (ui: Mounted, key: string) => ui.press({ key }).catch(() => undefined)
+
+  test('a press and a log after a /clear, before restore, do not fork the run', async ($, on) => {
+    const w = world(on)
+    const wipe = wipeable(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    wipe()
+    w.sessionId = 'S2' // a /clear changes the session id; the run keeps the first
+    await pressAnyway(ui, 'agent:agent1')
+    await step($) // restores from state.json
+    expect(row(w, 'agent1')).toBeDefined()
+    expect((JSON.parse(w.files.get(STATE)!) as { runId: string }).runId).toBe('S1')
+    expect(w.files.get(ACT)).toContain('spawned impl-1')
+    expect(w.files.get(ACT)).toContain('press agent:agent1 (desktop, orchestrator)')
+    expect([...w.files.keys()].some(k => k.includes('/S2/'))).toBe(false)
+    await ui.unmount()
+  })
+
+  test('a line before session.start is not written at the root, and lands in the file after start', async ($, on) => {
+    const w = world(on)
+    await spawn($, { prompt: 'P0', name: 'early' })
+    expect(w.files.has('/activity.log')).toBe(false)
+    await running($, w)
+    const l = lines(w)
+    expect(l.some(x => x.includes('spawned early'))).toBe(true)
+    expect(l.some(x => x.includes('spawned impl-1'))).toBe(true)
+    expect([...w.files.keys()].filter(k => k.endsWith('activity.log'))).toEqual([ACT])
+  })
+
+  test('a Hand over start that throws releases its guard: the next press starts it', async ($, on) => {
+    const w = world(on)
+    const wipe = wipeable(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await step($, 'agent2')
+    await complete($, 'agent1')
+    expect(row(w, 'agent1')!.status).toBe('idle')
+    const ui = await mountPane($, 'desktop')
+    w.sendFails = 'throw'
+    await pressAnyway(ui, 'handover:agent1')
+    w.sendFails = ''
+    // agent1 back to idle, as if the failed start had never happened
+    const saved = JSON.parse(w.files.get(STATE)!) as { agents: AgentRow[] }
+    saved.agents = saved.agents.map(a => (a.id === 'agent1' ? { ...a, status: 'idle', handoverVia: undefined } : a))
+    w.files.set(STATE, JSON.stringify(saved))
+    wipe()
+    await step($)
+    await pressAnyway(ui, 'handover:agent1')
+    const l = lines(w)
+    expect(l.some(x => x.includes('already starting'))).toBe(false)
+    expect(l.some(x => x.includes('HANDOVER sent'))).toBe(true)
+    await ui.unmount()
   })
 })

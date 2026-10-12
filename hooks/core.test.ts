@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
+  ACTIVITY_MAX,
+  activityLine,
   MAX_SAMPLES,
   adoptChildren,
   contextOf,
@@ -288,5 +290,16 @@ describe('adoptChildren', () => {
     ]
     const out = adoptChildren(rows, 'old', 'new')
     expect(out.map(r => r.parentId)).toEqual(['main', 'old', 'new', 'other'])
+  })
+})
+
+describe('activityLine', () => {
+  test('a warn line: UTC time, WARN, newlines folded', () => {
+    expect(activityLine(Date.UTC(2026, 9, 12, 10, 0, 0), 'warn', 'a\nb')).toBe('2026-10-12T10:00:00.000Z WARN a ⏎ b')
+  })
+
+  test('the info level prints info', () => {
+    expect(activityLine(Date.UTC(2026, 9, 12, 10, 0, 0), 'info', 'x\r\ny')).toBe('2026-10-12T10:00:00.000Z info x ⏎ y')
+    expect(ACTIVITY_MAX).toBe(2000)
   })
 })
