@@ -1,6 +1,6 @@
 # Handover fixes: respawn under auto mode, loud respawn failure, remap to the replacement, persisted activity
 
-Date: 2026-10-12 · Branch: `handover-fixes` · Mod version now: 0.3.6 → **0.3.7** (Task 5) · Found live: desktop app, auto mode, engine 2.1.295
+Date: 2026-10-12 · Branch: `handover-fixes` · Mod version now: 0.3.6 → **0.3.7** (Task 6) · Found live: desktop app, auto mode, engine 2.1.295
 
 ## Goal
 
@@ -81,7 +81,7 @@ A follow-up could skip unchanged transcript writes to cut redraws. It is not in 
 
 ## Order
 
-**Task 1 → Task 2 → Task 3 → Task 4 → Task 5**, serially: every task touches R and RT.
+**Task 1 → Task 2 → Task 3 → Task 4 → Task 5 → Task 6**, serially: every task touches R and RT. (Task 1 is committed as `bc2b080`.)
 - Task 2 builds on Task 1's `spawnOwn`, and on its world `spawnChecks`/`spawnDeny`.
 - Task 3 builds on Task 1's `callOwn`/`ownCalls` for TaskStop, and on Task 2's `respawn-failed` status: the redirect skips it.
 - Task 4 is independent in logic, but it edits `log`, `startHandover` and `ui.press` in R, so it comes after.
@@ -92,7 +92,8 @@ A follow-up could skip unchanged transcript writes to cut redraws. It is not in 
 | 2 | `types/index.d.ts`, `hooks/core.ts`, `hooks/core.test.ts`, `hooks/view.ts`, `hooks/view.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `README.md`, `skills/orchestrated-run/SKILL.md` |
 | 3 | `hooks/core.ts`, `hooks/core.test.ts`, `hooks/view.ts`, `hooks/view.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `README.md`, `skills/orchestrated-run/SKILL.md` |
 | 4 | `hooks/core.ts`, `hooks/core.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `README.md` |
-| 5 | `.claude-plugin/plugin.json` (0.3.6 → 0.3.7), after 1-4 are green |
+| 5 | `hooks/view.ts`, `hooks/view.test.ts`, `hooks/register.tsx`, `hooks/register.test.ts`, `README.md` |
+| 6 | `.claude-plugin/plugin.json` (0.3.6 → 0.3.7), after 1-5 are green |
 
 ---
 
@@ -615,9 +616,121 @@ if (e.tool === 'TaskStop') {
 
 ---
 
-### Task 5: version (content, exempt)
+### Task 5: terminal pane: full text expands in flow, no hover cards (view.ts, register.tsx)
 
-`.claude-plugin/plugin.json` `version` goes from `0.3.6` to `0.3.7`, after Tasks 1-4 are green.
+**Problem (R as of `bc2b080`; line numbers move with Tasks 2-4).**
+
+The transcript's full-text card:
+- **Where it is.** R:1911-1938. It is an absolute Box with `top={1}`, `left={-1}`, `width={cols}`, and `hover={{ display: 'flex' }}` unless pinned.
+- **It blocks clicks.** It opens downward over the transcript rows beneath the hovered line. Because the card is part of the hovered area, it stays open while the pointer moves onto those rows, so their `tool:` Buttons can't be clicked.
+- **Its height comes from the wrong number.** Its line cap `fit = room` (R:1915) is the *activity* line count (R:1942). That is not the space below the line. The card is also `lines + 2` tall (its border), and the rest of the transcript box, the axis line and the `Activity` header sit between it and the activity. So it runs past the pane's bottom and overprints the axis and the header (the `03:0200:29code` and `Activitylf:` residue).
+
+The activity card has the same faults:
+- **Where it is.** R:2040-2065. It opens upward with `top={-(wrapped.length + 2)}`.
+- **It isn't capped at all.** A long line, such as Task 3's redirect line or Task 2's failure line, draws above the pane's top.
+- **It also blocks clicks.** It covers the lines and tree rows above it while hovered.
+
+**Decision: no hover cards on the terminal.**
+- A press on a cut line toggles an **in-flow** expansion directly beneath it, as the desktop pane does (R:1662-1675, R:1753-1767). This applies to both transcript text items and activity lines.
+- One expansion at a time, through the existing `pinnedAtom`. The same press keys stay: `step-<agentId>-…` and `log-…`.
+- The expansion is a bordered `Box key="full:<id>"` in flow, never `position="absolute"`. It pushes the rows beneath it down, so it can never cover them.
+- Its lines are capped from the pane's real row budget, and the activity gives up exactly the rows the expansion takes. So nothing draws outside the pane.
+- Rejected: a card placed where it can't overlap the rows below. A terminal pane has no free space beside or above the line that is reliably large enough. Any absolute card still covers some rows, and it needs geometry the render doesn't have (the hovered line's own row).
+
+**Pure helpers (V; R can't be avoided: the drawing lives there):**
+```ts
+/** The terminal pane's rows left for an open expansion and the activity: viewport rows less the agent rows, the open transcript box and the frame (header, axis line, `Activity`, slack). */
+export const terminalBase = (o: { rows: number; agents: number; peekRows: number; buttonRow: boolean }): number =>
+  o.rows - o.agents - 8 - (o.buttonRow ? 1 : 0) - o.peekRows
+/** The most text lines an expansion may show: it and its border leave the activity at least 3 lines. */
+export const expandCap = (base: number): number => Math.max(1, base - 3 - 2)
+/** At most `max` lines; when cut, the last kept line is `…`. */
+export const capLines = (lines: readonly string[], max: number): string[] =>
+  lines.length <= max ? [...lines] : [...lines.slice(0, Math.max(0, max - 1)), '…']
+```
+- In R, `room` is today's formula (R:1942). Keep it identical when nothing is expanded, so the RT:1450-1470 `crowded` tests stay green.
+
+**Wiring (R, terminal branch only; the desktop is untouched):**
+1. `const base = terminalBase({ rows: e.viewport?.rows ?? 30, agents: ordered.length, peekRows, buttonRow: shown })`. Compute it before `item` is defined: move the `room` line above `item`, since `room` is read inside `item` today.
+2. **Transcript text item** with `full`, replacing R:1911-1938:
+   ```tsx
+   const inner = Math.max(10, cols - 8) // transcript box border (2) + expansion border (2) + its padding spaces (2) + slack
+   const lines = capLines(wrapFill(it.full, inner), expandCap(base))
+   return (
+     <Box key={it.id} flexDirection="column">
+       <Button key={pin} plain onPress={() => togglePinned($, pin)}>{time}{who}<Text>{it.short}</Text></Button>
+       {pinned === pin && (
+         <Box key={`full:${pin}`} borderStyle="round" flexDirection="column" width={cols - 2}>
+           {lines.map((w, j) => <Text key={`w${j}`} wrap="truncate">{` ${w}`}</Text>)}
+         </Box>
+       )}
+     </Box>
+   )
+   ```
+3. **Activity line**, replacing R:2045-2065: the same shape. Use `key={\`l${i}\`}` on the column Box, the `log-…` Button, and `full:<logId>` with `width={cols}`, `inner = Math.max(10, cols - 6)`, and `color` on its Texts.
+4. **The expansion's rows come off the activity:**
+   - `expRows` is the pinned expansion's `lines.length + 2`, when the pinned id is a visible transcript text item with `full`, or an entry among `entries.slice(-Math.max(3, base))` that is cut (`text.length > cols - 6`). Otherwise it is 0.
+   - Compute it before drawing, from the same `transcriptView` items and entries.
+   - Then `room = Math.max(3, base - expRows)`.
+   - If the pinned activity entry falls outside `entries.slice(-room)` once `room` shrinks, it is not drawn. Its `expRows` still counts, which keeps the arithmetic one-pass, and the pane only shows fewer lines.
+5. Remove `position="absolute"` and `hover` from the terminal branch entirely. Afterwards, `grep -n 'position="absolute"\|hover=' hooks/register.tsx` returns nothing.
+6. Update the comments at R:1879, R:1912-1913 and R:2040-2042 to say "a press shows the full text beneath it, in flow".
+
+**Failing tests first.**
+- VT, `describe('terminal budget')`:
+  1. `terminalBase({ rows: 30, agents: 2, peekRows: 5, buttonRow: true })` is `14`.
+  2. `expandCap(14)` is `9`; `expandCap(4)` is `1`.
+  3. `capLines(['a','b'], 3)` is `['a','b']`; `capLines(['a','b','c','d'], 3)` is `['a','b','…']`; `capLines(['a','b'], 1)` is `['…']`.
+- RT. These are rewrites of three existing tests, and the plan names them.
+  - **RT:644** `a truncated activity line shows its full text in a card on hover, pinned by a click` → `terminal: a truncated activity line expands in flow beneath it on a press; no card covers other lines`. Same setup (cols 40, the long agent name). Then:
+    - no drawn node has `props.position === 'absolute'`, and none has a `hover` key;
+    - `full:<line.key>` is absent;
+    - press the line: `full:<line.key>` exists, is the next sibling of the line's Button inside the same column Box, and its text contains `will-not-fit`;
+    - the number of drawn activity lines (Texts and Buttons after the `Activity` Text) dropped by `full`'s line count plus 2, but not below 3;
+    - press again: `full:` is gone, and the count is restored.
+  - **RT:1731** `terminal: a long text is cut, and its card shows on hover, pinned by a press` → `terminal: a long transcript text expands in flow on a press, and no card covers the rows beneath`, with `longStub`, cols 80:
+    - before the press, no absolute Box and no `hover`;
+    - press `button.key`: `full:<button.key>` exists, holds `END`, and is not absolute;
+    - press again: it is gone.
+  - **RT:1751** `terminal: a long text card opens downward inside the border, its lines capped to the room` → `terminal: an expansion never outgrows the pane` (HUGE text, cols 40, default 30 rows):
+    - press it;
+    - `full:`'s Text lines number at most `expandCap(terminalBase({ rows: 30, agents: 2, peekRows, buttonRow: true }))`, where `peekRows` is the transcript box's item count + 2;
+    - the last line is `…`, and `END` is absent;
+    - the whole drawn pane's line count (header + agent rows + transcript box with its expansion + axis + `Activity` + activity lines) is at most 30.
+  - New: `terminal: with a text expanded, the tool call beneath it still presses to its detail`:
+    - stub `session.messages` with `[brief, { role: 'assistant', text: long, toolUses: [] }, <a Bash tool use and its result>]`, the shape the `tool detail` suite (RT:1774) uses;
+    - open agent1's transcript and press the text: `full:` is drawn;
+    - press `tool:agent1:<id>`: `w.opened` contains `orchestrator-tool`, and `full:` is still drawn.
+  - New: `desktop is unchanged`. The existing desktop tests (RT:1738, RT:925) stay green unchanged; no new test is needed.
+- **Watch them fail first:** today the tree holds absolute Boxes with `hover`, and no `full:` key on the terminal.
+
+**Docs (README, terminal bullets):**
+- README:43:
+  > click a subagent's name to show its transcript in a box beneath it: its last six entries, each with its time. A long entry ends in `…`; a click shows its full text beneath it, pushing the rest down (as many lines as the pane has room for), and a second click hides it. Click the name again to close the box. The box takes its rows from the activity log
+- README:46:
+  > an activity log; a line too long for the pane ends in `…`, and a click shows its full text beneath it (a second click hides it); the log gives up the rows it takes
+
+**Acceptance:**
+- All tests pass, and the `crowded` tests are unchanged.
+- No `position="absolute"` or `hover=` remains in R.
+- No new state key.
+- Gates green.
+- Manual check M5.
+
+#### Decisions taken
+
+| question | choice | rejected |
+| --- | --- | --- |
+| Hover card or in-flow | an in-flow expansion on a press, for both transcript and activity, as on the desktop | a card placed so it can't overlap (no reliable free space; needs the line's row, which the render lacks) |
+| Row budget | one pure budget, `terminalBase`; the expansion is capped so the activity keeps 3 lines, and the activity gives up exactly its rows | capping by the activity count (today's bug) |
+| Activity card too | yes, same treatment: today it's uncapped upward and covers the tree | leaving it as is |
+| view.ts only? | no: the helpers are in V, the drawing in R | |
+
+---
+
+### Task 6: version (content, exempt)
+
+`.claude-plugin/plugin.json` `version` goes from `0.3.6` to `0.3.7`, after Tasks 1-5 are green.
 
 ## Deviations and open risks
 
@@ -640,6 +753,11 @@ if (e.tool === 'TaskStop') {
   2. The new orchestrator receives it, and the grandchild's tool result carries the redirect notice.
   3. The log says `… stopped` or `not stopped (…)`. Record which.
   4. The old row's children are drawn under the replacement.
+- **M5 (Task 5)**, terminal, 80 and 40 columns:
+  1. Open a transcript with a long `» <teammate-message …>` brief and tool calls beneath it.
+  2. Click the brief: its full text shows beneath it, and the tool calls move down. Click one: its detail opens.
+  3. No characters show outside the pane's border.
+  4. Click a long activity line: its text expands in place, and the tree is never covered.
 - **M4 (Task 4)**:
   1. On the desktop, open a running agent's transcript and press `Hand over` a few times while it works.
   2. In `.orchestrator/<run>/activity.log`, each press should have a `press handover:<id> (desktop, orchestrator)` line.
