@@ -3056,9 +3056,9 @@ describe('background shells: reconciled at turn ends', () => {
     } as never)
   const exits = (w: World, id = 'agent2') => row(w, id)!.shells!.map(s => [s.id, s.exit])
   /** The world, with the engine's own answers to both turn-end hooks beneath the plugin. */
-  const stopWorld = (on: On, sub: object = {}, stop: object = {}) => {
-    on('classic.SubagentStop', () => sub)
-    on('classic.Stop', () => stop)
+  const stopWorld = (on: On, sub: object | (() => Promise<object>) = {}, stop: object | (() => Promise<object>) = {}) => {
+    on('classic.SubagentStop', () => (typeof sub === 'function' ? sub() : sub))
+    on('classic.Stop', () => (typeof stop === 'function' ? stop() : stop))
     return world(on)
   }
 
@@ -3127,6 +3127,7 @@ describe('background shells: reconciled at turn ends', () => {
     const writes = w.writes.length
     await subagentStop($, 'agent2')
     await $.classic.Stop({ stop_hook_active: false } as never)
+    // a background_tasks that isn't a list is ignored too
     await subagentStop($, 'agent2', 'junk' as never)
     expect(exits(w)).toEqual([['b1', undefined]])
     expect(w.writes.length).toBe(writes)
@@ -3153,6 +3154,30 @@ describe('background shells: reconciled at turn ends', () => {
     await bgBash($, w, 'agent2', 'b3')
     w.fsFails = STATE
     expect(await subagentStop($, 'agent2', [])).toEqual({ block: 'keep going' })
+  })
+
+  test('a shell tracked while SubagentStop runs is not ended by its background_tasks', opts, async ($, on) => {
+    // The list was taken before the hook ran: a shell backgrounded meanwhile is missing from it, not gone.
+    let w: World
+    w = stopWorld(on, async () => {
+      await bgBash($, w, 'agent2', 'b9')
+      return {}
+    })
+    await family($, w)
+    await subagentStop($, 'agent2', [])
+    expect(exits(w)).toEqual([['b9', undefined]])
+  })
+
+  test('a shell tracked while Stop runs is not ended by its background_tasks', opts, async ($, on) => {
+    let w: World
+    w = stopWorld(on, {}, async () => {
+      await bgBash($, w, undefined, 'm9')
+      return {}
+    })
+    await family($, w)
+    await step($)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w, 'main')).toEqual([['m9', undefined]])
   })
 })
 

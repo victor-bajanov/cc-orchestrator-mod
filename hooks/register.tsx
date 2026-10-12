@@ -1116,10 +1116,12 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
 /**
  * Ends every tracked open shell a turn end's `background_tasks` no longer lists (the engine drops a finished one):
  * with the code its file holds, else `unknown`. It catches what polling missed. A missing list does nothing.
+ * `rows` are those read before the hook's `next`: a shell tracked while it ran is missing from the list, not gone.
  */
-async function reconcileShells($: $, tasks: unknown) {
+async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] | undefined) {
+  if (!rows) return
   try {
-    for (const { shell } of goneShells(await read($, agentsAtom), tasks)) {
+    for (const { shell } of goneShells(rows, tasks)) {
       await shellEnded($, shell.id, (await readExit($, shell.outputPath)) ?? 'unknown')
     }
   } catch (err) {
@@ -1899,20 +1901,33 @@ export const register: Register = (on, options) => {
   on('tool.check', { tool: 'TaskStop' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
 
   // A turn end lists the session's background work still running: a tracked shell missing from it has ended.
-  // Bookkeeping after `next`, never a send, and it never changes the answer.
+  // Bookkeeping after `next`, never a send, and it never changes the answer. The rows are read before `next`,
+  // as the list was taken: a shell tracked while the hooks beneath ran is not in it, yet still running.
   on('classic.SubagentStop', async ($, e, next) => {
+    let before: AgentRow[] | undefined
+    try {
+      before = await read($, agentsAtom)
+    } catch {
+      // nothing to reconcile against
+    }
     const res = await next(e)
     try {
-      await reconcileShells($, e.background_tasks)
+      await reconcileShells($, e.background_tasks, before)
     } catch {
       // see above
     }
     return res
   }).catch(($, e, next) => next(e))
   on('classic.Stop', async ($, e, next) => {
+    let before: AgentRow[] | undefined
+    try {
+      before = await read($, agentsAtom)
+    } catch {
+      // nothing to reconcile against
+    }
     const res = await next(e)
     try {
-      await reconcileShells($, e.background_tasks)
+      await reconcileShells($, e.background_tasks, before)
     } catch {
       // see above
     }
