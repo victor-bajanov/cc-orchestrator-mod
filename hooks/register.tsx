@@ -1131,6 +1131,27 @@ async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] |
   }
 }
 
+/**
+ * The hook on both turn ends (`classic.Stop`, `classic.SubagentStop`): bookkeeping after `next`, never a send, and it
+ * never changes the answer. The rows are read before `next`, as the list was taken: a shell tracked while the hooks
+ * beneath ran is not in it, yet still running.
+ */
+async function reconcileAtStop<E extends { background_tasks?: unknown }, R>($: $, e: E, next: (e: E) => Promise<R>) {
+  let before: AgentRow[] | undefined
+  try {
+    before = await read($, agentsAtom)
+  } catch {
+    // nothing to reconcile against
+  }
+  const res = await next(e)
+  try {
+    await reconcileShells($, e.background_tasks, before)
+  } catch {
+    // see above
+  }
+  return res
+}
+
 // ---- delivery from timers ---------------------------------------------
 //
 // A run woken by `$.session.send` (or started by `$.agent.spawn`) from a `$.clock` callback runs
@@ -1966,38 +1987,8 @@ export const register: Register = (on, options) => {
   on('tool.check', { tool: 'TaskStop' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
 
   // A turn end lists the session's background work still running: a tracked shell missing from it has ended.
-  // Bookkeeping after `next`, never a send, and it never changes the answer. The rows are read before `next`,
-  // as the list was taken: a shell tracked while the hooks beneath ran is not in it, yet still running.
-  on('classic.SubagentStop', async ($, e, next) => {
-    let before: AgentRow[] | undefined
-    try {
-      before = await read($, agentsAtom)
-    } catch {
-      // nothing to reconcile against
-    }
-    const res = await next(e)
-    try {
-      await reconcileShells($, e.background_tasks, before)
-    } catch {
-      // see above
-    }
-    return res
-  }).catch(($, e, next) => next(e))
-  on('classic.Stop', async ($, e, next) => {
-    let before: AgentRow[] | undefined
-    try {
-      before = await read($, agentsAtom)
-    } catch {
-      // nothing to reconcile against
-    }
-    const res = await next(e)
-    try {
-      await reconcileShells($, e.background_tasks, before)
-    } catch {
-      // see above
-    }
-    return res
-  }).catch(($, e, next) => next(e))
+  on('classic.SubagentStop', reconcileAtStop).catch(($, e, next) => next(e))
+  on('classic.Stop', reconcileAtStop).catch(($, e, next) => next(e))
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.
   on('turn.start', ($, e, next) => {
