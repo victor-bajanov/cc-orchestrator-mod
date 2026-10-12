@@ -5292,6 +5292,21 @@ describe('background shells: tracking', () => {
     ])
   })
 
+  test('a tail that fails once is retried on the next poll', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    w.files.set(out('b1'), 'x'.repeat(4 * 1024 * 1024 + 10) + '\n[exited with code 0]\n')
+    w.tailFails.add(out('b1'))
+    await poll(w)
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBeUndefined()
+    w.tailFails.clear()
+    // The file has not grown: the failed tail is retried anyway.
+    await poll(w)
+    expect(w.tails).toEqual([out('b1'), out('b1')])
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(0)
+  })
+
   test('a failed read is retried on the next poll', async ($, on) => {
     const w = world(on)
     await family($, w)

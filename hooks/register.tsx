@@ -1400,13 +1400,16 @@ const shellSizes = new Map<string, number>()
 /** A poll in flight: the next tick skips rather than overlap it. */
 let shellTicking = false
 
-/** The exit marker in a file's last 256 bytes, through `tail`: for a file too big to read; none when tail fails. */
-async function tailExit($: $, path: string): Promise<number | 'killed' | undefined> {
+/**
+ * The exit marker in a file's last 256 bytes, through `tail`: for a file too big to read. Undefined for no marker
+ * yet; null when tail failed (it rejected, or exited non-zero), so the poll tries it again.
+ */
+async function tailExit($: $, path: string): Promise<number | 'killed' | undefined | null> {
   try {
     const res = await $.process.run(['tail', '-c', '256', path], { timeoutMs: 5000 })
-    return res.exitCode === 0 ? shellExit(res.stdout) : undefined
+    return res.exitCode === 0 ? shellExit(res.stdout) : null
   } catch {
-    return undefined
+    return null
   }
 }
 
@@ -1414,7 +1417,7 @@ async function tailExit($: $, path: string): Promise<number | 'killed' | undefin
 async function readExit($: $, path: string): Promise<number | 'killed' | undefined> {
   if (!path) return undefined
   try {
-    if ((await $.fs.stat(path)).size > FS_READ_MAX) return await tailExit($, path)
+    if ((await $.fs.stat(path)).size > FS_READ_MAX) return (await tailExit($, path)) ?? undefined
     return shellExit(await $.fs.read(path))
   } catch {
     return undefined
@@ -1491,10 +1494,11 @@ async function shellTick($: $) {
           const size = (await $.fs.stat(shell.outputPath)).size
           // Empty as it was backgrounded: an unseen file counts as 0 bytes.
           if (size === (shellSizes.get(shell.id) ?? 0)) continue
-          // Too big to read: its tail, again only once it grows. A read that rejects goes to the catch with
-          // the size unrecorded: the next tick retries it.
+          // Too big to read: its tail, again only once it grows. A read that rejects (it goes to the catch) or a
+          // tail that fails (null) leaves the size unrecorded: the next tick retries it.
           const exit =
             size > FS_READ_MAX ? await tailExit($, shell.outputPath) : shellExit(await $.fs.read(shell.outputPath))
+          if (exit === null) continue
           shellSizes.set(shell.id, size)
           if (exit !== undefined) await shellEnded($, shell.id, exit)
         } catch {
