@@ -149,6 +149,10 @@ const slug = (s: string) =>
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '')
 
+/** The old agent's children now hang under its replacement (display, waiting, collapse and check-ins follow parentId). */
+export const adoptChildren = (rows: AgentRow[], oldId: string, newId: string): AgentRow[] =>
+  rows.map(r => (r.parentId === oldId && r.id !== newId ? { ...r, parentId: newId } : r))
+
 export const notePathFor = (runDir: string, r: AgentRow, attempt: number): string =>
   `${runDir}/handover/${r.name ? slug(r.name) : 'agent'}-${r.id}-${attempt}.md`
 

@@ -89,6 +89,12 @@ const world = (on: On) => {
     spawnDeny: '' as string,
     /** `ui.notify` refuses with this reason while set ('' none). */
     notifyDeny: '' as string,
+    /** Each agent a TaskStop stopped, in order. */
+    stops: [] as string[],
+    /** The verdict of each TaskStop check (auto mode), in order. */
+    stopChecks: [] as string[],
+    /** How TaskStop fails: not at all, by throwing, never answering ('hang'), or refused with this reason. */
+    stopFails: '' as '' | 'throw' | 'hang' | string,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -238,6 +244,19 @@ const world = (on: On) => {
     return { text: e.answer }
   })
   on('tool.call', async ($, e) => {
+    if (e.tool === 'TaskStop') {
+      const id = String((e as { task_id?: unknown }).task_id)
+      if (w.checkSends) {
+        const verdict = (await w.engine!.tool.check({ tool: 'TaskStop', input: { task_id: id } } as never)).decision
+        w.stopChecks.push(verdict)
+        if (verdict !== 'allow') return { deny: 'The server-side auto mode classifier gave no verdict for TaskStop' } as never
+      }
+      if (w.stopFails === 'throw') throw new Error('stop broke')
+      if (w.stopFails === 'hang') return new Promise(() => {}) as never
+      if (w.stopFails) return { deny: w.stopFails } as never
+      w.stops.push(id)
+      return { result: { message: 'stopped', task_id: id, task_type: 'local_agent' } } as never
+    }
     if (w.holdNext) await w.holdNext
     return (w.toolAnswer?.(e as never) ?? { result: 'ok' }) as never
   })
@@ -3762,6 +3781,217 @@ describe('a respawn that fails', () => {
     expect(w.spawns).toHaveLength(2)
     expect(w.toasts.some(t => t.includes('no replacement started'))).toBe(false)
     expect(w.prompts.some(p => p.includes('no replacement started'))).toBe(false)
+  })
+})
+
+describe('after a handover, the replacement takes over', () => {
+  /** `id` at 460k is sent HANDOVER, writes `note` and ends: the mod respawns it. */
+  const handOver = async ($: Engine, w: World, id: string, note: string) => {
+    w.tokens.set(id, 460_000)
+    await step($, id)
+    await tool($, id)
+    w.files.set(note, 'x')
+    await complete($, id, 'HANDED OVER')
+    await w.clock.settle()
+  }
+  /** impl-1 (agent1, with child impl-2) hands over; agent3, registered impl-1-2, replaces it. */
+  const swap = async ($: Engine, w: World) => {
+    await family($, w)
+    w.agents.push({ id: 'agent3', name: 'impl-1-2' })
+    await handOver($, w, 'agent1', `${RUN_DIR}/handover/impl-1-agent1-1.md`)
+  }
+  /** Records the `to` of each SendMessage that reaches the engine. */
+  const watchSends = (w: World) => {
+    const seen: string[] = []
+    w.toolAnswer = e => {
+      if (e.tool === 'SendMessage') seen.push(String(e.to))
+      return undefined
+    }
+    return seen
+  }
+  const logged = async ($: Engine) => {
+    const ui = await mountPane($, 'desktop')
+    const s = JSON.stringify(await ui.drawn())
+    await ui.unmount()
+    return s
+  }
+
+  test("a child's SendMessage to its replaced parent goes to the replacement, and the child is told", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    const res = (await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'R: green' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1-2'])
+    const ctx = (res.context ?? []).filter(c => c.includes('impl-1 was replaced by impl-1-2'))
+    expect(ctx).toHaveLength(1)
+    expect(await logged($)).toContain('redirected to impl-1-2')
+  })
+
+  test('by id too', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'R: green' })
+    expect(seen).toEqual(['impl-1-2'])
+  })
+
+  test("the redirected report counts as the child's report", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    await call($, 'agent3', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 30 })
+    expect(row(w, 'agent2')!.checkinAt).toBeDefined()
+    watchSends(w)
+    await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'R: green' })
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    expect(row(w, 'agent2')!.report?.ok).toBe(true)
+  })
+
+  test('a replacement that registered the old name is not redirected to', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.agents.push({ id: 'agent3', name: 'impl-1' })
+    await handOver($, w, 'agent1', `${RUN_DIR}/handover/impl-1-agent1-1.md`)
+    await complete($, 'agent3')
+    const seen = watchSends(w)
+    const res = (await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1'])
+    expect((res.context ?? []).some(c => c.includes('was replaced by'))).toBe(false)
+  })
+
+  test('a chain goes to the newest replacement', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    w.agents.push({ id: 'agent4', name: 'impl-1-3' })
+    await step($, 'agent3') // starts small: a replacement that starts at the threshold is never handed over again
+    await handOver($, w, 'agent3', `${RUN_DIR}/handover/impl-1-2-agent3-1.md`)
+    expect(row(w, 'agent3')!.replacedBy).toBe('agent4')
+    const seen = watchSends(w)
+    await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'R' })
+    expect(seen).toEqual(['impl-1-3'])
+  })
+
+  test('left as addressed: a live name, the replacement to its predecessor, a failed respawn', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    const live = (await call($, 'agent3', 'SendMessage', { to: 'impl-2', message: 'x' })) as { context?: string[] }
+    const back = (await call($, 'agent3', 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-2', 'impl-1'])
+    expect(live.context).toBeUndefined()
+    expect(back.context).toBeUndefined()
+  })
+
+  test('left as addressed: a send to an agent whose respawn failed', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.spawnDeny = 'nope'
+    await handOver($, w, 'agent1', `${RUN_DIR}/handover/impl-1-agent1-1.md`)
+    expect(row(w, 'agent1')!.status).toBe('respawn-failed')
+    const seen = watchSends(w)
+    const res = (await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1'])
+    expect(res.context).toBeUndefined()
+  })
+
+  test("main's SendMessage is redirected too", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    const res = (await call($, undefined, 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1-2'])
+    expect((res.context ?? []).some(c => c.includes('impl-1 was replaced by impl-1-2'))).toBe(true)
+  })
+
+  test('the old agent is stopped once its replacement started', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    expect(w.stops).toEqual(['agent1'])
+    expect(await logged($)).toContain('impl-1 (agent1) stopped')
+  })
+
+  test('a failed stop is logged and the swap still completes', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'not running'
+    await swap($, w)
+    const s = await logged($)
+    expect(s).toContain('not stopped (not running)')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+    expect(s).toContain('impl-1 replaced by agent3')
+  })
+
+  test('a stop that throws is logged and the swap still completes', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'throw'
+    await swap($, w)
+    // The test kit hands a throw beneath the plugin's own tool call back as `no implementation`, not the original error.
+    expect(await logged($)).toContain('(agent1) not stopped (')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+  })
+
+  test('a stop that never answers is given up after the drain timeout, and the parent is still told', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'hang'
+    void swap($, w).catch(() => undefined)
+    for (let i = 0; i < 50; i++) await w.clock.advance(1)
+    await w.clock.advance(10_000)
+    await w.clock.settle()
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+    expect(JSON.stringify(w.session.appended())).toContain('Replacement id agent3')
+    const s = await logged($)
+    expect(s).toContain('(agent1) not stopped (')
+    expect(s).toContain('impl-1 replaced by agent3')
+  })
+
+  test('under auto mode the stop is allowed, and only while in flight', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await swap($, w)
+    expect(w.stopChecks).toEqual(['allow'])
+    expect(w.stops).toEqual(['agent1'])
+    expect((await $.tool.check({ tool: 'TaskStop', input: { task_id: 'agent1' } } as never)).decision).toBe('ask')
+    expect((await $.tool.check({ tool: 'TaskStop', input: 42 } as never)).decision).toBe('ask')
+  })
+
+  test("the old agent's children show under the replacement", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+    await complete($, 'agent3')
+    const ui = await mountPane($, 'desktop')
+    const keys = (await ui.findAll({ type: 'Box' })).map(b => b.key ?? '').filter(k => k.startsWith('row:'))
+    expect(keys.indexOf('row:agent2')).toBeGreaterThan(keys.indexOf('row:agent3'))
+    expect(keys.indexOf('row:agent3')).toBeGreaterThanOrEqual(0)
+    expect(((await ui.find({ key: 'row:agent2' }))!.props as Record<string, unknown>).paddingLeft).toBe(2)
+    expect((await ui.find({ key: 'agent:agent3' }))!.text).toContain('waiting')
+    await ui.unmount()
+  })
+
+  test("a parent replaced earlier is the one told of its child's swap", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    w.sent.length = 0
+    await handOver($, w, 'agent2', `${RUN_DIR}/handover/impl-2-agent2-1.md`)
+    expect(row(w, 'agent2')!.replacedBy).toBeDefined()
+    const told = w.sent.filter(m => m.text.includes('handed over'))
+    expect(told.length).toBeGreaterThan(0)
+    expect(told.every(m => m.to.includes('agent3'))).toBe(true)
+  })
+
+  test('a manual replacement after a failed respawn is linked, adopts the children and stops the old agent', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await spawn($, { prompt: 'P3', name: 'impl-3', parentAgentId: 'agent2' })
+    w.spawnDeny = 'nope'
+    const note = `${RUN_DIR}/handover/impl-2-agent2-1.md`
+    await handOver($, w, 'agent2', note)
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    await spawn($, { prompt: w.files.get(`${RUN_DIR}/handover/impl-2-agent2-1.brief.md`)!, name: 'impl-2', parentAgentId: 'agent1' })
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ status: 'replaced', replacedBy: 'agent4' }))
+    expect(row(w, 'agent3')!.parentId).toBe('agent4')
+    await w.clock.settle()
+    expect(w.stops).toContain('agent2')
   })
 })
 

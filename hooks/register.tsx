@@ -6,6 +6,7 @@ import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
   HANDOVER_CLAUSE,
+  adoptChildren,
   briefPathFor,
   contextOf,
   fmtTokens,
@@ -27,6 +28,7 @@ import {
 } from './core'
 import {
   LIVE,
+  addressFor,
   ceilingOf,
   chartWidthPx,
   contextChart,
@@ -45,6 +47,7 @@ import {
   foldGlyph,
   latest,
   namesAgent,
+  redirectTarget,
   resolveAgent,
   seriesColors,
   statusEmoji,
@@ -812,6 +815,47 @@ async function respawnFailed($: $, old: AgentRow, reason: string) {
   }
 }
 
+/** Stops a replaced agent once its replacement has started, so a late message can't wake it to act. Logged, never thrown. */
+async function stopReplaced($: $, old: AgentRow) {
+  try {
+    // Bounded: a stop that never answers holds neither the drain nor the parent's notice past DRAIN_TIMEOUT_MS.
+    let timer: { cancel: () => void } | undefined
+    const late = new Promise<'late'>(resolve => {
+      try {
+        timer = $.clock.after(DRAIN_TIMEOUT_MS, () => resolve('late'))
+      } catch {
+        // no timer: the stop is awaited as it is
+      }
+    })
+    const stop = callOwn($, { tool: 'TaskStop', taskId: old.id }, () => $.tool.call({ tool: 'TaskStop', task_id: old.id }))
+    let res: Awaited<typeof stop> | 'late'
+    try {
+      res = await Promise.race([stop, late])
+    } finally {
+      timer?.cancel()
+    }
+    if (res === 'late') {
+      void stop.catch(() => undefined)
+      await log($, `${label(old)} (${old.id}) not stopped (no answer in ${DRAIN_TIMEOUT_MS / 1000} s)`)
+      return
+    }
+    const bad = res.deny ?? (res.isError ? String(res.text ?? 'error') : undefined)
+    await log($, bad === undefined ? `${label(old)} (${old.id}) stopped` : `${label(old)} (${old.id}) not stopped (${bad})`)
+  } catch (err) {
+    await log($, `${label(old)} (${old.id}) not stopped (${String(err)})`).catch(() => undefined)
+  }
+}
+
+/** Links a respawn's replacement: the old agent's children move under it, and the old agent is stopped. Never throws. */
+async function linkReplacement($: $, old: AgentRow, newId: string) {
+  try {
+    await update($, agentsAtom, l => adoptChildren(l, old.id, newId))
+  } catch (err) {
+    $.ui.log(`orchestrator: children of ${old.id} not moved: ${String(err)}`)
+  }
+  await stopReplaced($, old)
+}
+
 async function respawn($: $, old: AgentRow) {
   const brief = old.brief
   if (!brief || !old.notePath) return respawnFailed($, old, 'no brief recorded')
@@ -861,10 +905,12 @@ async function respawn($: $, old: AgentRow) {
     )
   })
   await log($, `${label(old)} replaced by ${newId}, resuming from ${old.notePath}`)
+  await linkReplacement($, old, newId)
   await noticeRename($, newId, brief.name, info?.name)
   await tellParent(
     $,
-    old.parentId,
+    // A parent that handed over is carried on by its replacement: the notice goes there.
+    latest(await read($, agentsAtom), old.parentId ?? 'main'),
     `[orchestrator mod] Agent ${label(old)} (id ${old.id}) reached ${fmtTokens(old.tokens)} context and handed over; note at ${old.notePath}. ` +
       `Replacement id ${newId}${name ? ` (SendMessage name "${name}")` : ''} continues from the note. ` +
       `No action needed: do not spawn another.${!isTeammate && (old.parentId === 'main' || old.parentId === undefined) ? ' Its final report will be forwarded to you.' : ''} Update your roster.`,
@@ -1356,8 +1402,12 @@ export const register: Register = (on, options) => {
         (e.parentAgentId ?? 'main') === latest(rows, r.parentId ?? 'main'),
     )
     if (gap) {
-      await update($, agentsAtom, l => patch(patch(l, gap.id, { status: 'replaced', replacedBy: id }), id, { replaces: gap.id }))
+      await update($, agentsAtom, l =>
+        adoptChildren(patch(patch(l, gap.id, { status: 'replaced', replacedBy: id }), id, { replaces: gap.id }), gap.id, id),
+      )
       await log($, `${label(gap)}: ${name ?? id} (${id}) takes over from its note`)
+      // Off the spawn's path, as the name lookup below: the Agent result never waits on the stop.
+      void stopReplaced($, gap)
     }
     await persist($)
     // Off the spawn's path: the Agent result and the pane never wait on the engine's list.
@@ -1452,28 +1502,45 @@ export const register: Register = (on, options) => {
         // see above
       }
     }
-    const res = await next(e)
-    if (e.agentId === undefined) return res
+    // A SendMessage naming a replaced agent goes to its newest replacement, and the sender is told the new name.
+    let call = e
+    let redirected: string | undefined
+    if (e.tool === 'SendMessage') {
+      try {
+        const to = (e as { to?: unknown }).to
+        const dest = redirectTarget(await read($, agentsAtom), to, e.agentId)
+        if (dest && typeof to === 'string') {
+          const addr = addressFor(dest, to)
+          call = { ...e, to: addr } as typeof e
+          redirected = `[orchestrator mod] ${to} was replaced by ${addr} (id ${dest.id}); this message went to ${addr}. Use that name from now on.`
+          await log($, `SendMessage to ${to} from ${e.agentId ?? 'main'} redirected to ${addr} (${dest.id}): ${to} was replaced`)
+        }
+      } catch (err) {
+        $.ui.log(`orchestrator: SendMessage not redirected: ${String(err)}`)
+      }
+    }
+    const res = await next(call)
     if (res.deny !== undefined) {
       // A refused call is still an action: a report before it was not the run's last (a refused report is not ok).
-      await noteReport($, e.agentId, e.tool, argsOf(e), res).catch(() => undefined)
+      if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, argsOf(call), res).catch(() => undefined)
       return res
     }
-    let out = res
+    let out = redirected === undefined ? res : { ...res, context: [...(res.context ?? []), redirected] }
+    if (e.agentId === undefined) return out
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
       if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
         await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
         await log($, `${label(r)}: HANDOVER delivered with a tool result`)
         await persist($)
-        out = { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+        out = { ...out, context: [...(out.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
       }
     } catch (err) {
       $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
     }
     try {
       // After the HANDOVER is attached, and it never alters `out`: a report to the parent disarms the check-in.
-      await noteReport($, e.agentId, e.tool, argsOf(e), res)
+      await noteReport($, e.agentId, e.tool, argsOf(call), res)
     } catch (err) {
       $.ui.log(`orchestrator: report not noted: ${String(err)}`)
     }

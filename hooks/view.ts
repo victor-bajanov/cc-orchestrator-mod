@@ -561,6 +561,30 @@ export const latest = (rows: readonly AgentRow[], id: string): string => {
 }
 
 /**
+ * The agent a SendMessage `to` should reach when it names a replaced agent: the newest row `to` names
+ * (by id, name or teammate address, as namesAgent does) that is `replaced` with a `replacedBy`, followed
+ * to its `latest`. Undefined, so the message goes as addressed, when `to` also names a live agent (the
+ * engine routes a name to its live holder), when nothing replaced matches, when the replacement itself
+ * answers to `to`, or when the sender is that replacement.
+ */
+export const redirectTarget = (rows: readonly AgentRow[], to: unknown, sender?: string): AgentRow | undefined => {
+  if (typeof to !== 'string') return undefined
+  if (rows.some(r => LIVE.includes(r.status) && namesAgent(to, r))) return undefined
+  const old = rows
+    .filter(r => r.status === 'replaced' && r.replacedBy !== undefined && namesAgent(to, r))
+    .sort((a, b) => b.startedAt - a.startedAt)[0]
+  if (!old) return undefined
+  const dest = rows.find(r => r.id === latest(rows, old.id))
+  // A replacement registered under the old name already receives it as addressed.
+  if (!dest || dest.id === old.id || dest.id === sender || namesAgent(to, dest)) return undefined
+  return dest
+}
+
+/** How to address `dest` in place of `to`: its teammate address when `to` was one, else its registered name, else its id. */
+export const addressFor = (dest: AgentRow, to: string): string =>
+  to.includes('@') && dest.teammateId ? dest.teammateId : (dest.name ?? dest.id)
+
+/**
  * Whether two reports say the same: equal once whitespace is collapsed, or one holding the
  * other and at least 80% of its length.
  */

@@ -6,6 +6,7 @@ import {
   PEEK_DENIED,
   MAIN_COLOR,
   PALETTE,
+  addressFor,
   ceilingOf,
   canFold,
   cleanBlock,
@@ -29,6 +30,7 @@ import {
   modelName,
   namesAgent,
   paneHeader,
+  redirectTarget,
   resolveAgent,
   runnerFor,
   sameReport,
@@ -1045,5 +1047,43 @@ describe('collapse', () => {
     const base2 = { ...base, now: 900_000, colors: new Map([['x', '#000']]), selected: '' }
     expect(contextChart({ ...base2, rows }).source).toContain(`>${hhmm(600_000)}<`)
     expect(contextChart({ ...base2, rows, t0: 60_000 }).source).toContain(`>${hhmm(60_000)}<`)
+  })
+})
+
+describe('redirectTarget', () => {
+  const r1 = row({ id: 'a1', name: 'probe', status: 'replaced', replacedBy: 'a2', startedAt: 1 })
+  const r2 = row({ id: 'a2', name: 'probe-2', status: 'running', startedAt: 2 })
+  test('a replaced agent named by name, id or a ListAgents row gives its replacement', () => {
+    for (const to of ['probe', 'a1', 'probe [ref]']) expect(redirectTarget([r1, r2], to)).toBe(r2)
+  })
+  test('a chain gives the newest replacement', () => {
+    const a2 = { ...r2, status: 'replaced' as const, replacedBy: 'a3' }
+    const a3 = row({ id: 'a3', name: 'probe-3', status: 'running', startedAt: 3 })
+    expect(redirectTarget([r1, a2, a3], 'probe')).toBe(a3)
+  })
+  test('a name a live agent holds is left as addressed', () => {
+    const live = row({ id: 'b1', name: 'probe', status: 'idle', startedAt: 5 })
+    expect(redirectTarget([r1, r2, live], 'probe')).toBeUndefined()
+  })
+  test('the replacement messaging its predecessor is left as addressed', () => {
+    expect(redirectTarget([r1, r2], 'probe', 'a2')).toBeUndefined()
+  })
+  test('a respawn-failed row, a non-string to and an unknown name are left as addressed', () => {
+    const gap = row({ id: 'a1', name: 'probe', status: 'respawn-failed', startedAt: 1 })
+    expect(redirectTarget([gap], 'probe')).toBeUndefined()
+    expect(redirectTarget([r1, r2], { agentId: 'a1' })).toBeUndefined()
+    expect(redirectTarget([r1, r2], 'nobody')).toBeUndefined()
+  })
+  test('a replacement that holds the same name is no redirect for that name; the old id still is', () => {
+    const old = row({ id: 'a1', name: 'probe', status: 'replaced', replacedBy: 'a2', startedAt: 1 })
+    const dest = row({ id: 'a2', name: 'probe', status: 'done', replaces: 'a1', startedAt: 2 })
+    expect(redirectTarget([old, dest], 'probe')).toBeUndefined()
+    expect(redirectTarget([old, dest], 'probe [x]')).toBeUndefined()
+    expect(redirectTarget([old, dest], 'a1')).toBe(dest)
+  })
+  test('addressFor: the registered name, the teammate address for an address, else the id', () => {
+    expect(addressFor(r2, 'probe')).toBe('probe-2')
+    expect(addressFor({ ...r2, teammateId: 'probe-2@team' }, 'probe@team')).toBe('probe-2@team')
+    expect(addressFor({ ...r2, name: undefined }, 'probe')).toBe('a2')
   })
 })

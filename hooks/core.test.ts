@@ -2,6 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import {
   MAX_SAMPLES,
+  adoptChildren,
   contextOf,
   crossed,
   fmtTokens,
@@ -274,5 +275,18 @@ describe('wrapFill', () => {
   })
   test('hard-breaks a word longer than the width', () => {
     expect(wrapFill('/a/very/long/path ok', 8)).toEqual(['/a/very/', 'long/pat', 'h ok    '])
+  })
+})
+
+describe('adoptChildren', () => {
+  test("moves only the old agent's children and never the replacement itself", () => {
+    const rows = [
+      row({ id: 'old', parentId: 'main' }),
+      row({ id: 'new', parentId: 'old' }),
+      row({ id: 'c1', parentId: 'old' }),
+      row({ id: 'c2', parentId: 'other' }),
+    ]
+    const out = adoptChildren(rows, 'old', 'new')
+    expect(out.map(r => r.parentId)).toEqual(['main', 'old', 'new', 'other'])
   })
 })
