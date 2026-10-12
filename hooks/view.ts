@@ -12,7 +12,7 @@ export const LIMIT_COLOR = '#DC2626'
 /** Statuses the pane draws as live. */
 export const LIVE: readonly AgentStatus[] = ['running', 'idle', 'handing-over']
 
-/** Today's terminal header: live and handed-over subagents, the limits, the main mode and any phase. */
+/** Today's terminal header: live, handed-over and (when any) not-replaced subagents, the limits, the main mode and any phase. */
 export const paneHeader = (
   rows: readonly AgentRow[],
   o: { agentThreshold: number; mainThreshold: number; mainMode: string; phase: MainPhase },
@@ -20,7 +20,8 @@ export const paneHeader = (
   const subs = rows.filter(r => r.id !== 'main')
   const live = subs.filter(r => LIVE.includes(r.status)).length
   const replaced = subs.filter(r => r.status === 'replaced').length
-  return `${live} live · ${replaced} handed over · limits ${fmtTokens(o.agentThreshold)} / main ${fmtTokens(o.mainThreshold)} (${o.mainMode}${o.phase !== 'idle' ? `, ${o.phase}` : ''})`
+  const failed = subs.filter(r => r.status === 'respawn-failed').length
+  return `${live} live · ${replaced} handed over${failed ? ` · ${failed} not replaced` : ''} · limits ${fmtTokens(o.agentThreshold)} / main ${fmtTokens(o.mainThreshold)} (${o.mainMode}${o.phase !== 'idle' ? `, ${o.phase}` : ''})`
 }
 
 /** Whether either pane offers Hand over main: only in ask mode, and not while main is already handing over. */
@@ -45,6 +46,19 @@ export const hhmm = (t: number): string => new Date(t).toISOString().slice(11, 1
 
 /** An activity line cut to `fits` characters, ending in an ellipsis. */
 export const cut = (text: string, fits: number): string => `${text.slice(0, Math.max(1, fits - 1))}…`
+
+/** The terminal pane's rows left for an open expansion and the activity: viewport rows less the agent rows, the open transcript box and the frame (header, axis line, `Activity`, slack). */
+export const terminalBase = (o: { rows: number; agents: number; peekRows: number; buttonRow: boolean }): number =>
+  o.rows - o.agents - 8 - (o.buttonRow ? 1 : 0) - o.peekRows
+/** The most text lines an expansion may show: it and its border leave the activity at least 3 lines; 0 (none shown) when the pane is too small. */
+export const expandCap = (base: number): number => {
+  // Under 2 lines the text would be all cut marker: show none.
+  const c = base - 3 - 2
+  return c < 2 ? 0 : c
+}
+/** At most `max` lines; when cut, the last kept line is `…`. */
+export const capLines = (lines: readonly string[], max: number): string[] =>
+  lines.length <= max ? [...lines] : [...lines.slice(0, Math.max(0, max - 1)), '…']
 
 /** Text safe for one pane line: ANSI escapes and control characters removed. */
 const clean = (s: string): string =>
@@ -127,6 +141,8 @@ export const statusStyle = (status: DisplayStatus): { color: string; dimColor?: 
       return { color: 'suggestion', bold: true }
     case 'replaced':
       return { color: 'inactive', dimColor: true }
+    case 'respawn-failed':
+      return { color: 'error', bold: true }
   }
 }
 
@@ -160,6 +176,8 @@ export const statusEmoji = (status: DisplayStatus, id: string): string => {
       return '📝'
     case 'replaced':
       return '♻️'
+    case 'respawn-failed':
+      return '⚠️'
   }
 }
 
@@ -554,6 +572,32 @@ export const latest = (rows: readonly AgentRow[], id: string): string => {
   }
   return cur
 }
+
+/**
+ * The agent a SendMessage `to` should reach when it names a replaced agent: the newest row `to` names
+ * (by id, name or teammate address, as namesAgent does) that is `replaced` with a `replacedBy`, followed
+ * to its `latest`. Undefined, so the message goes as addressed, when `to` also names a live agent (the
+ * engine routes a name to its live holder), when a newer agent not replaced holds it, when nothing replaced matches, when the replacement itself
+ * answers to `to`, or when the sender is that replacement.
+ */
+export const redirectTarget = (rows: readonly AgentRow[], to: unknown, sender?: string): AgentRow | undefined => {
+  if (typeof to !== 'string') return undefined
+  if (rows.some(r => LIVE.includes(r.status) && namesAgent(to, r))) return undefined
+  const old = rows
+    .filter(r => r.status === 'replaced' && r.replacedBy !== undefined && namesAgent(to, r))
+    .sort((a, b) => b.startedAt - a.startedAt)[0]
+  if (!old) return undefined
+  // A newer agent registered under that name, finished or not, is who the name means now.
+  if (rows.some(r => r.id !== old.id && r.status !== 'replaced' && r.startedAt > old.startedAt && namesAgent(to, r))) return undefined
+  const dest = rows.find(r => r.id === latest(rows, old.id))
+  // A replacement registered under the old name already receives it as addressed.
+  if (!dest || dest.id === old.id || dest.id === sender || namesAgent(to, dest)) return undefined
+  return dest
+}
+
+/** How to address `dest` in place of `to`: its teammate address when `to` was one, else its registered name, else its id. */
+export const addressFor = (dest: AgentRow, to: string): string =>
+  to.includes('@') && dest.teammateId ? dest.teammateId : (dest.name ?? dest.id)
 
 /**
  * Whether two reports say the same: equal once whitespace is collapsed, or one holding the

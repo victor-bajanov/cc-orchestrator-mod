@@ -6,8 +6,10 @@ import {
   PEEK_DENIED,
   MAIN_COLOR,
   PALETTE,
+  addressFor,
   ceilingOf,
   canFold,
+  capLines,
   cleanBlock,
   chartWidthPx,
   contextChart,
@@ -16,6 +18,7 @@ import {
   collapseHidden,
   cut,
   displayStatus,
+  expandCap,
   foldGlyph,
   forwardTarget,
   effortAbbrev,
@@ -29,12 +32,14 @@ import {
   modelName,
   namesAgent,
   paneHeader,
+  redirectTarget,
   resolveAgent,
   runnerFor,
   sameReport,
   seriesColors,
   statusEmoji,
   statusStyle,
+  terminalBase,
   textKey,
   toolBrief,
   transcriptItems,
@@ -91,6 +96,15 @@ describe('paneHeader', () => {
   test('counts live and handed-over subagents, with limits, mode and phase', () => {
     expect(paneHeader(rows, { agentThreshold: 450_000, mainThreshold: 300_000, mainMode: 'ask', phase: 'offered' })).toBe(
       '2 live · 1 handed over · limits 450k / main 300k (ask, offered)',
+    )
+  })
+  test('counts respawn-failed rows as not replaced, before the limits; none adds nothing', () => {
+    const failed = [...rows, row({ id: 'f', status: 'respawn-failed' })]
+    expect(paneHeader(failed, { agentThreshold: 450_000, mainThreshold: 300_000, mainMode: 'ask', phase: 'idle' })).toContain(
+      '· 1 not replaced · limits',
+    )
+    expect(paneHeader(rows, { agentThreshold: 450_000, mainThreshold: 300_000, mainMode: 'ask', phase: 'idle' })).not.toContain(
+      'not replaced',
     )
   })
   test('leaves the phase out when idle', () => {
@@ -437,6 +451,7 @@ describe('statusStyle', () => {
     expect(statusStyle('stalled')).toEqual({ color: 'error', bold: true })
     expect(statusStyle('handing-over')).toEqual({ color: 'suggestion', bold: true })
     expect(statusStyle('replaced')).toEqual({ color: 'inactive', dimColor: true })
+    expect(statusStyle('respawn-failed')).toEqual({ color: 'error', bold: true })
   })
 })
 
@@ -455,6 +470,7 @@ describe('runnerFor and statusEmoji', () => {
     expect(statusEmoji('stalled', 'x')).toBe('🛑')
     expect(statusEmoji('handing-over', 'x')).toBe('📝')
     expect(statusEmoji('replaced', 'x')).toBe('♻️')
+    expect(statusEmoji('respawn-failed', 'x')).toBe('⚠️')
     for (const id of ['a', 'b', 'agent3']) expect(statusEmoji('running', id)).toBe(runnerFor(id))
   })
 })
@@ -996,6 +1012,11 @@ describe('collapse', () => {
     expect(ids(collapseHidden(rows, ['main']))).toEqual(['a', 'e'])
   })
 
+  test('collapsing never hides a respawn-failed descendant', () => {
+    expect(ids(collapseHidden(tree({ d2: { status: 'respawn-failed' } }), ['o']))).toEqual(['d1'])
+    expect(ids(collapseHidden(tree({ d2: { status: 'respawn-failed' } }), ['main']))).toEqual(['d1'])
+  })
+
   test('a stale id or a childless row hides nothing; hiddenCount matches', () => {
     expect(ids(collapseHidden(tree(), ['ghost', 'd1']))).toEqual([])
     const hidden = collapseHidden(tree(), ['o'])
@@ -1029,5 +1050,72 @@ describe('collapse', () => {
     const base2 = { ...base, now: 900_000, colors: new Map([['x', '#000']]), selected: '' }
     expect(contextChart({ ...base2, rows }).source).toContain(`>${hhmm(600_000)}<`)
     expect(contextChart({ ...base2, rows, t0: 60_000 }).source).toContain(`>${hhmm(60_000)}<`)
+  })
+})
+
+describe('redirectTarget', () => {
+  const r1 = row({ id: 'a1', name: 'probe', status: 'replaced', replacedBy: 'a2', startedAt: 1 })
+  const r2 = row({ id: 'a2', name: 'probe-2', status: 'running', startedAt: 2 })
+  test('a replaced agent named by name, id or a ListAgents row gives its replacement', () => {
+    for (const to of ['probe', 'a1', 'probe [ref]']) expect(redirectTarget([r1, r2], to)).toBe(r2)
+  })
+  test('a chain gives the newest replacement', () => {
+    const a2 = { ...r2, status: 'replaced' as const, replacedBy: 'a3' }
+    const a3 = row({ id: 'a3', name: 'probe-3', status: 'running', startedAt: 3 })
+    expect(redirectTarget([r1, a2, a3], 'probe')).toBe(a3)
+  })
+  test('a name a live agent holds is left as addressed', () => {
+    const live = row({ id: 'b1', name: 'probe', status: 'idle', startedAt: 5 })
+    expect(redirectTarget([r1, r2, live], 'probe')).toBeUndefined()
+  })
+  test('the replacement messaging its predecessor is left as addressed', () => {
+    expect(redirectTarget([r1, r2], 'probe', 'a2')).toBeUndefined()
+  })
+  test('a respawn-failed row, a non-string to and an unknown name are left as addressed', () => {
+    const gap = row({ id: 'a1', name: 'probe', status: 'respawn-failed', startedAt: 1 })
+    expect(redirectTarget([gap], 'probe')).toBeUndefined()
+    expect(redirectTarget([r1, r2], { agentId: 'a1' })).toBeUndefined()
+    expect(redirectTarget([r1, r2], 'nobody')).toBeUndefined()
+  })
+  test('a replacement that holds the same name is no redirect for that name; the old id still is', () => {
+    const old = row({ id: 'a1', name: 'probe', status: 'replaced', replacedBy: 'a2', startedAt: 1 })
+    const dest = row({ id: 'a2', name: 'probe', status: 'done', replaces: 'a1', startedAt: 2 })
+    expect(redirectTarget([old, dest], 'probe')).toBeUndefined()
+    expect(redirectTarget([old, dest], 'probe [x]')).toBeUndefined()
+    expect(redirectTarget([old, dest], 'a1')).toBe(dest)
+  })
+  test('a newer agent that took the old name, live or not, is no redirect for that name', () => {
+    const A = row({ id: 'a1', name: 'probe', status: 'replaced', replacedBy: 'a2', startedAt: 1 })
+    const B = row({ id: 'a2', name: 'probe-2', status: 'idle', startedAt: 2 })
+    expect(redirectTarget([A, B], 'probe')).toBe(B)
+    for (const status of ['done', 'respawn-failed', 'stalled'] as const) {
+      const C = row({ id: 'a3', name: 'probe', status, startedAt: 3 })
+      expect(redirectTarget([A, B, C], 'probe')).toBeUndefined()
+    }
+  })
+  test('addressFor: the registered name, the teammate address for an address, else the id', () => {
+    expect(addressFor(r2, 'probe')).toBe('probe-2')
+    expect(addressFor({ ...r2, teammateId: 'probe-2@team' }, 'probe@team')).toBe('probe-2@team')
+    expect(addressFor({ ...r2, name: undefined }, 'probe')).toBe('a2')
+  })
+})
+
+describe('terminal budget', () => {
+  test('terminalBase: viewport rows less agent rows, the frame, the button row and the open transcript box', () => {
+    expect(terminalBase({ rows: 30, agents: 2, peekRows: 5, buttonRow: true })).toBe(14)
+    expect(terminalBase({ rows: 30, agents: 2, peekRows: 5, buttonRow: false })).toBe(15)
+  })
+  test('expandCap leaves the activity at least 3 lines beside the border; a pane too small shows none', () => {
+    expect(expandCap(14)).toBe(9)
+    // One line of text and a cut marker would be all `…`: under 2 lines, none.
+    expect(expandCap(7)).toBe(2)
+    expect(expandCap(6)).toBe(0)
+    expect(expandCap(5)).toBe(0)
+    expect(expandCap(4)).toBe(0)
+  })
+  test('capLines keeps lines that fit and ends a cut list in …', () => {
+    expect(capLines(['a', 'b'], 3)).toEqual(['a', 'b'])
+    expect(capLines(['a', 'b', 'c', 'd'], 3)).toEqual(['a', 'b', '…'])
+    expect(capLines(['a', 'b'], 1)).toEqual(['…'])
   })
 })

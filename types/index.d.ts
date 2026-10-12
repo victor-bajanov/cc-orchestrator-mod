@@ -10,7 +10,8 @@ export type Brief = {
   name?: string
 }
 
-export type AgentStatus = 'running' | 'idle' | 'handing-over' | 'replaced' | 'done' | 'stalled'
+/** `respawn-failed`: handed over with its note written, but no replacement started to carry its work. */
+export type AgentStatus = 'running' | 'idle' | 'handing-over' | 'replaced' | 'done' | 'stalled' | 'respawn-failed'
 
 /** What the pane shows for a row: its status, or `waiting` for an idle row with live descendants. Never stored. */
 export type DisplayStatus = AgentStatus | 'waiting'

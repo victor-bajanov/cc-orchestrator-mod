@@ -2,9 +2,9 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import type { AgentRow } from '../types'
-import { PEEK_TIMEOUT_MS, isOwnOrigin, isOwnSend, liveSelection } from './register'
-import { hhmm } from './view'
-import { nameNotice } from './core'
+import { PEEK_TIMEOUT_MS, isOwnCall, isOwnOrigin, isOwnSend, liveSelection } from './register'
+import { expandCap, hhmm, terminalBase } from './view'
+import { ACTIVITY_MAX, HANDOVER_CLAUSE, nameNotice, replacementPrompt } from './core'
 import { PEEK_DENIED as DENIED, runnerFor } from './view'
 
 const RUN_DIR = '/repo/.orchestrator/S1'
@@ -81,12 +81,34 @@ const world = (on: On) => {
     duringSend: undefined as
       | ((check: (input: { to: unknown; message: unknown }) => Promise<string>, e: { to: string; text: string }) => Promise<unknown>)
       | undefined,
+    /** The verdict of each mod spawn's Agent check (auto mode), in order. */
+    spawnChecks: [] as string[],
+    /** Runs inside the mod's spawn, after its check: `check` asks tool.check about any Agent input. */
+    duringSpawn: undefined as ((check: (input: Record<string, unknown>) => Promise<string>) => Promise<unknown>) | undefined,
+    /** The next spawn is refused with this reason ('' none); 'throw' makes it throw. Refused spawns are not recorded. */
+    spawnDeny: '' as string,
+    /** `ui.notify` refuses with this reason while set ('' none). */
+    notifyDeny: '' as string,
+    /** Each agent a TaskStop stopped, in order. */
+    stops: [] as string[],
+    /** The verdict of each TaskStop check (auto mode), in order. */
+    stopChecks: [] as string[],
+    /** While set, a write of activity.log never answers. */
+    activityHang: false,
+    /** The next mod spawn waits on this before it is recorded (and numbered), once. */
+    spawnHoldNext: undefined as Promise<void> | undefined,
+    /** How TaskStop fails: not at all, by throwing, never answering ('hang'), or refused with this reason. */
+    stopFails: '' as '' | 'throw' | 'hang' | string,
+    /** What `session.id` answers: a /clear changes it. */
+    sessionId: 'S1',
+    /** `fs.write` to this path throws ('' none). */
+    fsFails: '' as string,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
   const session = mock.session(on)
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: 'S1' }))
+  on('session.id', () => ({ value: w.sessionId }))
   on('session.root', () => ({ value: '/repo' }))
   on('agent.list', async () => {
     if (w.holdList) await w.holdList
@@ -127,7 +149,36 @@ const world = (on: On) => {
     if (e.command === 'clear') await w.duringClear?.()
     return { text: '' }
   })
-  on('agent.spawn', ($, e) => {
+  on('agent.spawn', async ($, e) => {
+    // Auto mode judges a spawn with no Agent tool call behind it (the mod's own; the model's carry a tool_use_id).
+    if (w.checkSends && !e.tool_use_id) {
+      const check = async (input: Record<string, unknown>) =>
+        (await w.engine!.tool.check({ tool: 'Agent', input } as never)).decision
+      const verdict = await check({
+        prompt: e.prompt,
+        description: e.description,
+        subagent_type: e.subagentType,
+        name: e.name,
+        model: e.model,
+      })
+      w.spawnChecks.push(verdict)
+      await w.duringSpawn?.(check)
+      if (verdict !== 'allow') return { deny: 'The server-side auto mode classifier gave no verdict for Agent' } as never
+    }
+    if (w.spawnDeny === 'throw') {
+      w.spawnDeny = ''
+      throw new Error('spawn broke')
+    }
+    if (w.spawnDeny) {
+      const deny = w.spawnDeny
+      w.spawnDeny = ''
+      return { deny } as never
+    }
+    if (w.spawnHoldNext && !e.tool_use_id) {
+      const hold = w.spawnHoldNext
+      w.spawnHoldNext = undefined
+      await hold
+    }
     const raw = e as typeof e & { subagent_type?: string }
     w.spawns.push({ ...e, subagentType: e.subagentType ?? raw.subagent_type ?? '' })
     if (w.hangSpawn) {
@@ -140,6 +191,8 @@ const world = (on: On) => {
     return { model: 'opus', agentId, ...(teammateId && { teammateId }) }
   })
   on('fs.write', ($, e) => {
+    if (w.activityHang && e.path.endsWith('activity.log')) return new Promise(() => {}) as never
+    if (w.fsFails && e.path === w.fsFails) throw new Error('disk full')
     if (e.path === STATE) w.writes.push(e.text)
     w.files.set(e.path, e.text)
     return { value: undefined }
@@ -169,7 +222,7 @@ const world = (on: On) => {
     w.status = e.text
     return { value: undefined }
   })
-  on('ui.notify', () => ({ value: { isSent: true, channel: 'terminal_bell' } }))
+  on('ui.notify', () => (w.notifyDeny ? ({ deny: w.notifyDeny } as never) : { value: { isSent: true, channel: 'terminal_bell' } }))
   on('ui.close', ($, e) => {
     w.closed.push(e.id)
     return { value: undefined }
@@ -206,6 +259,19 @@ const world = (on: On) => {
     return { text: e.answer }
   })
   on('tool.call', async ($, e) => {
+    if (e.tool === 'TaskStop') {
+      const id = String((e as { task_id?: unknown }).task_id)
+      if (w.checkSends) {
+        const verdict = (await w.engine!.tool.check({ tool: 'TaskStop', input: { task_id: id } } as never)).decision
+        w.stopChecks.push(verdict)
+        if (verdict !== 'allow') return { deny: 'The server-side auto mode classifier gave no verdict for TaskStop' } as never
+      }
+      if (w.stopFails === 'throw') throw new Error('stop broke')
+      if (w.stopFails === 'hang') return new Promise(() => {}) as never
+      if (w.stopFails) return { deny: w.stopFails } as never
+      w.stops.push(id)
+      return { result: { message: 'stopped', task_id: id, task_type: 'local_agent' } } as never
+    }
     if (w.holdNext) await w.holdNext
     return (w.toolAnswer?.(e as never) ?? { result: 'ok' }) as never
   })
@@ -611,42 +677,70 @@ describe('pane', () => {
     }
   })
 
-  test('a truncated activity line shows its full text in a card on hover, pinned by a click', async ($, on) => {
-    const w = world(on)
+  test('terminal: a truncated activity line expands in flow beneath it on a press; no card covers other lines', async ($, on) => {
+    world(on)
     await start($)
     const name = 'a-rather-long-agent-name-that-will-not-fit-in-a-narrow-pane'
-    await spawn($, { prompt: 'P', name })
+    // Eight agent rows on 25 rows: base = 25 - 8 - 8 - 1 = 8 rows, as many as the eight spawn lines.
+    // The names differ in length: lines logged at one time are told apart by their length.
+    for (let i = 1; i <= 8; i++) await spawn($, { prompt: 'P', name: `${name}-${'x'.repeat(i)}` })
     const ui = await $.ui.mount({
       plugin: 'orchestrator',
       surface: 'terminal',
       component: 'Pane',
       requestId: 'orchestrator',
       props: { bodyColumns: 40 } as never,
+      viewport: { columns: 40, rows: 25 },
     })
-    const line = (await ui.findAll({ type: 'Button' })).find(b => b.text.includes('spawned'))!
+    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
+    expect(agents).toBe(8)
+    const base = terminalBase({ rows: 25, agents, peekRows: 0, buttonRow: true })
+    const line = (await ui.findAll({ type: 'Button' })).filter(b => b.text.includes('spawned')).at(-1)!
     expect(line).toBeDefined()
     expect(line.text).toContain('…')
     expect(line.text).not.toContain(name)
 
-    type Drawn = { type: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
+    type Drawn = { type: string; key?: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; children?: unknown[] }
     const walk = (n: unknown): Drawn[] =>
       n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
-    const card = async () =>
-      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('spawned'))!
-
-    expect((await card()).props!.display).toBe('none')
-    expect((await card()).hover).toMatchObject({ display: 'flex' })
-    // it overlays other lines: every cell inside the border is painted, so nothing shows through
-    const rowsOf = JSON.stringify((await card()).children).match(/"[^"]*"/g)!.map(t => JSON.parse(t) as string)
-    const painted = rowsOf.filter(t => t.length > 10)
-    expect(painted.length).toBeGreaterThan(1)
-    expect(new Set(painted.map(t => t.length)).size).toBe(1)
-    expect((await card()).props!.paddingX).toBeUndefined()
+    const isActivity = (c: unknown) =>
+      (c as Drawn)?.type === 'Text' && ((c as Drawn).children ?? []).some(t => t === 'Activity')
+    /** The activity lines drawn: the pane's children after the `Activity` header. */
+    const activity = async () => {
+      const pane = walk(await ui.drawn()).find(b => (b.children ?? []).some(isActivity))!
+      const kids = (pane.children ?? []).filter(c => c && typeof c === 'object')
+      return kids.slice(kids.findIndex(isActivity) + 1)
+    }
+    const noCards = async () => {
+      const all = walk(await ui.drawn())
+      expect(all.some(b => b.props?.position === 'absolute')).toBe(false)
+      expect(all.some(b => 'hover' in b || (b.props !== undefined && 'hover' in b.props))).toBe(false)
+    }
+    await noCards()
+    expect(await ui.find({ key: `full:${line.key}` })).toBeUndefined()
+    const before = (await activity()).length
+    expect(before).toBe(base)
 
     await ui.press({ key: line.key! })
-    expect((await card()).props!.display).toBe('flex')
+    await noCards()
+    const full = (await ui.find({ key: `full:${line.key}` }))!
+    expect(full).toBeDefined()
+    // The expansion wraps at its width (read it with the line breaks taken out), capped to the rows the pane has.
+    expect(full.text.replace(/\s+/g, '')).toContain('spawneda-rather-long-agent-name-that-will')
+    const keyOf = (c: unknown) => (c as Drawn)?.props?.key ?? (c as Drawn)?.key
+    const column = walk(await ui.drawn()).find(b => (b.children ?? []).some(c => keyOf(c) === line.key))!
+    expect(column.props?.flexDirection).toBe('column')
+    const at = column.children!.findIndex(c => keyOf(c) === line.key)
+    expect(keyOf(column.children![at + 1])).toBe(`full:${line.key}`)
+    const fullNode = column.children![at + 1] as Drawn
+    const fullLines = (fullNode.children ?? []).filter(c => (c as Drawn)?.type === 'Text').length
+    expect(fullLines).toBe(expandCap(base))
+    expect((await activity()).length).toBe(Math.max(3, before - (fullLines + 2)))
+    expect((await activity()).length).toBeLessThan(before)
+
     await ui.press({ key: line.key! })
-    expect((await card()).props!.display).toBe('none')
+    expect(await ui.find({ key: `full:${line.key}` })).toBeUndefined()
+    expect((await activity()).length).toBe(before)
     await ui.unmount()
   })
 
@@ -1698,7 +1792,26 @@ describe('timestamped transcript', () => {
   const stepButton = async (ui: Awaited<ReturnType<typeof mountPane>>) =>
     (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
 
-  test('terminal: a long text is cut, and its card shows on hover, pinned by a press', async ($, on) => {
+  /** Rows a drawn node takes: a Text or Button one, a column its children's sum, a row its tallest (a wrapping row two), a border two more. */
+  const height = (n: Drawn): number => {
+    if (n.type === 'Text' || n.type === 'Button') return 1
+    const kids = (n.children ?? []).filter(c => c && typeof c === 'object') as Drawn[]
+    const hs = kids.map(height)
+    const inner =
+      n.props?.flexDirection === 'column'
+        ? hs.reduce((a, b) => a + b, 0)
+        : n.props?.flexWrap === 'wrap' && kids.length > 1
+          ? Math.max(0, ...hs) + 1
+          : Math.max(0, ...hs)
+    return inner + (n.props?.borderStyle ? 2 : 0)
+  }
+  const noCards = async (ui: Awaited<ReturnType<typeof mountPane>>) => {
+    const all = walk(await ui.drawn())
+    expect(all.some(b => b.props?.position === 'absolute')).toBe(false)
+    expect(all.some(b => 'hover' in b || (b.props !== undefined && 'hover' in b.props))).toBe(false)
+  }
+
+  test('terminal: a long transcript text expands in flow on a press, and no card covers the rows beneath', async ($, on) => {
     const w = world(on)
     longStub(on)
     await running($, w)
@@ -1707,31 +1820,85 @@ describe('timestamped transcript', () => {
     expect(button).toBeDefined()
     expect(button.text).toContain('…')
     expect(button.text).not.toContain('END')
-    const card = async () =>
-      walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('END'))!
-    expect((await card()).props!.display).toBe('none')
-    expect((await card()).hover).toMatchObject({ display: 'flex' })
+    await noCards(ui)
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
     await ui.press({ key: button.key! })
-    expect((await card()).props!.display).toBe('flex')
+    const full = (await ui.find({ key: `full:${button.key}` }))!
+    expect(full).toBeDefined()
+    expect(full.text).toContain('END')
+    await noCards(ui)
     await ui.press({ key: button.key! })
-    expect((await card()).props!.display).toBe('none')
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
     await ui.unmount()
   })
 
-  test('terminal: a long text card opens downward inside the border, its lines capped to the room', async ($, on) => {
+  test('terminal: an expansion never outgrows the pane', async ($, on) => {
     const w = world(on)
     const HUGE = `${'word '.repeat(390)}END`
     on('session.messages', () => ({ value: [brief, { role: 'assistant', text: HUGE, toolUses: [] }] as never }))
     await running($, w)
     const ui = await open($, w, 'terminal', 40)
-    const card = walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.position === 'absolute' && JSON.stringify(b.children).includes('word'))!
-    expect(card.props!.top as number).toBeGreaterThanOrEqual(0)
-    expect(card.props!.left).toBe(-1)
-    const lines = (card.children as Drawn[]).filter(c => c.type === 'Text')
-    // 30 rows (no viewport given): far fewer than the ~55 lines the text wraps to.
-    expect(lines.length).toBeLessThan(30)
+    const button = await stepButton(ui)
+    await ui.press({ key: button.key! })
+    const drawn = walk(await ui.drawn())
+    const box = drawn.find(b => b.props?.key === 'transcript:agent1')!
+    const peekRows = (box.children ?? []).filter(c => c && typeof c === 'object').length + 2
+    const full = drawn.find(b => b.props?.key === `full:${button.key}`)!
+    expect(full).toBeDefined()
+    const lines = (full.children as Drawn[]).filter(c => c.type === 'Text')
+    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
+    expect(lines.length).toBeLessThanOrEqual(expandCap(terminalBase({ rows: 30, agents, peekRows, buttonRow: true })))
     expect(JSON.stringify(lines[lines.length - 1]!.children)).toContain('…')
-    expect(JSON.stringify(card.children)).not.toContain('END')
+    expect(JSON.stringify(full.children)).not.toContain('END')
+    // The frame's budget reserves 5 rows of slack: the pane draws at most the viewport less those.
+    expect(height(walk(await ui.drawn())[0]!)).toBeLessThanOrEqual(30 - 5)
+    await ui.unmount()
+  })
+
+  test('terminal: a pane too small for an expansion shows none, and stays inside the pane', async ($, on) => {
+    const w = world(on)
+    longStub(on)
+    await running($, w)
+    // agent1's row, the button row and the transcript box (brief and text: 2 items + border) on 18 rows: base 4.
+    const ROWS = 18
+    const ui = await $.ui.mount({
+      plugin: 'orchestrator',
+      surface: 'terminal',
+      component: 'Pane',
+      requestId: 'orchestrator',
+      props: { bodyColumns: 40 } as never,
+      viewport: { columns: 40, rows: ROWS },
+    })
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    const box = walk(await ui.drawn()).find(b => b.props?.key === 'transcript:agent1')!
+    const peekRows = (box.children ?? []).filter(c => c && typeof c === 'object').length + 2
+    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
+    expect(terminalBase({ rows: ROWS, agents, peekRows, buttonRow: true })).toBe(4)
+    const button = (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
+    await ui.press({ key: button.key! })
+    expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
+    expect(height(walk(await ui.drawn())[0]!)).toBeLessThanOrEqual(ROWS - 5)
+    await ui.unmount()
+  })
+
+  test('terminal: with a text expanded, the tool call beneath it still presses to its detail', async ($, on) => {
+    const w = world(on)
+    on('session.messages', () => ({
+      value: [
+        brief,
+        { role: 'assistant', text: LONG, toolUses: [] },
+        { role: 'assistant', text: '', toolUses: [{ tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS' }] },
+      ] as never,
+    }))
+    await running($, w)
+    const ui = await open($, w, 'terminal', 80)
+    const button = await stepButton(ui)
+    await ui.press({ key: button.key! })
+    expect(await ui.find({ key: `full:${button.key}` })).toBeDefined()
+    await ui.press({ key: 'tool:agent1:b' })
+    expect(w.opened).toContain('orchestrator-tool')
+    expect(await ui.find({ key: `full:${button.key}` })).toBeDefined()
     await ui.unmount()
   })
 
@@ -3038,6 +3205,17 @@ describe('delivery from timers: hardening', () => {
       await complete($, undefined)
       await w.clock.settle()
       expect(w.sent.filter(m => m.text === 'HANDOVER queued')).toHaveLength(sends)
+      if (sends === 0 && 'handoverVia' in change) {
+        // A routine skip: recorded in activity.log, not drawn in the pane's activity.
+        const ui = await mountPane($, 'desktop')
+        const strip = (n: unknown): string =>
+          typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as { children?: unknown[] }).children ?? []).map(strip).join('') : ''
+        const drawn = (await ui.findAll({ type: 'Text' })).map(strip).join('\n')
+        expect(drawn).toContain('impl-1')
+        expect(drawn).not.toContain('HANDOVER not sent')
+        await ui.unmount()
+        expect(w.files.get(`${RUN_DIR}/activity.log`)).toContain('HANDOVER not sent')
+      }
     })
   }
 })
@@ -3253,6 +3431,7 @@ describe("auto mode: the mod's own sends", () => {
     w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
     await complete($, 'agent2', 'HANDED OVER')
     await w.clock.settle()
+    expect(w.spawnChecks).toEqual(['allow'])
     expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('agent3') && m.text.includes('handed over'))).toBe(true)
     expect(w.checks.length).toBeGreaterThan(0)
     expect(w.checks.every(c => c === 'allow')).toBe(true)
@@ -3485,6 +3664,544 @@ describe("auto mode: the mod's own sends, review fixes", () => {
     expect(checkins[0]!.text).toBe(checkins[1]!.text)
     expect(late).toEqual(['allow'])
     expect(w.checks).toEqual(['allow', 'allow'])
+  })
+})
+
+describe("auto mode: the mod's own spawn", () => {
+  const NOTE = `${RUN_DIR}/handover/impl-1-agent1-1.md`
+  /** impl-1 at 460k is sent HANDOVER, writes its note and ends: the mod respawns it. */
+  const handOver = async ($: Engine, w: World, beforeEnd?: () => void) => {
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(NOTE, 'x')
+    beforeEnd?.()
+    return complete($, 'agent1', 'HANDED OVER')
+  }
+
+  test('a respawn under auto mode is allowed and spawned', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await handOver($, w)
+    await w.clock.settle()
+    expect(w.spawnChecks).toEqual(['allow'])
+    expect(w.spawns).toHaveLength(2)
+    expect(row(w, 'agent2')!.replaces).toBe('agent1')
+    expect(w.toasts.some(t => t.includes('no replacement started'))).toBe(false)
+  })
+
+  test('the prompt with and without the HANDOVER clause is the mod\'s; anything else is not', () => {
+    const P = 'Do it.\n\n---\nYou replace…'
+    const inFlight = [{ tool: 'Agent' as const, prompt: P }]
+    expect(isOwnCall({ prompt: P }, inFlight)).toBe(true)
+    expect(isOwnCall({ prompt: P + HANDOVER_CLAUSE }, inFlight)).toBe(true)
+    expect(isOwnCall({ prompt: P + ' ' }, inFlight)).toBe(false)
+    expect(isOwnCall({ prompt: 'other' }, inFlight)).toBe(false)
+    expect(isOwnCall({ prompt: 42 }, inFlight)).toBe(false)
+    expect(isOwnCall(null, inFlight)).toBe(false)
+    expect(isOwnCall(42, inFlight)).toBe(false)
+    expect(isOwnCall({ prompt: P }, [])).toBe(false)
+    const stops = [{ tool: 'TaskStop' as const, taskId: 'agent1' }]
+    expect(isOwnCall({ task_id: 'agent1' }, stops)).toBe(true)
+    expect(isOwnCall({ shell_id: 'agent1' }, stops)).toBe(true)
+    expect(isOwnCall({ task_id: 'agent2' }, stops)).toBe(false)
+  })
+
+  test('the same spawn checked after it settled is ask', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await handOver($, w)
+    await w.clock.settle()
+    expect(w.spawns).toHaveLength(2)
+    const after = await $.tool.check({ tool: 'Agent', input: { prompt: w.spawns[1]!.prompt } } as never)
+    expect(after.decision).toBe('ask')
+  })
+
+  test("a different prompt during the mod's spawn is ask; the mod's own is allow", async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    const mine =
+      replacementPrompt({ prompt: 'P', subagentType: 'general-purpose', description: 'implement task', name: 'impl-1' }, NOTE) +
+      HANDOVER_CLAUSE
+    const probes: string[] = []
+    w.duringSpawn = async check => {
+      probes.push(await check({ prompt: 'P' }), await check({ prompt: mine }))
+    }
+    await handOver($, w)
+    await w.clock.settle()
+    expect(probes).toEqual(['ask', 'allow'])
+  })
+
+  test('a spawn that never answers allows nothing past the drain timeout', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    void handOver($, w, () => {
+      w.hangSpawn = true
+    }).catch(() => undefined)
+    // the hanging spawn is recorded once its check has passed: its prompt is the one checked
+    for (let i = 0; i < 100 && w.spawns.length < 2; i++) await w.clock.advance(1)
+    expect(w.spawns).toHaveLength(2)
+    const captured = w.spawns[1]!.prompt
+    expect((await $.tool.check({ tool: 'Agent', input: { prompt: captured } } as never)).decision).toBe('allow')
+    await w.clock.advance(11_000)
+    expect((await $.tool.check({ tool: 'Agent', input: { prompt: captured } } as never)).decision).toBe('ask')
+  })
+
+  test('the Agent check hook never throws', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await start($)
+    expect((await $.tool.check({ tool: 'Agent', input: null } as never)).decision).toBe('ask')
+    expect((await $.tool.check({ tool: 'Agent', input: { prompt: 7 } } as never)).decision).toBe('ask')
+  })
+})
+
+describe('a respawn that fails', () => {
+  const NOTE2 = `${RUN_DIR}/handover/impl-2-agent2-1.md`
+  const BRIEF2 = `${RUN_DIR}/handover/impl-2-agent2-1.brief.md`
+  /** agent2 (impl-2, under agent1) at 460k is sent HANDOVER, writes its note and ends; its respawn then fails. */
+  const failChild = async ($: Engine, w: World, deny = 'nope') => {
+    await family($, w)
+    w.spawnDeny = deny
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(NOTE2, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    await w.clock.settle()
+  }
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+
+  test('a refused respawn marks the gap and tells the parent agent how to respawn', async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    const told = w.sent.filter(m => m.to.includes('agent1') && m.text.includes('no replacement started: nope'))
+    expect(told).toHaveLength(1)
+    for (const s of [NOTE2, 'name "impl-2"', '.brief.md']) expect(told[0]!.text).toContain(s)
+    const brief = w.files.get(BRIEF2)!
+    expect(brief.startsWith('P2')).toBe(true)
+    expect(brief).toContain(NOTE2)
+    expect(w.toasts.some(t => t.includes('no replacement started'))).toBe(true)
+  })
+
+  test("main's child: the failure is submitted to main as a prompt", async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.spawnDeny = 'nope'
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    const told = w.prompts.filter(p => p.includes('no replacement started'))
+    expect(told).toHaveLength(1)
+    expect(told[0]).toContain('agent1')
+    expect(w.sent.some(m => m.text.includes('no replacement started'))).toBe(false)
+  })
+
+  test('a spawn that throws is a failed respawn', async ($, on) => {
+    const w = world(on)
+    await failChild($, w, 'throw')
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    // The test kit hands the mod's spawn hook a throw beneath it as `no implementation`, not the original error.
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('no replacement started: spawn failed: '))).toBe(true)
+  })
+
+  test('an agent with no brief is a failed respawn', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.agents = [{ id: 'agent9', name: 'x' }]
+    w.tokens.set('agent9', 460_000)
+    await step($, 'agent9')
+    await tool($, 'agent9')
+    w.files.set(`${RUN_DIR}/handover/x-agent9-1.md`, 'x')
+    await complete($, 'agent9', 'HANDED OVER')
+    await w.clock.settle()
+    expect(row(w, 'agent9')!.status).toBe('respawn-failed')
+    expect(w.prompts.some(p => p.includes('No brief was recorded'))).toBe(true)
+  })
+
+  test('the gap shows in both panes and the roster', async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    const desk = await mountPane($, 'desktop')
+    const deskText = (await desk.find({ key: 'row:agent2' }))!.text
+    expect(deskText).toContain('⚠️')
+    expect(deskText).toContain('respawn-failed')
+    await desk.unmount()
+    const term = await mountPane($, 'terminal')
+    const termRow = walk(await term.drawn()).find(b => b.type === 'Box' && b.props?.key === 'agent2')!
+    expect(textOf(termRow)).toContain('✗')
+    await term.unmount()
+    const roster = (await $.command.run({ command: 'orch', args: 'roster' } as never)) as { text: string }
+    expect(roster.text).toContain('| respawn-failed |')
+  })
+
+
+  test('a refused notification leaves no unhandled rejection; the gap is still marked and told', async ($, on) => {
+    const w = world(on)
+    w.notifyDeny = 'no'
+    // The sandbox has no `process`: the test kit itself fails the file on "a rejection nothing handled".
+    await failChild($, w)
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('no replacement started'))).toBe(true)
+  })
+
+  test('a refused stall notification leaves no unhandled rejection', async ($, on) => {
+    const w = world(on)
+    w.notifyDeny = 'no'
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    await w.clock.advance(20 * 60_000 + 30_000)
+    await w.clock.settle()
+    expect(row(w, 'agent1')!.status).toBe('stalled')
+  })
+
+  test("a spawn by another agent naming the note is not linked as the replacement", async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    await spawn($, { prompt: w.files.get(BRIEF2)!, name: 'impl-2', parentAgentId: 'agent9' })
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    expect(row(w, 'agent2')!.replacedBy).toBeUndefined()
+  })
+
+  test("the parent's own spawn from the brief file is linked as the replacement", async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    await spawn($, { prompt: w.files.get(BRIEF2)!, name: 'impl-2', parentAgentId: 'agent1' })
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ status: 'replaced', replacedBy: 'agent3' }))
+    expect(row(w, 'agent3')!.replaces).toBe('agent2')
+  })
+
+  test('the scripted reply no longer claims the spawn', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    const res = await tool($, 'agent1')
+    const handover = (res.context ?? []).find(c => c.includes('HANDOVER'))!
+    expect(handover).toContain('will spawn the replacement')
+  })
+
+  test('under auto mode with the allow in place, a respawn is not reported as failed', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(w.spawns).toHaveLength(2)
+    expect(w.toasts.some(t => t.includes('no replacement started'))).toBe(false)
+    expect(w.prompts.some(p => p.includes('no replacement started'))).toBe(false)
+  })
+})
+
+describe('after a handover, the replacement takes over', () => {
+  /** `id` at 460k is sent HANDOVER, writes `note` and ends: the mod respawns it. */
+  const handOver = async ($: Engine, w: World, id: string, note: string) => {
+    w.tokens.set(id, 460_000)
+    await step($, id)
+    await tool($, id)
+    w.files.set(note, 'x')
+    await complete($, id, 'HANDED OVER')
+    await w.clock.settle()
+  }
+  /** impl-1 (agent1, with child impl-2) hands over; agent3, registered impl-1-2, replaces it. */
+  const swap = async ($: Engine, w: World) => {
+    await family($, w)
+    w.agents.push({ id: 'agent3', name: 'impl-1-2' })
+    await handOver($, w, 'agent1', `${RUN_DIR}/handover/impl-1-agent1-1.md`)
+  }
+  /** Records the `to` of each SendMessage that reaches the engine. */
+  const watchSends = (w: World) => {
+    const seen: string[] = []
+    w.toolAnswer = e => {
+      if (e.tool === 'SendMessage') seen.push(String(e.to))
+      return undefined
+    }
+    return seen
+  }
+  const logged = async ($: Engine) => {
+    const ui = await mountPane($, 'desktop')
+    const s = JSON.stringify(await ui.drawn())
+    await ui.unmount()
+    return s
+  }
+
+  test("a child's SendMessage to its replaced parent goes to the replacement, and the child is told", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    const res = (await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'R: green' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1-2'])
+    const ctx = (res.context ?? []).filter(c => c.includes('impl-1 was replaced by impl-1-2'))
+    expect(ctx).toHaveLength(1)
+    expect(await logged($)).toContain('redirected to impl-1-2')
+  })
+
+  test('by id too', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    await call($, 'agent2', 'SendMessage', { to: 'agent1', message: 'R: green' })
+    expect(seen).toEqual(['impl-1-2'])
+  })
+
+  test("the redirected report counts as the child's report", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    await call($, 'agent3', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 30 })
+    expect(row(w, 'agent2')!.checkinAt).toBeDefined()
+    watchSends(w)
+    await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'R: green' })
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    expect(row(w, 'agent2')!.report?.ok).toBe(true)
+  })
+
+  test('a replacement that registered the old name is not redirected to', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.agents.push({ id: 'agent3', name: 'impl-1' })
+    await handOver($, w, 'agent1', `${RUN_DIR}/handover/impl-1-agent1-1.md`)
+    await complete($, 'agent3')
+    const seen = watchSends(w)
+    const res = (await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1'])
+    expect((res.context ?? []).some(c => c.includes('was replaced by'))).toBe(false)
+  })
+
+  test('a chain goes to the newest replacement', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    w.agents.push({ id: 'agent4', name: 'impl-1-3' })
+    await step($, 'agent3') // starts small: a replacement that starts at the threshold is never handed over again
+    await handOver($, w, 'agent3', `${RUN_DIR}/handover/impl-1-2-agent3-1.md`)
+    expect(row(w, 'agent3')!.replacedBy).toBe('agent4')
+    const seen = watchSends(w)
+    await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'R' })
+    expect(seen).toEqual(['impl-1-3'])
+  })
+
+  test('left as addressed: a live name, the replacement to its predecessor, a failed respawn', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    const live = (await call($, 'agent3', 'SendMessage', { to: 'impl-2', message: 'x' })) as { context?: string[] }
+    const back = (await call($, 'agent3', 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-2', 'impl-1'])
+    expect(live.context).toBeUndefined()
+    expect(back.context).toBeUndefined()
+  })
+
+  test('left as addressed: a send to an agent whose respawn failed', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.spawnDeny = 'nope'
+    await handOver($, w, 'agent1', `${RUN_DIR}/handover/impl-1-agent1-1.md`)
+    expect(row(w, 'agent1')!.status).toBe('respawn-failed')
+    const seen = watchSends(w)
+    const res = (await call($, 'agent2', 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1'])
+    expect(res.context).toBeUndefined()
+  })
+
+  test("main's SendMessage is redirected too", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    const seen = watchSends(w)
+    const res = (await call($, undefined, 'SendMessage', { to: 'impl-1', message: 'x' })) as { context?: string[] }
+    expect(seen).toEqual(['impl-1-2'])
+    expect((res.context ?? []).some(c => c.includes('impl-1 was replaced by impl-1-2'))).toBe(true)
+  })
+
+  test('the old agent is stopped once its replacement started', async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    expect(w.stops).toEqual(['agent1'])
+    expect(await logged($)).toContain('impl-1 (agent1) stopped')
+  })
+
+  test('a failed stop is logged and the swap still completes', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'not running'
+    await swap($, w)
+    const s = await logged($)
+    expect(s).toContain('not stopped (not running)')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+    expect(s).toContain('impl-1 replaced by agent3')
+  })
+
+  test('a stop that throws is logged and the swap still completes', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'throw'
+    await swap($, w)
+    // The test kit hands a throw beneath the plugin's own tool call back as `no implementation`, not the original error.
+    expect(await logged($)).toContain('(agent1) not stopped (')
+    expect(row(w, 'agent3')!.replaces).toBe('agent1')
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+  })
+
+  test("a child respawned while its parent respawns lands under the parent's replacement", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    let release = () => {}
+    w.spawnHoldNext = new Promise<void>(r => (release = r))
+    // The child hands over first; its spawn waits.
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    void complete($, 'agent2', 'HANDED OVER').catch(() => undefined)
+    for (let i = 0; i < 20; i++) await w.clock.advance(1)
+    // The parent hands over and is replaced (agent3) while the child's spawn waits.
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(row(w, 'agent1')!.replacedBy).toBe('agent3')
+    release()
+    await w.clock.settle()
+    expect(row(w, 'agent2')!.replacedBy).toBe('agent4')
+    expect(row(w, 'agent4')!.parentId).toBe('agent3')
+  })
+
+  test('the parent is told before the stop answers: main', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'hang'
+    void swap($, w).catch(() => undefined)
+    for (let i = 0; i < 50; i++) await w.clock.advance(1)
+    expect(JSON.stringify(w.session.appended())).toContain('Replacement id agent3')
+    await w.clock.advance(10_000)
+    await w.clock.settle()
+  })
+
+  test('the parent is told before the stop answers: an agent parent', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.stopFails = 'hang'
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    void complete($, 'agent2', 'HANDED OVER').catch(() => undefined)
+    for (let i = 0; i < 50; i++) await w.clock.advance(1)
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('Replacement id agent3'))).toBe(true)
+    await w.clock.advance(10_000)
+    await w.clock.settle()
+  })
+
+  test('a stop that never answers is given up after the drain timeout, and the parent is still told', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'hang'
+    void swap($, w).catch(() => undefined)
+    for (let i = 0; i < 50; i++) await w.clock.advance(1)
+    await w.clock.advance(10_000)
+    await w.clock.settle()
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+    expect(JSON.stringify(w.session.appended())).toContain('Replacement id agent3')
+    const s = await logged($)
+    expect(s).toContain('(agent1) not stopped (')
+    expect(s).toContain('impl-1 replaced by agent3')
+  })
+
+  test('under auto mode the stop is allowed, and only while in flight', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await swap($, w)
+    expect(w.stopChecks).toEqual(['allow'])
+    expect(w.stops).toEqual(['agent1'])
+    expect((await $.tool.check({ tool: 'TaskStop', input: { task_id: 'agent1' } } as never)).decision).toBe('ask')
+    expect((await $.tool.check({ tool: 'TaskStop', input: 42 } as never)).decision).toBe('ask')
+  })
+
+  test("the old agent's children show under the replacement", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    expect(row(w, 'agent2')!.parentId).toBe('agent3')
+    await complete($, 'agent3')
+    const ui = await mountPane($, 'desktop')
+    const keys = (await ui.findAll({ type: 'Box' })).map(b => b.key ?? '').filter(k => k.startsWith('row:'))
+    expect(keys.indexOf('row:agent2')).toBeGreaterThan(keys.indexOf('row:agent3'))
+    expect(keys.indexOf('row:agent3')).toBeGreaterThanOrEqual(0)
+    expect(((await ui.find({ key: 'row:agent2' }))!.props as Record<string, unknown>).paddingLeft).toBe(2)
+    expect((await ui.find({ key: 'agent:agent3' }))!.text).toContain('waiting')
+    await ui.unmount()
+  })
+
+  test("a parent replaced earlier is the one told of its child's swap", async ($, on) => {
+    const w = world(on)
+    await swap($, w)
+    w.sent.length = 0
+    await handOver($, w, 'agent2', `${RUN_DIR}/handover/impl-2-agent2-1.md`)
+    expect(row(w, 'agent2')!.replacedBy).toBeDefined()
+    const told = w.sent.filter(m => m.text.includes('handed over'))
+    expect(told.length).toBeGreaterThan(0)
+    expect(told.every(m => m.to.includes('agent3'))).toBe(true)
+  })
+
+  test('a manual replacement after a failed respawn is linked, adopts the children and stops the old agent', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await spawn($, { prompt: 'P3', name: 'impl-3', parentAgentId: 'agent2' })
+    w.spawnDeny = 'nope'
+    const note = `${RUN_DIR}/handover/impl-2-agent2-1.md`
+    await handOver($, w, 'agent2', note)
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    await spawn($, { prompt: w.files.get(`${RUN_DIR}/handover/impl-2-agent2-1.brief.md`)!, name: 'impl-2', parentAgentId: 'agent1' })
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ status: 'replaced', replacedBy: 'agent4' }))
+    expect(row(w, 'agent3')!.parentId).toBe('agent4')
+    await w.clock.settle()
+    expect(w.stops).toContain('agent2')
+  })
+})
+
+describe('the activity log never holds the mod up', () => {
+  test('a log line is in the pane while its file write never answers', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.activityHang = true
+    const done: string[] = []
+    void spawn($, { prompt: 'P', name: 'impl-1' }).then(() => done.push('impl-1'))
+    for (let i = 0; i < 5000; i++) await Promise.resolve()
+    void spawn($, { prompt: 'P', name: 'impl-2' }).then(() => done.push('impl-2'))
+    for (let i = 0; i < 5000; i++) await Promise.resolve()
+    expect(done).toEqual(['impl-1', 'impl-2'])
+    const ui = await mountPane($, 'desktop')
+    const s = JSON.stringify(await ui.drawn())
+    await ui.unmount()
+    expect(s).toContain('spawned impl-1 (agent1)')
+    expect(s).toContain('spawned impl-2 (agent2)')
+  })
+})
+
+describe('the activity log never holds a press up', () => {
+  test('a Hand over press goes through while its press line is never written', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.activityHang = true
+    const ui = await mountPane($, 'desktop')
+    void ui.press({ key: 'handover:agent1' })
+    for (let i = 0; i < 5000; i++) await Promise.resolve()
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+    await ui.unmount()
   })
 })
 
@@ -3859,5 +4576,151 @@ describe('engine-assigned names', () => {
     await renamed($, w)
     const outbox = (JSON.parse(w.files.get(STATE)!) as { outbox?: { agentId: string; text: string }[] }).outbox ?? []
     expect(outbox).toEqual([expect.objectContaining({ agentId: 'agent1', text: NOTICE })])
+  })
+})
+
+describe('activity.log', () => {
+  const ACT = `${RUN_DIR}/activity.log`
+  const lines = (w: World) => (w.files.get(ACT) ?? '').split('\n').filter(Boolean)
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+
+  test('every activity line is written to the run folder', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    expect(w.files.get(ACT)).toContain('info spawned impl-1 (agent1)')
+  })
+
+  test('a warn is marked WARN', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.spawnDeny = 'nope'
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(lines(w).some(l => / WARN .*no replacement started \(nope\)/.test(l))).toBe(true)
+  })
+
+  test('the file keeps the last ACTIVITY_MAX lines, earlier lines read back after a reload', async ($, on) => {
+    const w = world(on)
+    w.files.set(ACT, Array.from({ length: ACTIVITY_MAX }, (_, i) => `old ${i}`).join('\n') + '\n')
+    await running($, w)
+    const l = lines(w)
+    expect(l).toHaveLength(ACTIVITY_MAX)
+    expect(l[0]).toBe('old 1')
+    expect(l.at(-1)).toContain('spawned impl-1')
+    expect(w.files.get(ACT)!.endsWith('\n')).toBe(true)
+  })
+
+  test('a pane press is recorded in the file, not the pane', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await ui.press({ key: 'agent:agent1' })
+    expect(w.files.get(ACT)).toContain('press agent:agent1 (desktop, orchestrator)')
+    const drawn = (await ui.findAll({ type: 'Text' })).map(t => textOf(t)).join('\n')
+    expect(drawn).not.toContain('press agent:')
+    await ui.unmount()
+  })
+
+  test('two Hand over presses at once start one handover, and the second says why', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    await Promise.all([ui.press({ key: 'handover:agent1' }), ui.press({ key: 'handover:agent1' })])
+    await w.clock.settle()
+    expect(row(w, 'agent1')!.handovers).toBe(1)
+    const l = lines(w)
+    expect(l.filter(x => x.includes('press handover:agent1 (desktop'))).toHaveLength(2)
+    expect(l.filter(x => x.includes('Hand over not started ('))).toHaveLength(1)
+    expect(l.filter(x => x.includes('HANDOVER goes with its next tool result'))).toHaveLength(1)
+    await ui.unmount()
+  })
+
+  test('a failing write never breaks logging', async ($, on) => {
+    const w = world(on)
+    w.fsFails = ACT
+    await running($, w)
+    expect(row(w, 'agent1')).toBeDefined()
+    expect(w.logSinks.some(s => s.to === 'debug' && s.text.includes('activity.log not written'))).toBe(true)
+  })
+
+  /** A /clear: the next read of each key finds nothing, until the plugin writes it again. */
+  const wipeable = (on: Parameters<typeof world>[0]) => {
+    let wiped: Set<string> | undefined
+    on('state.get', async ($, e, next) => {
+      const res = (await next(e)) as { value?: { value: unknown; version: number } }
+      const k = (e as unknown as { key: string }).key
+      if (!wiped?.has(k) || !res.value) return res as never
+      return { value: { value: undefined, version: res.value.version } } as never
+    })
+    on('state.set', async ($, e, next) => {
+      const res = await next(e)
+      wiped?.delete((e as unknown as { key: string }).key)
+      return res
+    })
+    return () => {
+      wiped = new Set(['agents', 'log', 'mainPhase', 'runId', 'outbox', 'selectedAgent', 'transcripts', 'collapsed', 'toolView', 'pinnedLog', 'mainQueued'])
+    }
+  }
+  type Mounted = Awaited<ReturnType<typeof mountPane>>
+  /** A press whose rejection (a start that throws) is the test's to ignore. */
+  const pressAnyway = (ui: Mounted, key: string) => ui.press({ key }).catch(() => undefined)
+
+  test('a press and a log after a /clear, before restore, do not fork the run', async ($, on) => {
+    const w = world(on)
+    const wipe = wipeable(on)
+    await running($, w)
+    const ui = await mountPane($, 'desktop')
+    wipe()
+    w.sessionId = 'S2' // a /clear changes the session id; the run keeps the first
+    await pressAnyway(ui, 'agent:agent1')
+    await step($) // restores from state.json
+    expect(row(w, 'agent1')).toBeDefined()
+    expect((JSON.parse(w.files.get(STATE)!) as { runId: string }).runId).toBe('S1')
+    expect(w.files.get(ACT)).toContain('spawned impl-1')
+    expect(w.files.get(ACT)).toContain('press agent:agent1 (desktop, orchestrator)')
+    expect([...w.files.keys()].some(k => k.includes('/S2/'))).toBe(false)
+    await ui.unmount()
+  })
+
+  test('a line before session.start is not written at the root, and lands in the file after start', async ($, on) => {
+    const w = world(on)
+    await spawn($, { prompt: 'P0', name: 'early' })
+    expect(w.files.has('/activity.log')).toBe(false)
+    await running($, w)
+    const l = lines(w)
+    expect(l.some(x => x.includes('spawned early'))).toBe(true)
+    expect(l.some(x => x.includes('spawned impl-1'))).toBe(true)
+    expect([...w.files.keys()].filter(k => k.endsWith('activity.log'))).toEqual([ACT])
+  })
+
+  test('a Hand over start that throws releases its guard: the next press starts it', async ($, on) => {
+    const w = world(on)
+    const wipe = wipeable(on)
+    await running($, w)
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await step($, 'agent2')
+    await complete($, 'agent1')
+    expect(row(w, 'agent1')!.status).toBe('idle')
+    const ui = await mountPane($, 'desktop')
+    w.sendFails = 'throw'
+    await pressAnyway(ui, 'handover:agent1')
+    w.sendFails = ''
+    // agent1 back to idle, as if the failed start had never happened
+    const saved = JSON.parse(w.files.get(STATE)!) as { agents: AgentRow[] }
+    saved.agents = saved.agents.map(a => (a.id === 'agent1' ? { ...a, status: 'idle', handoverVia: undefined } : a))
+    w.files.set(STATE, JSON.stringify(saved))
+    wipe()
+    await step($)
+    await pressAnyway(ui, 'handover:agent1')
+    const l = lines(w)
+    expect(l.some(x => x.includes('already starting'))).toBe(false)
+    expect(l.some(x => x.includes('HANDOVER sent'))).toBe(true)
+    await ui.unmount()
   })
 })

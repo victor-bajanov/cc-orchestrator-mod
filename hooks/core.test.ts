@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
+  ACTIVITY_MAX,
+  activityLine,
   MAX_SAMPLES,
+  adoptChildren,
   contextOf,
   crossed,
   fmtTokens,
@@ -16,6 +19,8 @@ import {
   sparkline,
   timeline,
   handoverMessage,
+  briefPathFor,
+  respawnFailedNotice,
   wrapFill,
 } from './core'
 import type { AgentRow } from '../types'
@@ -73,6 +78,11 @@ describe('recordStep', () => {
   })
   test('revives a done agent resumed by a message, noting when', () => {
     const rows = recordStep([row({ id: 'x', status: 'done' })], { id: 'x', tokens: 1, t: 42, tools: 0 })
+    expect(rows[0]!.status).toBe('running')
+    expect(rows[0]!.resumedAt).toBe(42)
+  })
+  test('a step revives a respawn-failed row as running, marked resumed', () => {
+    const rows = recordStep([row({ id: 'x', status: 'respawn-failed' })], { id: 'x', tokens: 1, t: 42, tools: 0 })
     expect(rows[0]!.status).toBe('running')
     expect(rows[0]!.resumedAt).toBe(42)
   })
@@ -228,14 +238,36 @@ describe('timeline', () => {
 })
 
 describe('handoverMessage', () => {
-  test('tells the agent its parent need not act when the mod respawns it', () => {
+  test('tells the agent the mod will spawn its replacement, without claiming it has', () => {
     const m = handoverMessage('/n.md', true)
     expect(m).toContain('HANDOVER')
     expect(m).toContain('/n.md')
     expect(m).toContain('no action needed')
+    expect(m).toContain('will spawn the replacement')
+    expect(m).not.toContain('has spawned')
   })
   test('tells the parent to respawn when the mod does not', () => {
     expect(handoverMessage('/n.md', false)).toContain('spawn a replacement')
+  })
+})
+
+describe('respawnFailedNotice', () => {
+  const brief = { prompt: 'P', subagentType: 'general-purpose', description: 'impl', model: 'opus', name: 'impl-2' }
+  test('names the note, the brief file and how to spawn', () => {
+    const t = respawnFailedNotice({ label: 'impl-2', id: 'agent2', notePath: '/n.md', reason: 'nope', brief, briefPath: '/r/h/impl-2-agent2-1.brief.md' })
+    for (const s of ['no replacement started: nope', 'note at /n.md', 'name "impl-2"', 'subagent_type "general-purpose"', 'model "opus"', '/r/h/impl-2-agent2-1.brief.md'])
+      expect(t).toContain(s)
+  })
+  test('with no brief file, it quotes the start line', () => {
+    const t = respawnFailedNotice({ label: 'impl-2', id: 'agent2', notePath: '/n.md', reason: 'nope', brief })
+    expect(t).toContain('Start from the handover note at /n.md')
+  })
+  test('with no brief, it says so', () => {
+    const t = respawnFailedNotice({ label: 'x', id: 'agent9', notePath: '/n.md', reason: 'no brief recorded' })
+    expect(t).toContain('No brief was recorded')
+  })
+  test('briefPathFor', () => {
+    expect(briefPathFor('/r/h/x-1.md')).toBe('/r/h/x-1.brief.md')
   })
 })
 
@@ -245,5 +277,29 @@ describe('wrapFill', () => {
   })
   test('hard-breaks a word longer than the width', () => {
     expect(wrapFill('/a/very/long/path ok', 8)).toEqual(['/a/very/', 'long/pat', 'h ok    '])
+  })
+})
+
+describe('adoptChildren', () => {
+  test("moves only the old agent's children and never the replacement itself", () => {
+    const rows = [
+      row({ id: 'old', parentId: 'main' }),
+      row({ id: 'new', parentId: 'old' }),
+      row({ id: 'c1', parentId: 'old' }),
+      row({ id: 'c2', parentId: 'other' }),
+    ]
+    const out = adoptChildren(rows, 'old', 'new')
+    expect(out.map(r => r.parentId)).toEqual(['main', 'old', 'new', 'other'])
+  })
+})
+
+describe('activityLine', () => {
+  test('a warn line: UTC time, WARN, newlines folded', () => {
+    expect(activityLine(Date.UTC(2026, 9, 12, 10, 0, 0), 'warn', 'a\nb')).toBe('2026-10-12T10:00:00.000Z WARN a ⏎ b')
+  })
+
+  test('the info level prints info', () => {
+    expect(activityLine(Date.UTC(2026, 9, 12, 10, 0, 0), 'info', 'x\r\ny')).toBe('2026-10-12T10:00:00.000Z info x ⏎ y')
+    expect(ACTIVITY_MAX).toBe(2000)
   })
 })

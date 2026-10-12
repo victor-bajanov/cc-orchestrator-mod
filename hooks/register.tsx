@@ -5,7 +5,11 @@ import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ToolView, 
 import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
+  ACTIVITY_MAX,
   HANDOVER_CLAUSE,
+  activityLine,
+  adoptChildren,
+  briefPathFor,
   contextOf,
   fmtTokens,
   handoverMessage,
@@ -18,6 +22,7 @@ import {
   orderRows,
   recordStep,
   replacementPrompt,
+  respawnFailedNotice,
   resumePrompt,
   rosterMarkdown,
   timeline,
@@ -25,11 +30,14 @@ import {
 } from './core'
 import {
   LIVE,
+  addressFor,
+  capLines,
   ceilingOf,
   chartWidthPx,
   contextChart,
   cut,
   displayStatus,
+  expandCap,
   hhmm,
   logId,
   mainButtonShown,
@@ -43,10 +51,12 @@ import {
   foldGlyph,
   latest,
   namesAgent,
+  redirectTarget,
   resolveAgent,
   seriesColors,
   statusEmoji,
   statusStyle,
+  terminalBase,
   textKey,
   transcriptItems,
   transcriptView,
@@ -69,7 +79,7 @@ const agentsAtom = atom({ plugin: 'orchestrator', key: 'agents' } as const, [] a
 const logAtom = atom({ plugin: 'orchestrator', key: 'log' } as const, [] as LogEntry[])
 const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'idle' as MainPhase)
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
-/** The activity line whose full-text card a click pinned open ('' for none). */
+/** The line (activity or transcript text) whose full text a press shows beneath it, in flow ('' for none). */
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
 /** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
@@ -136,6 +146,24 @@ export const isOwnSend = (o: {
   return o.inFlight.some(s => toward(s) && (own || (typeof o.message === 'string' && s.text === o.message)))
 }
 
+/** One of the mod's own tool calls in flight, other than a send: a respawn's Agent call, or a TaskStop of a replaced agent. */
+export type OwnCall = { tool: 'Agent'; prompt: string } | { tool: 'TaskStop'; taskId: string }
+
+/**
+ * Whether a tool.check input is one of the mod's own calls in flight: an Agent call with the exact prompt the mod
+ * spawned with, or that prompt with the HANDOVER clause the mod's own agent.spawn hook appends; a TaskStop of
+ * exactly the agent it is stopping. Anything malformed is not.
+ */
+export const isOwnCall = (input: unknown, inFlight: readonly OwnCall[]): boolean => {
+  if (typeof input !== 'object' || input === null) return false
+  const i = input as { prompt?: unknown; task_id?: unknown; shell_id?: unknown }
+  return inFlight.some(c =>
+    c.tool === 'Agent'
+      ? typeof i.prompt === 'string' && (i.prompt === c.prompt || i.prompt === c.prompt + HANDOVER_CLAUSE)
+      : i.task_id === c.taskId || i.shell_id === c.taskId,
+  )
+}
+
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
@@ -181,6 +209,13 @@ const ownSends: OwnSend[] = []
 /** A SendMessage check went unmatched while the mod had a send in flight, and was logged: once per load. */
 let checkMissLogged = false
 /**
+ * The mod's own tool calls in flight other than sends (a respawn's Agent call, a TaskStop): under auto mode the
+ * classifier refuses them, as it does the mod's sends. tool.check allows exactly these, and only while in flight.
+ */
+const ownCalls: OwnCall[] = []
+/** An Agent or TaskStop check went unmatched while the mod had a call in flight, and was logged: once per load. */
+let callMissLogged = false
+/**
  * When the mod saw each transcript entry, per agent: a call's `tool_use_id` → ms, or a text's
  * `textKey` → each time it was seen, oldest first (a repeated text takes its own). Module-level,
  * so lost on reload; an entry it never saw draws `--:--`.
@@ -194,6 +229,16 @@ const STAMPS_MAX = 500
 let lastSpawned: string | undefined
 /** Agents already told their registered name: one notice each, however many paths learn the rename. */
 const noticed = new Set<string>()
+/** activity.log's lines, read back once per load (undefined: not read yet). */
+let activity: string[] | undefined
+/** The path `activity` was read from: another path is read afresh. */
+let activityPath = ''
+/** Lines logged before the run folder was known; they go in with the next line written. */
+const activityPending: string[] = []
+/** activity.log writes, one after another. */
+let activityChain: Promise<void> = Promise.resolve()
+/** Agents whose Hand over is being set up: a second start in the meantime is refused. */
+const handoverStarting = new Set<string>()
 
 async function runDir($: $) {
   let id = await read($, runAtom)
@@ -236,9 +281,56 @@ async function restore($: $) {
   await update($, outboxAtom, q => [...(saved.outbox ?? []).filter(d => !done.has(d.id)), ...q])
 }
 
+/**
+ * Appends a line to <run>/activity.log, keeping the last ACTIVITY_MAX (earlier lines read back once per load and
+ * per path). Never throws. Uses the run folder already known, never runDir: that writes the run id when it is
+ * empty, and after a /clear that would fork the run before restore. A line before the folder is known waits.
+ */
+async function writeActivity($: $, line: string) {
+  const run = activityChain.then(async () => {
+    try {
+      if (!runDirCache) {
+        activityPending.push(line)
+        activityPending.splice(0, Math.max(0, activityPending.length - ACTIVITY_MAX))
+        return
+      }
+      const path = `${runDirCache}/activity.log`
+      if (path !== activityPath) {
+        activity = undefined
+        activityPath = path
+      }
+      if (activity === undefined) {
+        activity = (await $.fs.exists(path)) ? (await $.fs.read(path)).split('\n').filter(Boolean) : []
+      }
+      activity.push(...activityPending.splice(0), line)
+      activity.splice(0, Math.max(0, activity.length - ACTIVITY_MAX))
+      await $.fs.write(path, `${activity.join('\n')}\n`)
+    } catch (err) {
+      try {
+        $.ui.log(`orchestrator: activity.log not written: ${String(err)}`, { to: 'debug' })
+      } catch {
+        // Nothing more to do.
+      }
+    }
+  })
+  activityChain = run
+  return run
+}
+
+/** Writes a line to activity.log only, not to the pane. Never throws, and never waits on the file. */
+async function trace($: $, text: string) {
+  try {
+    void writeActivity($, activityLine(await $.clock.now(), 'info', text))
+  } catch {
+    // The file is a record; a lost line breaks nothing.
+  }
+}
+
 async function log($: $, text: string, lvl: LogEntry['level'] = 'info') {
   const t = await $.clock.now()
   await update($, logAtom, l => [...l, { t, text, level: lvl }].slice(-200))
+  // Not awaited: a slow or hung file write never holds up the hook that logs (writeActivity never rejects).
+  void writeActivity($, activityLine(t, lvl, text))
   if (lvl === 'warn') $.ui.toast(`orchestrator: ${text}`)
 }
 
@@ -565,19 +657,36 @@ function toolBody($: $, ui: Ui, v: ToolView | null, copyable: boolean) {
 // ---- subagents -------------------------------------------------------
 
 async function startHandover($: $, id: string, why: string) {
-  const r = (await read($, agentsAtom)).find(a => a.id === id)
-  if (!r || !canHandOver(r)) return false
-  const attempt = (r.handovers ?? 0) + 1
-  const notePath = notePathFor(await runDir($), r, attempt)
-  const now = await $.clock.now()
-  await update($, agentsAtom, l =>
-    patch(l, id, { status: 'handing-over', notePath, handoverAt: now, handovers: attempt, handoverVia: undefined }),
-  )
-  if (r.status === 'idle') return sendHandover($, id, why)
-  // A message would wait in a busy teammate's inbox until its turn ends: it rides on the next tool result instead.
-  await log($, `${label(r)} ${why}: HANDOVER goes with its next tool result`)
-  await persist($)
-  return true
+  // Checked and taken before any await: two presses in the same tick both pass canHandOver otherwise.
+  if (handoverStarting.has(id)) {
+    await log($, `${id}: Hand over not started (already starting; ${why})`)
+    return false
+  }
+  handoverStarting.add(id)
+  try {
+    const r = (await read($, agentsAtom)).find(a => a.id === id)
+    if (!r) {
+      await log($, `${id}: Hand over not started (no such agent; ${why})`)
+      return false
+    }
+    if (!canHandOver(r)) {
+      await log($, `${label(r)}: Hand over not started (status ${r.status}; ${why})`)
+      return false
+    }
+    const attempt = (r.handovers ?? 0) + 1
+    const notePath = notePathFor(await runDir($), r, attempt)
+    const now = await $.clock.now()
+    await update($, agentsAtom, l =>
+      patch(l, id, { status: 'handing-over', notePath, handoverAt: now, handovers: attempt, handoverVia: undefined }),
+    )
+    if (r.status === 'idle') return await sendHandover($, id, why)
+    // A message would wait in a busy teammate's inbox until its turn ends: it rides on the next tool result instead.
+    await log($, `${label(r)} ${why}: HANDOVER goes with its next tool result`)
+    await persist($)
+    return true
+  } finally {
+    handoverStarting.delete(id)
+  }
 }
 
 /**
@@ -601,7 +710,14 @@ async function sendHandover($: $, id: string, why: string, queue = false) {
 async function deliverHandover($: $, id: string, why: string, text: string) {
   const r = (await read($, agentsAtom)).find(a => a.id === id)
   // Rechecked at delivery: a tool result may have carried it since it was queued, or the agent been replaced.
-  if (r?.status !== 'handing-over' || r.handoverVia !== undefined) return false
+  if (r?.status !== 'handing-over' || r.handoverVia !== undefined) {
+    // A routine skip: to the file only, not the pane.
+    await trace(
+      $,
+      `${r ? label(r) : id}: HANDOVER not sent (status ${r?.status ?? 'gone'}${r?.handoverVia ? `, already via ${r.handoverVia}` : ''})`,
+    )
+    return false
+  }
   const sent = await sendOwn($, id, text)
   if (sent.isDelivered) {
     const now = await $.clock.now()
@@ -647,6 +763,49 @@ async function sendOwn($: $, agentId: string, text: string) {
     timer?.cancel()
     unmark()
   }
+}
+
+/** Runs one of the mod's own calls, marked for tool.check while in flight (at most DRAIN_TIMEOUT_MS). */
+async function callOwn<T>($: $, mark: OwnCall, run: () => Promise<T>): Promise<T> {
+  const unmark = () => {
+    const i = ownCalls.indexOf(mark)
+    if (i >= 0) ownCalls.splice(i, 1)
+  }
+  ownCalls.push(mark) // synchronously, before any await
+  let timer: { cancel: () => void } | undefined
+  try {
+    timer = $.clock.after(DRAIN_TIMEOUT_MS, unmark)
+  } catch {
+    // no timer: the mark lasts as long as the call
+  }
+  try {
+    return await run()
+  } finally {
+    timer?.cancel()
+    unmark()
+  }
+}
+
+/**
+ * tool.check's verdict for an Agent or TaskStop call: allow when it is one of the mod's own in flight, else
+ * undefined (the engine decides). Logs the first miss while a call is in flight, by length only. Never throws.
+ */
+function ownCallVerdict($: $, tool: string, input: unknown) {
+  try {
+    if (ownCalls.length === 0) return undefined
+    if (isOwnCall(input, ownCalls)) return { decision: 'allow' as const, reason: 'orchestrator mod: its own call' }
+    if (!callMissLogged) {
+      callMissLogged = true
+      // No prompt text: the debug log may be shared.
+      const p = typeof input === 'object' && input !== null ? (input as { prompt?: unknown }).prompt : undefined
+      $.ui.log(`orchestrator: ${tool} check not matched: prompt=${typeof p === 'string' ? `${p.length} chars` : typeof p}`, {
+        to: 'debug',
+      })
+    }
+  } catch {
+    // fall through to the engine's verdict
+  }
+  return undefined
 }
 
 async function tellParent($: $, parentId: string | undefined, text: string) {
@@ -699,31 +858,117 @@ async function registeredName($: $, id: string, requested: string | undefined) {
   }
 }
 
+/** A respawn that did not start a replacement: marks the gap, saves the brief, and tells the parent, the person and the log. Never throws. */
+async function respawnFailed($: $, old: AgentRow, reason: string) {
+  try {
+    await update($, agentsAtom, l => patch(l, old.id, { status: 'respawn-failed', ...DISARMED }))
+    let briefPath: string | undefined
+    if (old.brief && old.notePath) {
+      try {
+        briefPath = briefPathFor(old.notePath)
+        await $.fs.write(briefPath, replacementPrompt(old.brief, old.notePath))
+      } catch {
+        briefPath = undefined
+      }
+    }
+    const rows = await read($, agentsAtom)
+    // A parent that handed over is carried on by its replacement: the notice goes there.
+    const to = latest(rows, old.parentId ?? 'main')
+    const text = respawnFailedNotice({
+      label: label(old),
+      id: old.id,
+      notePath: old.notePath ?? '(none)',
+      reason,
+      brief: old.brief,
+      briefPath,
+    })
+    const toRow = rows.find(r => r.id === to)
+    await log($, `${label(old)}: no replacement started (${reason}); told ${to === 'main' ? 'main' : toRow ? label(toRow) : to}`, 'warn')
+    // A refused notification is fine: the toast said it.
+    void $.ui.notify(`${label(old)} handed over, but no replacement started`, { title: 'orchestrator' }).catch(() => undefined)
+    if (to === 'main') $.clock.after(0, () => void $.prompt.submit({ text }))
+    else {
+      const sent = await sendOwn($, to, text)
+      if (!sent.isDelivered) await log($, `${label(old)}: parent not told of the failed respawn (${sent.reason})`, 'warn')
+    }
+    await persist($)
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: failed respawn not reported: ${String(err)}`)
+    } catch {
+      // nothing more
+    }
+  }
+}
+
+/** Stops a replaced agent once its replacement has started, so a late message can't wake it to act. Logged, never thrown. */
+async function stopReplaced($: $, old: AgentRow) {
+  try {
+    // Bounded: a stop that never answers holds neither the drain nor the parent's notice past DRAIN_TIMEOUT_MS.
+    let timer: { cancel: () => void } | undefined
+    const late = new Promise<'late'>(resolve => {
+      try {
+        timer = $.clock.after(DRAIN_TIMEOUT_MS, () => resolve('late'))
+      } catch {
+        // no timer: the stop is awaited as it is
+      }
+    })
+    const stop = callOwn($, { tool: 'TaskStop', taskId: old.id }, () => $.tool.call({ tool: 'TaskStop', task_id: old.id }))
+    let res: Awaited<typeof stop> | 'late'
+    try {
+      res = await Promise.race([stop, late])
+    } finally {
+      timer?.cancel()
+    }
+    if (res === 'late') {
+      void stop.catch(() => undefined)
+      await log($, `${label(old)} (${old.id}) not stopped (no answer in ${DRAIN_TIMEOUT_MS / 1000} s)`)
+      return
+    }
+    const bad = res.deny ?? (res.isError ? String(res.text ?? 'error') : undefined)
+    await log($, bad === undefined ? `${label(old)} (${old.id}) stopped` : `${label(old)} (${old.id}) not stopped (${bad})`)
+  } catch (err) {
+    await log($, `${label(old)} (${old.id}) not stopped (${String(err)})`).catch(() => undefined)
+  }
+}
+
+/** Links a respawn's replacement: the old agent's children move under it. Never throws. */
+async function linkReplacement($: $, old: AgentRow, newId: string) {
+  try {
+    await update($, agentsAtom, l => adoptChildren(l, old.id, newId))
+  } catch (err) {
+    $.ui.log(`orchestrator: children of ${old.id} not moved: ${String(err)}`)
+  }
+}
+
 async function respawn($: $, old: AgentRow) {
   const brief = old.brief
-  if (!brief || !old.notePath) {
-    await log($, `${label(old)}: no brief recorded, cannot respawn`, 'warn')
-    return
-  }
+  if (!brief || !old.notePath) return respawnFailed($, old, 'no brief recorded')
   lastSpawned = undefined
-  const res = await $.agent.spawn({
+  const args = {
     prompt: replacementPrompt(brief, old.notePath),
     subagentType: brief.subagentType,
     description: brief.description,
     model: brief.model,
     name: brief.name,
-  })
-  const newId = res.agentId ?? lastSpawned
-  if (res.deny !== undefined || !newId) {
-    await log($, `${label(old)}: respawn refused (${res.deny ?? 'no agent id'})`, 'warn')
-    return
   }
+  let res: Awaited<ReturnType<typeof $.agent.spawn>>
+  try {
+    res = await callOwn($, { tool: 'Agent', prompt: args.prompt }, () => $.agent.spawn(args))
+  } catch (err) {
+    return respawnFailed($, old, `spawn failed: ${String(err)}`)
+  }
+  const newId = res.agentId ?? lastSpawned
+  if (res.deny !== undefined || !newId) return respawnFailed($, old, res.deny ?? 'no agent id')
   // A teammate's name is suffixed when the original still holds it; the engine delivers its final reply itself.
   const info = (await $.agent.list()).find(a => a.id === newId)
   const name = info?.name ?? brief.name
   const isTeammate = info?.teammateId !== undefined
   const now = await $.clock.now()
+  // The old row's parent as it is now, not as queued: a parent replaced meanwhile has adopted it.
+  let parentId = old.parentId
   await update($, agentsAtom, l => {
+    parentId = l.find(a => a.id === old.id)?.parentId ?? old.parentId
     const known = l.some(a => a.id === newId) ? l : [...l, newRow(newId, now)]
     return known.map(a =>
       a.id === old.id
@@ -736,7 +981,7 @@ async function respawn($: $, old: AgentRow) {
               type: brief.subagentType,
               brief,
               replaces: old.id,
-              parentId: old.parentId,
+              parentId,
               isOurs: true,
               isTeammate,
               background: old.background,
@@ -748,14 +993,18 @@ async function respawn($: $, old: AgentRow) {
     )
   })
   await log($, `${label(old)} replaced by ${newId}, resuming from ${old.notePath}`)
+  await linkReplacement($, old, newId)
   await noticeRename($, newId, brief.name, info?.name)
   await tellParent(
     $,
-    old.parentId,
+    // A parent that handed over is carried on by its replacement: the notice goes there.
+    latest(await read($, agentsAtom), parentId ?? 'main'),
     `[orchestrator mod] Agent ${label(old)} (id ${old.id}) reached ${fmtTokens(old.tokens)} context and handed over; note at ${old.notePath}. ` +
       `Replacement id ${newId}${name ? ` (SendMessage name "${name}")` : ''} continues from the note. ` +
-      `No action needed: do not spawn another.${!isTeammate && (old.parentId === 'main' || old.parentId === undefined) ? ' Its final report will be forwarded to you.' : ''} Update your roster.`,
+      `No action needed: do not spawn another.${!isTeammate && (parentId === 'main' || parentId === undefined) ? ' Its final report will be forwarded to you.' : ''} Update your roster.`,
   )
+  // Last: the parent is told first, whatever the stop takes.
+  await stopReplaced($, old)
 }
 
 // ---- check-in and reports ---------------------------------------------
@@ -1045,7 +1294,7 @@ async function sync($: $) {
     if (r.status === 'handing-over' && r.handoverAt && now - r.handoverAt > STALL_MS) {
       await update($, agentsAtom, l => patch(l, r.id, { status: 'stalled' }))
       await log($, `${label(r)} has not handed over after ${Math.round(STALL_MS / 60_000)} min`, 'warn')
-      void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' })
+      void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' }).catch(() => undefined)
       changed = true
     } else if (isActive(r) && !listed.has(r.id) && !resumedRunning(r, now)) {
       await update($, agentsAtom, l => patch(l, r.id, { status: 'done' }))
@@ -1161,8 +1410,15 @@ export const register: Register = (on, options) => {
   toolReads.again.clear()
   ownSends.length = 0
   checkMissLogged = false
+  ownCalls.length = 0
+  callMissLogged = false
   draining = false
   nudgedSinceDrain = false
+  activity = undefined
+  activityPath = ''
+  activityPending.length = 0
+  activityChain = Promise.resolve()
+  handoverStarting.clear()
 
   // ---- events ----------------------------------------------------------
 
@@ -1230,6 +1486,24 @@ export const register: Register = (on, options) => {
       },
     ])
     await log($, `spawned ${name ?? e.description} (${id})`)
+    // A parent's own replacement for a failed respawn names the old agent's note: link the two.
+    // Only the agent told of the gap (the old parent's latest) links it: not by name, which the engine may suffix.
+    const rows = await read($, agentsAtom)
+    const gap = rows.find(
+      r =>
+        r.status === 'respawn-failed' &&
+        r.notePath &&
+        e.prompt.includes(r.notePath) &&
+        (e.parentAgentId ?? 'main') === latest(rows, r.parentId ?? 'main'),
+    )
+    if (gap) {
+      await update($, agentsAtom, l =>
+        adoptChildren(patch(patch(l, gap.id, { status: 'replaced', replacedBy: id }), id, { replaces: gap.id }), gap.id, id),
+      )
+      await log($, `${label(gap)}: ${name ?? id} (${id}) takes over from its note`)
+      // Off the spawn's path, as the name lookup below: the Agent result never waits on the stop.
+      void stopReplaced($, gap)
+    }
     await persist($)
     // Off the spawn's path: the Agent result and the pane never wait on the engine's list.
     void registeredName($, id, e.name)
@@ -1323,28 +1597,45 @@ export const register: Register = (on, options) => {
         // see above
       }
     }
-    const res = await next(e)
-    if (e.agentId === undefined) return res
+    // A SendMessage naming a replaced agent goes to its newest replacement, and the sender is told the new name.
+    let call = e
+    let redirected: string | undefined
+    if (e.tool === 'SendMessage') {
+      try {
+        const to = (e as { to?: unknown }).to
+        const dest = redirectTarget(await read($, agentsAtom), to, e.agentId)
+        if (dest && typeof to === 'string') {
+          const addr = addressFor(dest, to)
+          call = { ...e, to: addr } as typeof e
+          redirected = `[orchestrator mod] ${to} was replaced by ${addr} (id ${dest.id}); this message went to ${addr}. Use that name from now on.`
+          await log($, `SendMessage to ${to} from ${e.agentId ?? 'main'} redirected to ${addr} (${dest.id}): ${to} was replaced`)
+        }
+      } catch (err) {
+        $.ui.log(`orchestrator: SendMessage not redirected: ${String(err)}`)
+      }
+    }
+    const res = await next(call)
     if (res.deny !== undefined) {
       // A refused call is still an action: a report before it was not the run's last (a refused report is not ok).
-      await noteReport($, e.agentId, e.tool, argsOf(e), res).catch(() => undefined)
+      if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, argsOf(call), res).catch(() => undefined)
       return res
     }
-    let out = res
+    let out = redirected === undefined ? res : { ...res, context: [...(res.context ?? []), redirected] }
+    if (e.agentId === undefined) return out
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
       if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
         await update($, agentsAtom, l => patch(l, r.id, { handoverVia: 'tool' }))
         await log($, `${label(r)}: HANDOVER delivered with a tool result`)
         await persist($)
-        out = { ...res, context: [...(res.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
+        out = { ...out, context: [...(out.context ?? []), handoverMessage(r.notePath, cfg.autoRespawn)] }
       }
     } catch (err) {
       $.ui.log(`orchestrator: HANDOVER not attached: ${String(err)}`)
     }
     try {
       // After the HANDOVER is attached, and it never alters `out`: a report to the parent disarms the check-in.
-      await noteReport($, e.agentId, e.tool, argsOf(e), res)
+      await noteReport($, e.agentId, e.tool, argsOf(call), res)
     } catch (err) {
       $.ui.log(`orchestrator: report not noted: ${String(err)}`)
     }
@@ -1384,6 +1675,11 @@ export const register: Register = (on, options) => {
     }
     return next(e)
   })
+
+  // The mod's own respawn (Agent) and its stop of a replaced agent (TaskStop) are tool calls no request asked for;
+  // under auto mode the classifier refuses them. Allow exactly those, while in flight.
+  on('tool.check', { tool: 'Agent' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
+  on('tool.check', { tool: 'TaskStop' }, async ($, e, next) => ownCallVerdict($, e.tool, e.input) ?? next(e))
 
   // Raised for main's turns alone: a subagent's run raises no turn.start.
   on('turn.start', ($, e, next) => {
@@ -1508,6 +1804,14 @@ export const register: Register = (on, options) => {
   // A pane Hand over press is handled here, in hook context: a send from the button's own closure runs in
   // the plugin's environment like a timer's, and could wake the agent without the mod's hooks.
   on('ui.press', async ($, e, next) => {
+    // Every press on the mod's surfaces goes to activity.log (not the pane): a lost press shows as a missing line.
+    if (e.plugin === 'orchestrator') {
+      try {
+        await trace($, `press ${e.element} (${e.surface}, ${e.requestId})`)
+      } catch {
+        // A record only.
+      }
+    }
     const id = e.element.startsWith('handover:') ? e.element.slice('handover:'.length) : ''
     if (e.plugin !== 'orchestrator' || e.requestId !== PANE || id === '' || id === 'main') return next(e)
     try {
@@ -1789,6 +2093,7 @@ export const register: Register = (on, options) => {
       replaced: '⤳',
       done: '✓',
       stalled: '!',
+      'respawn-failed': '✗',
     }
     const selected = liveSelection(visible, await read($, selectedAtom))
     // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.
@@ -1800,7 +2105,29 @@ export const register: Register = (on, options) => {
     // A session that places no dialog (too narrow, or no surface places panes) shows the open call's detail in flow.
     const tv = await read($, toolViewAtom)
     const ui = $.ui.resolve(e)
-    /** One transcript row: a tool call opens its detail; a cut text shows whole in a card on hover, pinned by a press. */
+    // Rows left for an open expansion and the activity; the activity gives up exactly the rows an expansion takes.
+    // The header's button can wrap onto a row of its own.
+    const base = terminalBase({ rows: e.viewport?.rows ?? 30, agents: ordered.length, peekRows, buttonRow: shown })
+    // A pane too small for an expansion (cap 0) shows none: a press then only pins.
+    const cap = expandCap(base)
+    const fits = cols - 6
+    // Inside the transcript box's border, the expansion's border, its padding spaces and slack.
+    const textLines = (full: string) => capLines(wrapFill(full, Math.max(10, cols - 8)), cap)
+    // Inside the expansion's border, its padding spaces and slack.
+    const logLines = (text: string) => capLines(wrapFill(text, Math.max(10, cols - 6)), cap)
+    const pinOf = (agentId: string, it: TranscriptLine) => it.id.replace(/^step-/, `step-${agentId}-`)
+    const expRows = (() => {
+      if (pinned === '' || cap === 0) return 0
+      if (peek && 'items' in peek && selected) {
+        const it = peek.items.find(it => it.kind !== 'tool' && it.full !== undefined && pinOf(selected, it) === pinned)
+        if (it) return textLines(it.full!).length + 2
+      }
+      const l = entries.slice(-Math.max(3, base)).find(l => l.text.length > fits && logId(l) === pinned)
+      return l ? logLines(l.text).length + 2 : 0
+    })()
+    // A pinned line that falls outside the shrunk room is not drawn; its rows still count, so the pane only shows fewer.
+    const room = Math.max(3, base - expRows)
+    /** One transcript row: a tool call opens its detail; a press on a cut text shows its full text beneath it, in flow. */
     const item = (agentId: string, it: TranscriptLine) => {
       const time = <Text dimColor>{it.time} </Text>
       if (it.kind === 'tool') {
@@ -1832,38 +2159,25 @@ export const register: Register = (on, options) => {
           </Text>
         )
       }
-      const pin = it.id.replace(/^step-/, `step-${agentId}-`)
-      // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
-      // It opens downward, over the activity (the top of the pane would clip it), with as many lines as fit there.
-      const all = wrapFill(it.full, Math.max(10, cols - 4))
-      const fit = Math.max(1, room)
-      const wrapped = all.length > fit ? [...all.slice(0, fit - 1), '…'] : all
+      const pin = pinOf(agentId, it)
+      // A press shows the full text beneath it, in flow: it pushes the rows beneath down and never covers them.
       return (
-        <Box key={it.id}>
+        <Box key={it.id} flexDirection="column">
           <Button key={pin} plain onPress={() => togglePinned($, pin)}>
             {time}
             {who}
             <Text>{it.short}</Text>
           </Button>
-          <Box
-            position="absolute"
-            top={1}
-            left={-1}
-            width={cols}
-            borderStyle="round"
-            flexDirection="column"
-            display={pinned === pin ? 'flex' : 'none'}
-            hover={pinned === pin ? undefined : { display: 'flex' }}
-          >
-            {wrapped.map((w, j) => (
-              <Text key={`w${j}`} wrap="truncate">{` ${w} `}</Text>
-            ))}
-          </Box>
+          {pinned === pin && cap > 0 && (
+            <Box key={`full:${pin}`} borderStyle="round" flexDirection="column" width={cols - 2}>
+              {textLines(it.full).map((w, j) => (
+                <Text key={`w${j}`} wrap="truncate">{` ${w}`}</Text>
+              ))}
+            </Box>
+          )}
         </Box>
       )
     }
-    // The header's button can wrap onto a row of its own.
-    const room = Math.max(3, (e.viewport?.rows ?? 30) - ordered.length - 8 - (shown ? 1 : 0) - peekRows)
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
@@ -1952,7 +2266,6 @@ export const register: Register = (on, options) => {
         {entries.length === 0 && <Text dimColor>Nothing yet.</Text>}
         {entries.slice(-room).map((l, i) => {
           const color = l.level === 'warn' ? 'warning' : undefined
-          const fits = cols - 6
           if (l.text.length <= fits) {
             return (
               <Text key={`l${i}`} color={color} wrap="truncate">
@@ -1961,31 +2274,21 @@ export const register: Register = (on, options) => {
               </Text>
             )
           }
-          // Too long: cut with an ellipsis; the full text shows in a card above while hovered, or pinned by a click.
+          // Too long: cut with an ellipsis; a press shows the full text beneath it, in flow, and a second press hides it.
           const id = logId(l)
-          // It overlays other lines and paints only the cells it writes: each line is padded to the full width.
-          const inner = Math.max(10, cols - 4)
-          const wrapped = wrapFill(l.text, inner)
           return (
-            <Box key={`l${i}`}>
+            <Box key={`l${i}`} flexDirection="column">
               <Button key={id} plain onPress={() => togglePinned($, id)}>
                 <Text dimColor>{hhmm(l.t)} </Text>
                 <Text color={color}>{cut(l.text, fits)}</Text>
               </Button>
-              <Box
-                position="absolute"
-                top={-(wrapped.length + 2)}
-                left={0}
-                width={cols}
-                borderStyle="round"
-                flexDirection="column"
-                display={pinned === id ? 'flex' : 'none'}
-                hover={pinned === id ? undefined : { display: 'flex' }}
-              >
-                {wrapped.map((w, j) => (
-                  <Text key={`w${j}`} color={color} wrap="truncate">{` ${w} `}</Text>
-                ))}
-              </Box>
+              {pinned === id && cap > 0 && (
+                <Box key={`full:${id}`} borderStyle="round" flexDirection="column" width={cols}>
+                  {logLines(l.text).map((w, j) => (
+                    <Text key={`w${j}`} color={color} wrap="truncate">{` ${w}`}</Text>
+                  ))}
+                </Box>
+              )}
             </Box>
           )
         })}
