@@ -51,7 +51,11 @@ export const cut = (text: string, fits: number): string => `${text.slice(0, Math
 export const terminalBase = (o: { rows: number; agents: number; peekRows: number; buttonRow: boolean }): number =>
   o.rows - o.agents - 8 - (o.buttonRow ? 1 : 0) - o.peekRows
 /** The most text lines an expansion may show: it and its border leave the activity at least 3 lines; 0 (none shown) when the pane is too small. */
-export const expandCap = (base: number): number => Math.max(0, base - 3 - 2)
+export const expandCap = (base: number): number => {
+  // Under 2 lines the text would be all cut marker: show none.
+  const c = base - 3 - 2
+  return c < 2 ? 0 : c
+}
 /** At most `max` lines; when cut, the last kept line is `…`. */
 export const capLines = (lines: readonly string[], max: number): string[] =>
   lines.length <= max ? [...lines] : [...lines.slice(0, Math.max(0, max - 1)), '…']
@@ -573,7 +577,7 @@ export const latest = (rows: readonly AgentRow[], id: string): string => {
  * The agent a SendMessage `to` should reach when it names a replaced agent: the newest row `to` names
  * (by id, name or teammate address, as namesAgent does) that is `replaced` with a `replacedBy`, followed
  * to its `latest`. Undefined, so the message goes as addressed, when `to` also names a live agent (the
- * engine routes a name to its live holder), when nothing replaced matches, when the replacement itself
+ * engine routes a name to its live holder), when a newer agent not replaced holds it, when nothing replaced matches, when the replacement itself
  * answers to `to`, or when the sender is that replacement.
  */
 export const redirectTarget = (rows: readonly AgentRow[], to: unknown, sender?: string): AgentRow | undefined => {
@@ -583,6 +587,8 @@ export const redirectTarget = (rows: readonly AgentRow[], to: unknown, sender?: 
     .filter(r => r.status === 'replaced' && r.replacedBy !== undefined && namesAgent(to, r))
     .sort((a, b) => b.startedAt - a.startedAt)[0]
   if (!old) return undefined
+  // A newer agent registered under that name, finished or not, is who the name means now.
+  if (rows.some(r => r.id !== old.id && r.status !== 'replaced' && r.startedAt > old.startedAt && namesAgent(to, r))) return undefined
   const dest = rows.find(r => r.id === latest(rows, old.id))
   // A replacement registered under the old name already receives it as addressed.
   if (!dest || dest.id === old.id || dest.id === sender || namesAgent(to, dest)) return undefined

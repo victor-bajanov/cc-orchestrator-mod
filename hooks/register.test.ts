@@ -93,6 +93,10 @@ const world = (on: On) => {
     stops: [] as string[],
     /** The verdict of each TaskStop check (auto mode), in order. */
     stopChecks: [] as string[],
+    /** While set, a write of activity.log never answers. */
+    activityHang: false,
+    /** The next mod spawn waits on this before it is recorded (and numbered), once. */
+    spawnHoldNext: undefined as Promise<void> | undefined,
     /** How TaskStop fails: not at all, by throwing, never answering ('hang'), or refused with this reason. */
     stopFails: '' as '' | 'throw' | 'hang' | string,
     /** What `session.id` answers: a /clear changes it. */
@@ -170,6 +174,11 @@ const world = (on: On) => {
       w.spawnDeny = ''
       return { deny } as never
     }
+    if (w.spawnHoldNext && !e.tool_use_id) {
+      const hold = w.spawnHoldNext
+      w.spawnHoldNext = undefined
+      await hold
+    }
     const raw = e as typeof e & { subagent_type?: string }
     w.spawns.push({ ...e, subagentType: e.subagentType ?? raw.subagent_type ?? '' })
     if (w.hangSpawn) {
@@ -182,6 +191,7 @@ const world = (on: On) => {
     return { model: 'opus', agentId, ...(teammateId && { teammateId }) }
   })
   on('fs.write', ($, e) => {
+    if (w.activityHang && e.path.endsWith('activity.log')) return new Promise(() => {}) as never
     if (w.fsFails && e.path === w.fsFails) throw new Error('disk full')
     if (e.path === STATE) w.writes.push(e.text)
     w.files.set(e.path, e.text)
@@ -4047,6 +4057,57 @@ describe('after a handover, the replacement takes over', () => {
     expect(row(w, 'agent2')!.parentId).toBe('agent3')
   })
 
+  test("a child respawned while its parent respawns lands under the parent's replacement", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    let release = () => {}
+    w.spawnHoldNext = new Promise<void>(r => (release = r))
+    // The child hands over first; its spawn waits.
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    void complete($, 'agent2', 'HANDED OVER').catch(() => undefined)
+    for (let i = 0; i < 20; i++) await w.clock.advance(1)
+    // The parent hands over and is replaced (agent3) while the child's spawn waits.
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(row(w, 'agent1')!.replacedBy).toBe('agent3')
+    release()
+    await w.clock.settle()
+    expect(row(w, 'agent2')!.replacedBy).toBe('agent4')
+    expect(row(w, 'agent4')!.parentId).toBe('agent3')
+  })
+
+  test('the parent is told before the stop answers: main', async ($, on) => {
+    const w = world(on)
+    w.stopFails = 'hang'
+    void swap($, w).catch(() => undefined)
+    for (let i = 0; i < 50; i++) await w.clock.advance(1)
+    expect(JSON.stringify(w.session.appended())).toContain('Replacement id agent3')
+    await w.clock.advance(10_000)
+    await w.clock.settle()
+  })
+
+  test('the parent is told before the stop answers: an agent parent', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    w.stopFails = 'hang'
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(`${RUN_DIR}/handover/impl-2-agent2-1.md`, 'x')
+    void complete($, 'agent2', 'HANDED OVER').catch(() => undefined)
+    for (let i = 0; i < 50; i++) await w.clock.advance(1)
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('Replacement id agent3'))).toBe(true)
+    await w.clock.advance(10_000)
+    await w.clock.settle()
+  })
+
   test('a stop that never answers is given up after the drain timeout, and the parent is still told', async ($, on) => {
     const w = world(on)
     w.stopFails = 'hang'
@@ -4109,6 +4170,38 @@ describe('after a handover, the replacement takes over', () => {
     expect(row(w, 'agent3')!.parentId).toBe('agent4')
     await w.clock.settle()
     expect(w.stops).toContain('agent2')
+  })
+})
+
+describe('the activity log never holds the mod up', () => {
+  test('a log line is in the pane while its file write never answers', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.activityHang = true
+    const done: string[] = []
+    void spawn($, { prompt: 'P', name: 'impl-1' }).then(() => done.push('impl-1'))
+    for (let i = 0; i < 5000; i++) await Promise.resolve()
+    void spawn($, { prompt: 'P', name: 'impl-2' }).then(() => done.push('impl-2'))
+    for (let i = 0; i < 5000; i++) await Promise.resolve()
+    expect(done).toEqual(['impl-1', 'impl-2'])
+    const ui = await mountPane($, 'desktop')
+    const s = JSON.stringify(await ui.drawn())
+    await ui.unmount()
+    expect(s).toContain('spawned impl-1 (agent1)')
+    expect(s).toContain('spawned impl-2 (agent2)')
+  })
+})
+
+describe('the activity log never holds a press up', () => {
+  test('a Hand over press goes through while its press line is never written', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.activityHang = true
+    const ui = await mountPane($, 'desktop')
+    void ui.press({ key: 'handover:agent1' })
+    for (let i = 0; i < 5000; i++) await Promise.resolve()
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+    await ui.unmount()
   })
 })
 

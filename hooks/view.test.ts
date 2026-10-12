@@ -1084,6 +1084,15 @@ describe('redirectTarget', () => {
     expect(redirectTarget([old, dest], 'probe [x]')).toBeUndefined()
     expect(redirectTarget([old, dest], 'a1')).toBe(dest)
   })
+  test('a newer agent that took the old name, live or not, is no redirect for that name', () => {
+    const A = row({ id: 'a1', name: 'probe', status: 'replaced', replacedBy: 'a2', startedAt: 1 })
+    const B = row({ id: 'a2', name: 'probe-2', status: 'idle', startedAt: 2 })
+    expect(redirectTarget([A, B], 'probe')).toBe(B)
+    for (const status of ['done', 'respawn-failed', 'stalled'] as const) {
+      const C = row({ id: 'a3', name: 'probe', status, startedAt: 3 })
+      expect(redirectTarget([A, B, C], 'probe')).toBeUndefined()
+    }
+  })
   test('addressFor: the registered name, the teammate address for an address, else the id', () => {
     expect(addressFor(r2, 'probe')).toBe('probe-2')
     expect(addressFor({ ...r2, teammateId: 'probe-2@team' }, 'probe@team')).toBe('probe-2@team')
@@ -1098,7 +1107,9 @@ describe('terminal budget', () => {
   })
   test('expandCap leaves the activity at least 3 lines beside the border; a pane too small shows none', () => {
     expect(expandCap(14)).toBe(9)
-    expect(expandCap(6)).toBe(1)
+    // One line of text and a cut marker would be all `…`: under 2 lines, none.
+    expect(expandCap(7)).toBe(2)
+    expect(expandCap(6)).toBe(0)
     expect(expandCap(5)).toBe(0)
     expect(expandCap(4)).toBe(0)
   })

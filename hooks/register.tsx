@@ -317,10 +317,10 @@ async function writeActivity($: $, line: string) {
   return run
 }
 
-/** Writes a line to activity.log only, not to the pane. Never throws. */
+/** Writes a line to activity.log only, not to the pane. Never throws, and never waits on the file. */
 async function trace($: $, text: string) {
   try {
-    await writeActivity($, activityLine(await $.clock.now(), 'info', text))
+    void writeActivity($, activityLine(await $.clock.now(), 'info', text))
   } catch {
     // The file is a record; a lost line breaks nothing.
   }
@@ -329,7 +329,8 @@ async function trace($: $, text: string) {
 async function log($: $, text: string, lvl: LogEntry['level'] = 'info') {
   const t = await $.clock.now()
   await update($, logAtom, l => [...l, { t, text, level: lvl }].slice(-200))
-  await writeActivity($, activityLine(t, lvl, text))
+  // Not awaited: a slow or hung file write never holds up the hook that logs (writeActivity never rejects).
+  void writeActivity($, activityLine(t, lvl, text))
   if (lvl === 'warn') $.ui.toast(`orchestrator: ${text}`)
 }
 
@@ -931,14 +932,13 @@ async function stopReplaced($: $, old: AgentRow) {
   }
 }
 
-/** Links a respawn's replacement: the old agent's children move under it, and the old agent is stopped. Never throws. */
+/** Links a respawn's replacement: the old agent's children move under it. Never throws. */
 async function linkReplacement($: $, old: AgentRow, newId: string) {
   try {
     await update($, agentsAtom, l => adoptChildren(l, old.id, newId))
   } catch (err) {
     $.ui.log(`orchestrator: children of ${old.id} not moved: ${String(err)}`)
   }
-  await stopReplaced($, old)
 }
 
 async function respawn($: $, old: AgentRow) {
@@ -965,7 +965,10 @@ async function respawn($: $, old: AgentRow) {
   const name = info?.name ?? brief.name
   const isTeammate = info?.teammateId !== undefined
   const now = await $.clock.now()
+  // The old row's parent as it is now, not as queued: a parent replaced meanwhile has adopted it.
+  let parentId = old.parentId
   await update($, agentsAtom, l => {
+    parentId = l.find(a => a.id === old.id)?.parentId ?? old.parentId
     const known = l.some(a => a.id === newId) ? l : [...l, newRow(newId, now)]
     return known.map(a =>
       a.id === old.id
@@ -978,7 +981,7 @@ async function respawn($: $, old: AgentRow) {
               type: brief.subagentType,
               brief,
               replaces: old.id,
-              parentId: old.parentId,
+              parentId,
               isOurs: true,
               isTeammate,
               background: old.background,
@@ -995,11 +998,13 @@ async function respawn($: $, old: AgentRow) {
   await tellParent(
     $,
     // A parent that handed over is carried on by its replacement: the notice goes there.
-    latest(await read($, agentsAtom), old.parentId ?? 'main'),
+    latest(await read($, agentsAtom), parentId ?? 'main'),
     `[orchestrator mod] Agent ${label(old)} (id ${old.id}) reached ${fmtTokens(old.tokens)} context and handed over; note at ${old.notePath}. ` +
       `Replacement id ${newId}${name ? ` (SendMessage name "${name}")` : ''} continues from the note. ` +
-      `No action needed: do not spawn another.${!isTeammate && (old.parentId === 'main' || old.parentId === undefined) ? ' Its final report will be forwarded to you.' : ''} Update your roster.`,
+      `No action needed: do not spawn another.${!isTeammate && (parentId === 'main' || parentId === undefined) ? ' Its final report will be forwarded to you.' : ''} Update your roster.`,
   )
+  // Last: the parent is told first, whatever the stop takes.
+  await stopReplaced($, old)
 }
 
 // ---- check-in and reports ---------------------------------------------
