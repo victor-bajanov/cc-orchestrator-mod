@@ -4980,3 +4980,225 @@ describe('background shells: tracking', () => {
     expect(row(w, 'agent2')!.shells).toHaveLength(2)
   })
 })
+
+describe('background shells: grace and ceiling nudges', () => {
+  const ACT = `${RUN_DIR}/activity.log`
+  const logged = async (w: World, text: string) => {
+    await w.clock.settle()
+    return (w.files.get(ACT) ?? '').includes(text)
+  }
+  const out = (id: string) => `${TASKS}/${id}.output`
+  const poll = async (w: World, ms = 15_000) => {
+    await w.clock.advance(ms)
+    await w.clock.settle()
+  }
+  /** A turn end (main's) delivers what the timers queued. */
+  const drained = async ($: Engine, w: World) => {
+    await complete($, undefined)
+    await w.clock.settle()
+  }
+  const nudges = (w: World, to = 'agent2') => w.sent.filter(m => m.to.includes(to) && m.text.includes('background command'))
+  const at = (t: number) => new Date(t).toISOString().slice(11, 16)
+  /** agent2 (impl-2) backgrounds `id`, ends its turn (idle), and the poll sees the command exit with `code`. */
+  const idleWithEnded = async ($: Engine, w: World, id: string, code: number | 'killed' = 0) => {
+    await family($, w)
+    await bgBash($, w, 'agent2', id)
+    await complete($, 'agent2')
+    endOutput(w, id, code)
+    await poll(w)
+    expect(row(w, 'agent2')!.status).toBe('idle')
+    expect(row(w, 'agent2')!.shells![0]!.exit).toBe(code)
+    return row(w, 'agent2')!.shells![0]!.endedAt!
+  }
+
+  test('an idle agent whose last shell exited is nudged once after the grace, with the code, time and output path', async ($, on) => {
+    const w = world(on)
+    const t = await idleWithEnded($, w, 'b1', 0)
+    await poll(w, 45_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    await poll(w, 15_000)
+    // Queued, not sent: nothing reaches the agent before a turn end.
+    expect(nudges(w)).toEqual([])
+    await drained($, w)
+    expect(nudges(w).map(m => m.text)).toEqual([
+      `[orchestrator mod] your background command "run the tests" (id b1) exited with code 0 at ${at(t)} UTC and you haven't picked it up; output: ${out('b1')}`,
+    ])
+    expect(await logged(w, 'impl-2: nudged about finished background command(s) b1')).toBe(true)
+    expect(row(w, 'agent2')!.shells).toEqual([])
+    await poll(w, 300_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test('a step that starts a new run within the grace picks it up: no nudge', async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await step($, 'agent2')
+    expect(row(w, 'agent2')!.shells).toEqual([])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBeUndefined()
+    await complete($, 'agent2')
+    await poll(w, 120_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+  })
+
+  test("a busy agent's steps don't pick it up; the grace runs from its turn end", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    await poll(w, 30_000)
+    // Still in the same run: it may not have seen the notice.
+    await step($, 'agent2')
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+    await complete($, 'agent2')
+    await poll(w, 45_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    await poll(w, 15_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test("a tool call naming the shell's id or output path picks it up", async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2')
+    await bgBash($, w, 'agent2', 'b3')
+    endOutput(w, 'b1', 0)
+    endOutput(w, 'b2', 0)
+    await poll(w)
+    await call($, 'agent2', 'Read', { file_path: out('b1') })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b2', 'b3'])
+    // Naming an open shell picks up nothing.
+    await call($, 'agent2', 'TaskOutput', { task_id: 'b3' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b2', 'b3'])
+    await call($, 'agent2', 'TaskOutput', { task_id: 'b2' })
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b3'])
+    expect(row(w, 'agent2')!.shellsDoneAt).toBeUndefined()
+  })
+
+  test('with another shell still open, no nudge; when that one ends too, one nudge lists both', async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent2', 'b2', { description: 'build' })
+    await complete($, 'agent2')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    await poll(w, 120_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    endOutput(w, 'b2', 2)
+    await poll(w)
+    const t1 = row(w, 'agent2')!.shells![0]!.endedAt!
+    const t2 = row(w, 'agent2')!.shells![1]!.endedAt!
+    await poll(w, 60_000)
+    await drained($, w)
+    expect(nudges(w).map(m => m.text)).toEqual([
+      [
+        "[orchestrator mod] your background commands finished and you haven't picked them up:",
+        `- "run the tests" (id b1) exited with code 0 at ${at(t1)} UTC; output: ${out('b1')}`,
+        `- "build" (id b2) exited with code 2 at ${at(t2)} UTC; output: ${out('b2')}`,
+      ].join('\n'),
+    ])
+    expect(await logged(w, 'impl-2: nudged about finished background command(s) b1, b2')).toBe(true)
+  })
+
+  test("a killed shell's nudge says it was killed", async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1', 'killed')
+    await poll(w, 60_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+    expect(nudges(w)[0]!.text).toContain('(id b1) was killed at ')
+  })
+
+  test('main is never nudged; its finished shells are dropped at its next step', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    await complete($, undefined)
+    endOutput(w, 'm1', 0)
+    await poll(w)
+    expect(row(w, 'main')!.shells![0]!.exit).toBe(0)
+    await poll(w, 300_000)
+    await drained($, w)
+    expect(w.sent.filter(m => m.text.includes('background command'))).toEqual([])
+    expect(w.prompts.filter(p => p.includes('background command'))).toEqual([])
+    await step($)
+    expect(row(w, 'main')!.shells).toEqual([])
+  })
+
+  test('shellGraceSeconds 0 never nudges', { options: { shellGraceSeconds: 0 } }, async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    expect(row(w, 'agent2')!.shells!.map(s => s.id)).toEqual(['b1'])
+  })
+
+  test('a shell open past shellCeilingMinutes nudges its agent once', { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await poll(w, 105_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    await poll(w, 15_000)
+    expect(nudges(w)).toEqual([])
+    await drained($, w)
+    expect(nudges(w).map(m => m.text)).toEqual([
+      `[orchestrator mod] your background command "run the tests" (id b1) is still running after 2 min; check it (e.g. a suspended process) or stop it (TaskStop). Output: ${out('b1')}`,
+    ])
+    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBe(true)
+    expect(await logged(w, 'impl-2: background command "run the tests" (b1) still running after 2 min: nudged')).toBe(true)
+    await poll(w, 600_000)
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test("main's shell past the ceiling is a warning toast, not a prompt", { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await start($)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    await poll(w, 120_000)
+    await drained($, w)
+    const warned = (id: string) => w.toasts.filter(t => t.includes(`main thread: background command "run the tests" (${id}) still running after 2 min`))
+    expect(warned('m1')).toHaveLength(1)
+    expect(w.prompts.filter(p => p.includes('background command'))).toEqual([])
+    expect(w.sent.filter(m => m.text.includes('background command'))).toEqual([])
+    await poll(w, 600_000)
+    expect(warned('m1')).toHaveLength(1)
+  })
+
+  test('shellCeilingMinutes 0 never nudges', { options: { shellCeilingMinutes: 0 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await poll(w, 24 * 3_600_000)
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBeUndefined()
+  })
+
+  test('a nudge for an agent no longer live is dropped unsent', async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await poll(w, 60_000)
+    const outbox = () => (JSON.parse(w.files.get(STATE)!) as { outbox: { text: string }[] }).outbox
+    expect(outbox().some(d => d.text.includes('(id b1)'))).toBe(true)
+    // The engine no longer lists it: sync marks it done before any turn end delivers.
+    w.agents = [{ id: 'agent1', name: 'impl-1' }]
+    await poll(w, 30_000)
+    expect(row(w, 'agent2')!.status).toBe('done')
+    await drained($, w)
+    expect(nudges(w)).toEqual([])
+  })
+})

@@ -1379,6 +1379,19 @@ async function shellEnded($: $, shellId: string, exit: ShellExit) {
 
 /** Tracks a Bash call an agent (or main) sent to the background, and drops a shell a TaskStop stopped. */
 async function noteShell($: $, agentId: string, tool: string, args: Record<string, unknown>, res: object) {
+  // A call naming a finished shell's id or output path (Read, TaskOutput, cat) picked it up.
+  const own = (await read($, agentsAtom)).find(a => a.id === agentId)
+  if (own?.shells?.some(s => s.exit !== undefined)) {
+    const mention = JSON.stringify(args)
+    const kept = own.shells.length
+    let left = kept
+    await update($, agentsAtom, l => {
+      const next = pickUpShells(l, agentId, mention)
+      left = next.find(a => a.id === agentId)?.shells?.length ?? 0
+      return next
+    })
+    if (left !== kept) await persist($)
+  }
   if (tool === 'Bash') {
     const bg = backgroundedShell(res)
     if (!bg) return
@@ -1434,6 +1447,11 @@ async function shellTick($: $) {
         }
       }
     }
+    try {
+      await shellDeadlines($, await $.clock.now())
+    } catch (err) {
+      $.ui.log(`orchestrator: background command nudges not checked: ${String(err)}`)
+    }
   } catch (err) {
     try {
       $.ui.log(`orchestrator: background commands not polled: ${String(err)}`)
@@ -1442,6 +1460,44 @@ async function shellTick($: $) {
     }
   } finally {
     shellTicking = false
+  }
+}
+
+/**
+ * From the poll: queues one nudge to an idle agent whose finished shells went unpicked for the grace (then counts
+ * them picked up, so it is sent once), and one about each shell past the ceiling (main: a warning, never a prompt).
+ * Every nudge is live-only and rides the outbox. Never throws.
+ */
+async function shellDeadlines($: $, now: number) {
+  try {
+    const rows = await read($, agentsAtom)
+    let changed = false
+    for (const r of graceDue(rows, now, cfg.shellGraceSeconds * 1000)) {
+      const finished = (r.shells ?? []).filter(s => s.exit !== undefined)
+      await enqueue($, { agentId: r.id, text: shellNudge(finished), what: `shell nudge for ${label(r)} not delivered`, liveOnly: true })
+      await update($, agentsAtom, l => pickUpShells(l, r.id))
+      changed = true
+      await log($, `${label(r)}: nudged about finished background command(s) ${finished.map(s => s.id).join(', ')}`)
+    }
+    const minutes = cfg.shellCeilingMinutes
+    for (const { row: r, shell } of ceilingDue(rows, now, minutes * 60_000)) {
+      await update($, agentsAtom, l => markCeiling(l, shell.id))
+      changed = true
+      const what = `${label(r)}: background command "${shellName(shell)}" (${shell.id}) still running after ${minutes} min`
+      if (r.id === 'main') {
+        await log($, what, 'warn')
+      } else {
+        await enqueue($, { agentId: r.id, text: ceilingNudge(shell, minutes), what: `ceiling nudge for ${label(r)} not delivered`, liveOnly: true })
+        await log($, `${what}: nudged`)
+      }
+    }
+    if (changed) await persist($)
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: background command nudges not checked: ${String(err)}`)
+    } catch {
+      // nothing more to do
+    }
   }
 }
 
@@ -1668,7 +1724,14 @@ export const register: Register = (on, options) => {
       const tokens = contextOf(res.usage)
       // The answering model wins over the requested one; an engine without effort leaves it out.
       const ran = { model: res.usage?.model ?? e.model, effort: e.effort === undefined ? undefined : String(e.effort) }
-      await update($, agentsAtom, l => patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran))
+      const before = (await read($, agentsAtom)).find(a => a.id === id)
+      // A new run (its first step since a turn end; main at any step) has seen its finished shells' notices.
+      const newRun = before !== undefined && before.status !== 'running' && before.status !== 'handing-over'
+      const pickUp = (id === 'main' || newRun) && !!before?.shells?.some(s => s.exit !== undefined)
+      await update($, agentsAtom, l => {
+        const stepped = patch(recordStep(l, { id, tokens, t: now, tools: res.toolUses.length }), id, ran)
+        return pickUp ? pickUpShells(stepped, id) : stepped
+      })
       try {
         // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
         if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now, true)
