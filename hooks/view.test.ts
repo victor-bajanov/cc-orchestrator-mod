@@ -45,6 +45,7 @@ import {
   transcriptItems,
   transcriptView,
   watchdogDue,
+  watchdogTurnEnded,
 } from './view'
 import type { SessionMessage, ToolUseSummary } from 'claude-code'
 import type { AgentRow, AgentStatus, TranscriptItem } from '../types'
@@ -937,6 +938,13 @@ describe('watchdogDue', () => {
 
   test('idleMs 0: none', () => {
     expect(watchdogDue([idle()], listed({ a: 'idle' }), 10 * MIN, 0)).toEqual([])
+  })
+
+  test('watchdogTurnEnded counts one more turn end on the watchdog given, and nothing without one', () => {
+    expect(watchdogTurnEnded({ t: 5, ends: 0 })).toEqual({ watchdog: { t: 5, ends: 1 } })
+    expect(watchdogTurnEnded({ t: 5, ends: 1 })).toEqual({ watchdog: { t: 5, ends: 2 } })
+    expect(watchdogTurnEnded(undefined)).toBeUndefined()
+    expect({ a: 1, ...watchdogTurnEnded(undefined) }).toEqual({ a: 1 })
   })
 })
 

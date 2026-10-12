@@ -635,6 +635,9 @@ export const watchdogDue = (rows: readonly AgentRow[], engine: ReadonlyMap<strin
           (r.watchdog === undefined || r.watchdog.ends >= 2),
       )
 
+/** The patch counting one more turn end since the idle watchdog's nudge; undefined (nothing to patch) without one. */
+export const watchdogTurnEnded = (w?: AgentRow['watchdog']) => w && { watchdog: { ...w, ends: w.ends + 1 } }
+
 /**
  * Whether a child's final answer goes to its parent agent, and whether it may repeat what the child
  * already sent. Skipped: a parent that is main or unknown (the engine tells main), a teammate or a

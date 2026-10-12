@@ -78,6 +78,7 @@ import {
   transcriptItems,
   transcriptView,
   watchdogDue,
+  watchdogTurnEnded,
 } from './view'
 import type { TranscriptLine } from './view'
 
@@ -1308,7 +1309,7 @@ async function onAgentEnd($: $, id: string, answer: string, reason = 'answer') {
   // handover keeps it, for the replacement to inherit (or for the note-writing run it is woken for).
   // A turn ended since the idle watchdog's nudge: one besides the nudge's own run re-arms it.
   await update($, agentsAtom, l =>
-    patch(l, id, { report: undefined, ...(r.watchdog && { watchdog: { ...r.watchdog, ends: r.watchdog.ends + 1 } }) }),
+    patch(l, id, { report: undefined, ...watchdogTurnEnded(l.find(a => a.id === id)?.watchdog) }),
   )
   // A stalled handover is settled by its end like any other: by the note, if it wrote one late.
   if (r.status === 'handing-over' || r.status === 'stalled') {
