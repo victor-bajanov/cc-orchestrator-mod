@@ -1119,11 +1119,12 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
  * Ends every tracked open shell a turn end's `background_tasks` no longer lists (the engine drops a finished one):
  * with the code its file holds, else `unknown`. It catches what polling missed. A missing list does nothing.
  * `rows` are those read before the hook's `next`: a shell tracked while it ran is missing from the list, not gone.
+ * Only `agentId`'s own shells: the stopping agent's.
  */
-async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] | undefined) {
+async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] | undefined, agentId: string) {
   if (!rows) return
   try {
-    for (const { shell } of goneShells(rows, tasks)) {
+    for (const { shell } of goneShells(rows, tasks).filter(g => g.agentId === agentId)) {
       await shellEnded($, shell.id, (await readExit($, shell.outputPath)) ?? 'unknown')
     }
   } catch (err) {
@@ -1134,9 +1135,13 @@ async function reconcileShells($: $, tasks: unknown, rows: readonly AgentRow[] |
 /**
  * The hook on both turn ends (`classic.Stop`, `classic.SubagentStop`): bookkeeping after `next`, never a send, and it
  * never changes the answer. The rows are read before `next`, as the list was taken: a shell tracked while the hooks
- * beneath ran is not in it, yet still running.
+ * beneath ran is not in it, yet still running. Only the stopping agent's shells: `agent_id`, absent on main's Stop.
  */
-async function reconcileAtStop<E extends { background_tasks?: unknown }, R>($: $, e: E, next: (e: E) => Promise<R>) {
+async function reconcileAtStop<E extends { background_tasks?: unknown; agent_id?: string }, R>(
+  $: $,
+  e: E,
+  next: (e: E) => Promise<R>,
+) {
   let before: AgentRow[] | undefined
   try {
     before = await read($, agentsAtom)
@@ -1145,7 +1150,7 @@ async function reconcileAtStop<E extends { background_tasks?: unknown }, R>($: $
   }
   const res = await next(e)
   try {
-    await reconcileShells($, e.background_tasks, before)
+    await reconcileShells($, e.background_tasks, before, e.agent_id ?? 'main')
   } catch {
     // see above
   }

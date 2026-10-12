@@ -3272,8 +3272,8 @@ describe('background shells: reconciled at turn ends', () => {
     await bgBash($, w, 'agent2', 'b1')
     endOutput(w, 'b1', 0)
     const writes = w.writes.length
-    // Listed by another agent's turn end: the list is session-wide.
-    await subagentStop($, 'agent1', [task('b1'), { id: 'a9', type: 'subagent', status: 'running', description: 'x' }])
+    // The list is session-wide: other agents' work is in it too.
+    await subagentStop($, 'agent2', [task('b1'), { id: 'a9', type: 'subagent', status: 'running', description: 'x' }])
     expect(exits(w)).toEqual([['b1', undefined]])
     expect(w.writes.length).toBe(writes)
   })
@@ -3283,11 +3283,33 @@ describe('background shells: reconciled at turn ends', () => {
     await family($, w)
     await step($)
     await bgBash($, w, undefined, 'm1')
-    await bgBash($, w, 'agent2', 'b1')
     endOutput(w, 'm1', 0)
     await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
     expect(exits(w, 'main')).toEqual([['m1', 0]])
-    expect(exits(w)).toEqual([['b1', 'unknown']])
+  })
+
+  test("another agent's tracked shell missing from background_tasks at this agent's SubagentStop stays open", opts, async ($, on) => {
+    // Only the stopping agent's own shells are reconciled at its turn end.
+    const w = stopWorld(on)
+    await family($, w)
+    await bgBash($, w, 'agent1', 'a1')
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await subagentStop($, 'agent1', [])
+    expect(exits(w, 'agent1')).toEqual([['a1', 'unknown']])
+    expect(exits(w)).toEqual([['b1', undefined]])
+  })
+
+  test("a subagent's shell missing at main's Stop stays open", opts, async ($, on) => {
+    const w = stopWorld(on)
+    await family($, w)
+    await step($)
+    await bgBash($, w, undefined, 'm1')
+    await bgBash($, w, 'agent2', 'b1')
+    endOutput(w, 'b1', 0)
+    await $.classic.Stop({ stop_hook_active: false, background_tasks: [] } as never)
+    expect(exits(w, 'main')).toEqual([['m1', 'unknown']])
+    expect(exits(w)).toEqual([['b1', undefined]])
   })
 
   test('no background_tasks field changes nothing', opts, async ($, on) => {
