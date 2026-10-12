@@ -1533,9 +1533,25 @@ async function shellDeadlines($: $, now: number) {
     const graceMs = cfg.shellGraceSeconds * 1000
     const minutes = cfg.shellCeilingMinutes
     // The engine's list only when something is due: a row the engine has finished gets no nudge.
-    if (!graceDue(rows, now, graceMs).length && !ceilingDue(rows, now, minutes * 60_000).length) return
-    const engine = new Map((await $.agent.list()).map(a => [a.id, String(a.status)]))
+    const graceAny = graceDue(rows, now, graceMs)
+    const ceilingAny = ceilingDue(rows, now, minutes * 60_000)
+    if (!graceAny.length && !ceilingAny.length) return
+    // A list that fails leaves every row eligible: drain's live-only check still guards delivery.
+    const engine = await $.agent.list().then(
+      l => new Map(l.map(a => [a.id, String(a.status)])),
+      () => undefined,
+    )
     let changed = false
+    // A row the engine lists as ended is settled unnudged, so no later tick asks the engine about it again.
+    const ended = (id: string) => ['completed', 'failed', 'killed'].includes(engine?.get(id) ?? '')
+    for (const r of graceAny.filter(r => ended(r.id))) {
+      await update($, agentsAtom, l => pickUpShells(l, r.id))
+      changed = true
+    }
+    for (const { shell } of ceilingAny.filter(d => ended(d.row.id))) {
+      await update($, agentsAtom, l => markCeiling(l, shell.id))
+      changed = true
+    }
     for (const r of graceDue(rows, now, graceMs, engine)) {
       const finished = (r.shells ?? []).filter(s => s.exit !== undefined)
       await enqueue($, { agentId: r.id, text: shellNudge(finished), what: `shell nudge for ${label(r)} not delivered`, liveOnly: true })

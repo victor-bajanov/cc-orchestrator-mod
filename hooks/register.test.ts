@@ -5668,6 +5668,42 @@ describe('background shells: grace and ceiling nudges', () => {
     await poll(w, 600_000)
     await drained($, w)
     expect(nudges(w)).toEqual([])
-    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBeUndefined()
+    // Settled without a nudge, so later ticks don't ask the engine about it again.
+    expect(row(w, 'agent2')!.shells![0]!.ceilingNudged).toBe(true)
+  })
+
+  test("a failing agent list still nudges an idle agent's finished shell", async ($, on) => {
+    const w = world(on)
+    await idleWithEnded($, w, 'b1')
+    await poll(w, 45_000)
+    // Only at the grace's tick (75 s from the start, between two syncs) does the engine's list fail.
+    const broken = Promise.reject(new Error('list broke'))
+    broken.catch(() => undefined)
+    w.holdList = broken
+    await poll(w, 15_000)
+    w.holdList = undefined
+    await drained($, w)
+    expect(nudges(w)).toHaveLength(1)
+  })
+
+  test("an engine-ended row's shells are settled once, so the next tick lists the engine no more", { options: { shellCeilingMinutes: 2 } }, async ($, on) => {
+    const w = world(on)
+    await family($, w)
+    await bgBash($, w, 'agent2', 'b1')
+    await bgBash($, w, 'agent1', 'b2')
+    await complete($, 'agent2')
+    await complete($, 'agent1')
+    endOutput(w, 'b1', 0)
+    await poll(w)
+    w.agents = [
+      { id: 'agent1', name: 'impl-1', status: 'killed' },
+      { id: 'agent2', name: 'impl-2', status: 'completed' },
+    ]
+    await poll(w, 120_000)
+    await drained($, w)
+    expect(nudges(w, 'agent')).toEqual([])
+    // Nothing left due: the finished shell is dropped, the open one marked past its ceiling.
+    expect(row(w, 'agent2')!.shells).toEqual([])
+    expect(row(w, 'agent1')!.shells!.map(s => [s.id, s.ceilingNudged])).toEqual([['b2', true]])
   })
 })
