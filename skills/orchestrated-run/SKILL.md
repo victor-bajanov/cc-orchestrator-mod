@@ -59,9 +59,10 @@ Hard ceiling 500k tokens per agent; the mod acts at `agentThreshold` (450k).
 2. Past the threshold, gives the agent `HANDOVER` with a note path under `.orchestrator/<run>/handover/`: with its next tool result while it works (a busy teammate reads messages only between turns), or as a message when it is idle.
 3. Once the agent ends with the note written, spawns a replacement: the original brief, type and model, plus "start from the handover note at …". A named agent's replacement gets the name with a suffix while the original holds it (`impl-3` → `impl-3-2`).
 4. Tells the old agent's parent: `[orchestrator mod] Agent <name> (id …) … handed over … Replacement id … (SendMessage name "…") … do not spawn another.`
+5. If the spawn fails: `[orchestrator mod] Agent <name> … handed over …, but no replacement started: <reason>. … Spawn the replacement yourself …`
 
 **What the orchestrator must do** (put this in the brief):
-- On an `[orchestrator mod]` notice: **don't spawn a replacement**, update the task roster (old → new name and id), and send all later messages for that task (adjudicated fix lists, re-review requests) to the **new name** the notice gives. An implementer mid-review-loop hands the loop over in its note.
+- On an `[orchestrator mod]` notice: **don't spawn a replacement** unless the notice says `no replacement started` (then spawn one as it says: same name, type and model, the brief file as the prompt, and record the new name and id); update the task roster (old → new name and id), and send all later messages for that task (adjudicated fix lists, re-review requests) to the **new name** the notice gives. An implementer mid-review-loop hands the loop over in its note.
 - On an `[orchestrator mod] You are registered as <name> …` notice: that is its real name. It uses that name in every later child's clause, and tells children already running to SendMessage that name.
 - Never hand agents over itself, and never send `HANDOVER` on its own initiative.
 - Its own handover works the same way: its note lists every live child (name, id, state) and the task roster path, and its replacement adopts them.

@@ -93,6 +93,15 @@ describe('paneHeader', () => {
       '2 live · 1 handed over · limits 450k / main 300k (ask, offered)',
     )
   })
+  test('counts respawn-failed rows as not replaced, before the limits; none adds nothing', () => {
+    const failed = [...rows, row({ id: 'f', status: 'respawn-failed' })]
+    expect(paneHeader(failed, { agentThreshold: 450_000, mainThreshold: 300_000, mainMode: 'ask', phase: 'idle' })).toContain(
+      '· 1 not replaced · limits',
+    )
+    expect(paneHeader(rows, { agentThreshold: 450_000, mainThreshold: 300_000, mainMode: 'ask', phase: 'idle' })).not.toContain(
+      'not replaced',
+    )
+  })
   test('leaves the phase out when idle', () => {
     expect(
       paneHeader(rows, { agentThreshold: 450_000, mainThreshold: 300_000, mainMode: 'ask', phase: 'idle' }).endsWith('(ask)'),
@@ -437,6 +446,7 @@ describe('statusStyle', () => {
     expect(statusStyle('stalled')).toEqual({ color: 'error', bold: true })
     expect(statusStyle('handing-over')).toEqual({ color: 'suggestion', bold: true })
     expect(statusStyle('replaced')).toEqual({ color: 'inactive', dimColor: true })
+    expect(statusStyle('respawn-failed')).toEqual({ color: 'error', bold: true })
   })
 })
 
@@ -455,6 +465,7 @@ describe('runnerFor and statusEmoji', () => {
     expect(statusEmoji('stalled', 'x')).toBe('🛑')
     expect(statusEmoji('handing-over', 'x')).toBe('📝')
     expect(statusEmoji('replaced', 'x')).toBe('♻️')
+    expect(statusEmoji('respawn-failed', 'x')).toBe('⚠️')
     for (const id of ['a', 'b', 'agent3']) expect(statusEmoji('running', id)).toBe(runnerFor(id))
   })
 })
@@ -994,6 +1005,11 @@ describe('collapse', () => {
       row({ id: 'e', parentId: 'main', status: 'replaced' }),
     ]
     expect(ids(collapseHidden(rows, ['main']))).toEqual(['a', 'e'])
+  })
+
+  test('collapsing never hides a respawn-failed descendant', () => {
+    expect(ids(collapseHidden(tree({ d2: { status: 'respawn-failed' } }), ['o']))).toEqual(['d1'])
+    expect(ids(collapseHidden(tree({ d2: { status: 'respawn-failed' } }), ['main']))).toEqual(['d1'])
   })
 
   test('a stale id or a childless row hides nothing; hiddenCount matches', () => {

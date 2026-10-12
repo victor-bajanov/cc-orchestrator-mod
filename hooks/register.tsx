@@ -6,6 +6,7 @@ import { bodyOf, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
   HANDOVER_CLAUSE,
+  briefPathFor,
   contextOf,
   fmtTokens,
   handoverMessage,
@@ -18,6 +19,7 @@ import {
   orderRows,
   recordStep,
   replacementPrompt,
+  respawnFailedNotice,
   resumePrompt,
   rosterMarkdown,
   timeline,
@@ -767,12 +769,52 @@ async function registeredName($: $, id: string, requested: string | undefined) {
   }
 }
 
+/** A respawn that did not start a replacement: marks the gap, saves the brief, and tells the parent, the person and the log. Never throws. */
+async function respawnFailed($: $, old: AgentRow, reason: string) {
+  try {
+    await update($, agentsAtom, l => patch(l, old.id, { status: 'respawn-failed', ...DISARMED }))
+    let briefPath: string | undefined
+    if (old.brief && old.notePath) {
+      try {
+        briefPath = briefPathFor(old.notePath)
+        await $.fs.write(briefPath, replacementPrompt(old.brief, old.notePath))
+      } catch {
+        briefPath = undefined
+      }
+    }
+    const rows = await read($, agentsAtom)
+    // A parent that handed over is carried on by its replacement: the notice goes there.
+    const to = latest(rows, old.parentId ?? 'main')
+    const text = respawnFailedNotice({
+      label: label(old),
+      id: old.id,
+      notePath: old.notePath ?? '(none)',
+      reason,
+      brief: old.brief,
+      briefPath,
+    })
+    const toRow = rows.find(r => r.id === to)
+    await log($, `${label(old)}: no replacement started (${reason}); told ${to === 'main' ? 'main' : toRow ? label(toRow) : to}`, 'warn')
+    // A refused notification is fine: the toast said it.
+    void $.ui.notify(`${label(old)} handed over, but no replacement started`, { title: 'orchestrator' }).catch(() => undefined)
+    if (to === 'main') $.clock.after(0, () => void $.prompt.submit({ text }))
+    else {
+      const sent = await sendOwn($, to, text)
+      if (!sent.isDelivered) await log($, `${label(old)}: parent not told of the failed respawn (${sent.reason})`, 'warn')
+    }
+    await persist($)
+  } catch (err) {
+    try {
+      $.ui.log(`orchestrator: failed respawn not reported: ${String(err)}`)
+    } catch {
+      // nothing more
+    }
+  }
+}
+
 async function respawn($: $, old: AgentRow) {
   const brief = old.brief
-  if (!brief || !old.notePath) {
-    await log($, `${label(old)}: no brief recorded, cannot respawn`, 'warn')
-    return
-  }
+  if (!brief || !old.notePath) return respawnFailed($, old, 'no brief recorded')
   lastSpawned = undefined
   const args = {
     prompt: replacementPrompt(brief, old.notePath),
@@ -781,12 +823,14 @@ async function respawn($: $, old: AgentRow) {
     model: brief.model,
     name: brief.name,
   }
-  const res = await callOwn($, { tool: 'Agent', prompt: args.prompt }, () => $.agent.spawn(args))
-  const newId = res.agentId ?? lastSpawned
-  if (res.deny !== undefined || !newId) {
-    await log($, `${label(old)}: respawn refused (${res.deny ?? 'no agent id'})`, 'warn')
-    return
+  let res: Awaited<ReturnType<typeof $.agent.spawn>>
+  try {
+    res = await callOwn($, { tool: 'Agent', prompt: args.prompt }, () => $.agent.spawn(args))
+  } catch (err) {
+    return respawnFailed($, old, `spawn failed: ${String(err)}`)
   }
+  const newId = res.agentId ?? lastSpawned
+  if (res.deny !== undefined || !newId) return respawnFailed($, old, res.deny ?? 'no agent id')
   // A teammate's name is suffixed when the original still holds it; the engine delivers its final reply itself.
   const info = (await $.agent.list()).find(a => a.id === newId)
   const name = info?.name ?? brief.name
@@ -1114,7 +1158,7 @@ async function sync($: $) {
     if (r.status === 'handing-over' && r.handoverAt && now - r.handoverAt > STALL_MS) {
       await update($, agentsAtom, l => patch(l, r.id, { status: 'stalled' }))
       await log($, `${label(r)} has not handed over after ${Math.round(STALL_MS / 60_000)} min`, 'warn')
-      void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' })
+      void $.ui.notify(`${label(r)} has not handed over`, { title: 'orchestrator' }).catch(() => undefined)
       changed = true
     } else if (isActive(r) && !listed.has(r.id) && !resumedRunning(r, now)) {
       await update($, agentsAtom, l => patch(l, r.id, { status: 'done' }))
@@ -1301,6 +1345,20 @@ export const register: Register = (on, options) => {
       },
     ])
     await log($, `spawned ${name ?? e.description} (${id})`)
+    // A parent's own replacement for a failed respawn names the old agent's note: link the two.
+    // Only the agent told of the gap (the old parent's latest) links it: not by name, which the engine may suffix.
+    const rows = await read($, agentsAtom)
+    const gap = rows.find(
+      r =>
+        r.status === 'respawn-failed' &&
+        r.notePath &&
+        e.prompt.includes(r.notePath) &&
+        (e.parentAgentId ?? 'main') === latest(rows, r.parentId ?? 'main'),
+    )
+    if (gap) {
+      await update($, agentsAtom, l => patch(patch(l, gap.id, { status: 'replaced', replacedBy: id }), id, { replaces: gap.id }))
+      await log($, `${label(gap)}: ${name ?? id} (${id}) takes over from its note`)
+    }
     await persist($)
     // Off the spawn's path: the Agent result and the pane never wait on the engine's list.
     void registeredName($, id, e.name)
@@ -1865,6 +1923,7 @@ export const register: Register = (on, options) => {
       replaced: '⤳',
       done: '✓',
       stalled: '!',
+      'respawn-failed': '✗',
     }
     const selected = liveSelection(visible, await read($, selectedAtom))
     // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.

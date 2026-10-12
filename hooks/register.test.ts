@@ -87,6 +87,8 @@ const world = (on: On) => {
     duringSpawn: undefined as ((check: (input: Record<string, unknown>) => Promise<string>) => Promise<unknown>) | undefined,
     /** The next spawn is refused with this reason ('' none); 'throw' makes it throw. Refused spawns are not recorded. */
     spawnDeny: '' as string,
+    /** `ui.notify` refuses with this reason while set ('' none). */
+    notifyDeny: '' as string,
   }
   mock.env(on, { HOME: '/home/u' })
   mock.store(on)
@@ -199,7 +201,7 @@ const world = (on: On) => {
     w.status = e.text
     return { value: undefined }
   })
-  on('ui.notify', () => ({ value: { isSent: true, channel: 'terminal_bell' } }))
+  on('ui.notify', () => (w.notifyDeny ? ({ deny: w.notifyDeny } as never) : { value: { isSent: true, channel: 'terminal_bell' } }))
   on('ui.close', ($, e) => {
     w.closed.push(e.id)
     return { value: undefined }
@@ -3541,7 +3543,7 @@ describe("auto mode: the mod's own spawn", () => {
     expect(w.spawnChecks).toEqual(['allow'])
     expect(w.spawns).toHaveLength(2)
     expect(row(w, 'agent2')!.replaces).toBe('agent1')
-    expect(w.toasts.some(t => t.includes('respawn refused'))).toBe(false)
+    expect(w.toasts.some(t => t.includes('no replacement started'))).toBe(false)
   })
 
   test('the prompt with and without the HANDOVER clause is the mod\'s; anything else is not', () => {
@@ -3607,6 +3609,159 @@ describe("auto mode: the mod's own spawn", () => {
     await start($)
     expect((await $.tool.check({ tool: 'Agent', input: null } as never)).decision).toBe('ask')
     expect((await $.tool.check({ tool: 'Agent', input: { prompt: 7 } } as never)).decision).toBe('ask')
+  })
+})
+
+describe('a respawn that fails', () => {
+  const NOTE2 = `${RUN_DIR}/handover/impl-2-agent2-1.md`
+  const BRIEF2 = `${RUN_DIR}/handover/impl-2-agent2-1.brief.md`
+  /** agent2 (impl-2, under agent1) at 460k is sent HANDOVER, writes its note and ends; its respawn then fails. */
+  const failChild = async ($: Engine, w: World, deny = 'nope') => {
+    await family($, w)
+    w.spawnDeny = deny
+    w.tokens.set('agent2', 460_000)
+    await step($, 'agent2')
+    await tool($, 'agent2')
+    w.files.set(NOTE2, 'x')
+    await complete($, 'agent2', 'HANDED OVER')
+    await w.clock.settle()
+  }
+  type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
+  const walk = (n: unknown): Drawn[] =>
+    n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
+  const textOf = (n: unknown): string =>
+    typeof n === 'string' ? n : n && typeof n === 'object' ? ((n as Drawn).children ?? []).map(textOf).join('') : ''
+
+  test('a refused respawn marks the gap and tells the parent agent how to respawn', async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    const told = w.sent.filter(m => m.to.includes('agent1') && m.text.includes('no replacement started: nope'))
+    expect(told).toHaveLength(1)
+    for (const s of [NOTE2, 'name "impl-2"', '.brief.md']) expect(told[0]!.text).toContain(s)
+    const brief = w.files.get(BRIEF2)!
+    expect(brief.startsWith('P2')).toBe(true)
+    expect(brief).toContain(NOTE2)
+    expect(w.toasts.some(t => t.includes('no replacement started'))).toBe(true)
+  })
+
+  test("main's child: the failure is submitted to main as a prompt", async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.spawnDeny = 'nope'
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    const told = w.prompts.filter(p => p.includes('no replacement started'))
+    expect(told).toHaveLength(1)
+    expect(told[0]).toContain('agent1')
+    expect(w.sent.some(m => m.text.includes('no replacement started'))).toBe(false)
+  })
+
+  test('a spawn that throws is a failed respawn', async ($, on) => {
+    const w = world(on)
+    await failChild($, w, 'throw')
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    // The test kit hands the mod's spawn hook a throw beneath it as `no implementation`, not the original error.
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('no replacement started: spawn failed: '))).toBe(true)
+  })
+
+  test('an agent with no brief is a failed respawn', async ($, on) => {
+    const w = world(on)
+    await start($)
+    w.agents = [{ id: 'agent9', name: 'x' }]
+    w.tokens.set('agent9', 460_000)
+    await step($, 'agent9')
+    await tool($, 'agent9')
+    w.files.set(`${RUN_DIR}/handover/x-agent9-1.md`, 'x')
+    await complete($, 'agent9', 'HANDED OVER')
+    await w.clock.settle()
+    expect(row(w, 'agent9')!.status).toBe('respawn-failed')
+    expect(w.prompts.some(p => p.includes('No brief was recorded'))).toBe(true)
+  })
+
+  test('the gap shows in both panes and the roster', async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    const desk = await mountPane($, 'desktop')
+    const deskText = (await desk.find({ key: 'row:agent2' }))!.text
+    expect(deskText).toContain('⚠️')
+    expect(deskText).toContain('respawn-failed')
+    await desk.unmount()
+    const term = await mountPane($, 'terminal')
+    const termRow = walk(await term.drawn()).find(b => b.type === 'Box' && b.props?.key === 'agent2')!
+    expect(textOf(termRow)).toContain('✗')
+    await term.unmount()
+    const roster = (await $.command.run({ command: 'orch', args: 'roster' } as never)) as { text: string }
+    expect(roster.text).toContain('| respawn-failed |')
+  })
+
+
+  test('a refused notification leaves no unhandled rejection; the gap is still marked and told', async ($, on) => {
+    const w = world(on)
+    w.notifyDeny = 'no'
+    // The sandbox has no `process`: the test kit itself fails the file on "a rejection nothing handled".
+    await failChild($, w)
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    expect(w.sent.some(m => m.to.includes('agent1') && m.text.includes('no replacement started'))).toBe(true)
+  })
+
+  test('a refused stall notification leaves no unhandled rejection', async ($, on) => {
+    const w = world(on)
+    w.notifyDeny = 'no'
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    await w.clock.advance(20 * 60_000 + 30_000)
+    await w.clock.settle()
+    expect(row(w, 'agent1')!.status).toBe('stalled')
+  })
+
+  test("a spawn by another agent naming the note is not linked as the replacement", async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    await spawn($, { prompt: w.files.get(BRIEF2)!, name: 'impl-2', parentAgentId: 'agent9' })
+    expect(row(w, 'agent2')!.status).toBe('respawn-failed')
+    expect(row(w, 'agent2')!.replacedBy).toBeUndefined()
+  })
+
+  test("the parent's own spawn from the brief file is linked as the replacement", async ($, on) => {
+    const w = world(on)
+    await failChild($, w)
+    await spawn($, { prompt: w.files.get(BRIEF2)!, name: 'impl-2', parentAgentId: 'agent1' })
+    expect(row(w, 'agent2')).toEqual(expect.objectContaining({ status: 'replaced', replacedBy: 'agent3' }))
+    expect(row(w, 'agent3')!.replaces).toBe('agent2')
+  })
+
+  test('the scripted reply no longer claims the spawn', async ($, on) => {
+    const w = world(on)
+    await running($, w)
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    const res = await tool($, 'agent1')
+    const handover = (res.context ?? []).find(c => c.includes('HANDOVER'))!
+    expect(handover).toContain('will spawn the replacement')
+  })
+
+  test('under auto mode with the allow in place, a respawn is not reported as failed', async ($, on) => {
+    const w = world(on)
+    autoMode($, on, w)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await tool($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    await w.clock.settle()
+    expect(w.spawns).toHaveLength(2)
+    expect(w.toasts.some(t => t.includes('no replacement started'))).toBe(false)
+    expect(w.prompts.some(p => p.includes('no replacement started'))).toBe(false)
   })
 })
 

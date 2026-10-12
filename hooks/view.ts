@@ -12,7 +12,7 @@ export const LIMIT_COLOR = '#DC2626'
 /** Statuses the pane draws as live. */
 export const LIVE: readonly AgentStatus[] = ['running', 'idle', 'handing-over']
 
-/** Today's terminal header: live and handed-over subagents, the limits, the main mode and any phase. */
+/** Today's terminal header: live, handed-over and (when any) not-replaced subagents, the limits, the main mode and any phase. */
 export const paneHeader = (
   rows: readonly AgentRow[],
   o: { agentThreshold: number; mainThreshold: number; mainMode: string; phase: MainPhase },
@@ -20,7 +20,8 @@ export const paneHeader = (
   const subs = rows.filter(r => r.id !== 'main')
   const live = subs.filter(r => LIVE.includes(r.status)).length
   const replaced = subs.filter(r => r.status === 'replaced').length
-  return `${live} live · ${replaced} handed over · limits ${fmtTokens(o.agentThreshold)} / main ${fmtTokens(o.mainThreshold)} (${o.mainMode}${o.phase !== 'idle' ? `, ${o.phase}` : ''})`
+  const failed = subs.filter(r => r.status === 'respawn-failed').length
+  return `${live} live · ${replaced} handed over${failed ? ` · ${failed} not replaced` : ''} · limits ${fmtTokens(o.agentThreshold)} / main ${fmtTokens(o.mainThreshold)} (${o.mainMode}${o.phase !== 'idle' ? `, ${o.phase}` : ''})`
 }
 
 /** Whether either pane offers Hand over main: only in ask mode, and not while main is already handing over. */
@@ -127,6 +128,8 @@ export const statusStyle = (status: DisplayStatus): { color: string; dimColor?: 
       return { color: 'suggestion', bold: true }
     case 'replaced':
       return { color: 'inactive', dimColor: true }
+    case 'respawn-failed':
+      return { color: 'error', bold: true }
   }
 }
 
@@ -160,6 +163,8 @@ export const statusEmoji = (status: DisplayStatus, id: string): string => {
       return '📝'
     case 'replaced':
       return '♻️'
+    case 'respawn-failed':
+      return '⚠️'
   }
 }
 

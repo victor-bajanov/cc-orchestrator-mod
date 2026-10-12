@@ -45,11 +45,11 @@ export const recordStep = (rows: AgentRow[], step: Step): AgentRow[] => {
       ? r
       : {
           ...r,
-          // A step proves it alive: idle wakes, and done was resumed by a message. A stalled
+          // A step proves it alive: idle wakes, and done (or respawn-failed) was resumed by a message. A stalled
           // handover stays stalled: its run's end checks for the note it may still be writing and
           // marks it replaced or done, which running would skip (its end would only set idle).
-          status: r.status === 'idle' || r.status === 'done' ? 'running' : r.status,
-          ...(r.status === 'done' ? { resumedAt: step.t } : {}),
+          status: r.status === 'idle' || r.status === 'done' || r.status === 'respawn-failed' ? 'running' : r.status,
+          ...(r.status === 'done' || r.status === 'respawn-failed' ? { resumedAt: step.t } : {}),
           tokens: step.tokens,
           peak: Math.max(r.peak, step.tokens),
           steps: r.steps + 1,
@@ -167,7 +167,7 @@ export const handoverMessage = (notePath: string, isRespawned: boolean): string 
   [
     `HANDOVER. Your context is near its ceiling. Stop at the next safe point and write your cold-restart handover note to ${notePath}.`,
     isRespawned
-      ? `Then end with this final reply and nothing else: "HANDED OVER: note at ${notePath}. The orchestrator mod has spawned the replacement with my brief; no action needed."`
+      ? `Then end with this final reply and nothing else: "HANDED OVER: note at ${notePath}. The orchestrator mod will spawn the replacement with my brief and tell you; no action needed unless it reports that none started."`
       : `Then end with this final reply: "HANDED OVER: note at ${notePath}. Please spawn a replacement with my original brief plus: start from the handover note at ${notePath}."`,
   ].join(' ')
 
@@ -177,6 +177,37 @@ export const replacementPrompt = (brief: Brief, notePath: string): string =>
 /** Tells an agent the engine registered it under a suffixed name, so its children report to the right one. */
 export const nameNotice = (name: string, requested: string): string =>
   `[orchestrator mod] You are registered as \`${name}\` (you asked for \`${requested}\`); tell your children to SendMessage \`${name}\`.`
+
+/** Where a failed respawn's replacement prompt is saved: beside its note, as `<note>.brief.md`. */
+export const briefPathFor = (notePath: string): string => notePath.replace(/\.md$/, '') + '.brief.md'
+
+/** Tells a parent that its child handed over but no replacement started, and how to start one itself. */
+export const respawnFailedNotice = (o: {
+  label: string
+  id: string
+  notePath: string
+  reason: string
+  brief?: Brief
+  briefPath?: string
+}): string => {
+  const head =
+    `[orchestrator mod] Agent ${o.label} (id ${o.id}) handed over (note at ${o.notePath}), but no replacement started: ${o.reason}. ` +
+    `Nothing is carrying its work now. Spawn the replacement yourself`
+  const startLine = `"Start from the handover note at ${o.notePath}: read it first and continue from its next concrete step."`
+  if (!o.brief) return `${head} with its original brief plus: ${startLine} No brief was recorded for it.`
+  const b = o.brief
+  const opts = [
+    b.name && `name "${b.name}"`,
+    `subagent_type "${b.subagentType}"`,
+    b.model && `model "${b.model}"`,
+    `description "${b.description}"`,
+  ]
+    .filter(Boolean)
+    .join(', ')
+  return o.briefPath
+    ? `${head}: the Agent tool with ${opts}, and as its prompt the text of ${o.briefPath} (its original brief plus the line to start from the note).`
+    : `${head}: the Agent tool with ${opts}, and its original brief plus: ${startLine}`
+}
 
 export const mainHandoverPrompt = (notePath: string): string =>
   [
