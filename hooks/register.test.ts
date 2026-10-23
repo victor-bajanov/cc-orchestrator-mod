@@ -2445,9 +2445,9 @@ describe('check-in', () => {
     })
   }
 
-  test('a handback alone does not disarm it', async ($, on) => {
+  test('a handback the engine refused does not disarm it', async ($, on) => {
     const w = world(on)
-    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: false, message: 'Nothing was sent' } } : undefined)
     await family($, w)
     await call($, 'agent1', CHECKIN, { agent: 'agent2', minutes: 30 })
     await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
@@ -2806,17 +2806,81 @@ describe('auto-forward', () => {
     expect(forwards(w)).toHaveLength(1)
   })
 
-  // A handback goes to the main session, not to the parent agent: it is no report to the parent.
-  test('a child that hands back, then ends with an answer, is still forwarded to its parent', async ($, on) => {
+  // The engine delivers a handback to a live parent that is no teammate (it never reaches a teammate).
+  test("a delivered handback to a live subagent parent is the run's report: not forwarded, check-in disarmed", async ($, on) => {
     const w = world(on)
     w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    await kin($, w)
+    await call($, 'agent1', 'mcp__orchestrator__checkin', { agent: 'impl-2', minutes: 10 })
+    expect(row(w, 'agent2')!.checkinAt).toBeDefined()
+    await end($, 'agent1', 'waiting')
+    await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
+    expect(row(w, 'agent2')!.checkinAt).toBeUndefined()
+    await end($, 'agent2', 'Report')
+    expect(forwards(w)).toHaveLength(0)
+  })
+
+  test('a handback refused by the engine is no report: the answer is forwarded, flagged', async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e =>
+      e.tool === 'SubagentHandback'
+        ? { result: { success: false, message: 'Nothing was sent: the agent that spawned you is no longer running.' } }
+        : undefined
     await kin($, w)
     await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
     await end($, 'agent2', 'Report')
     expect(forwards(w)).toHaveLength(1)
-    expect(forwards(w)[0]!.text).toContain('Report')
-    // It may have reached main already: flagged as a possible duplicate.
     expect(forwards(w)[0]!.text).toContain('may duplicate a message it sent you')
+  })
+
+  test("a teammate parent's child's handback is no report, even when the engine says it was delivered", async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'orch', isTeammate: true })
+    await step($, 'agent1')
+    await spawn($, { prompt: 'P2', name: 'impl-2', parentAgentId: 'agent1' })
+    await step($, 'agent2')
+    await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
+    await end($, 'agent2', 'Report')
+    expect(forwards(w)).toHaveLength(1)
+  })
+
+  test("a handback after its parent ended went to main: the answer is forwarded to the parent's replacement path", async ($, on) => {
+    const w = world(on)
+    w.toolAnswer = e => (e.tool === 'SubagentHandback' ? { result: { success: true } } : undefined)
+    await kin($, w)
+    w.agents = [{ id: 'agent2', name: 'impl-2' }]
+    await w.clock.advance(30_000)
+    expect(row(w, 'agent1')!.status).toBe('done')
+    await call($, 'agent2', 'SubagentHandback', { message: 'Report' })
+    await end($, 'agent2', 'Report')
+    expect(forwards(w)).toHaveLength(1)
+  })
+
+  // A teammate's Agent calls run in the foreground, and the engine withholds the child's answer from it.
+  test("a foreground child of a teammate parent is forwarded: its answer reaches no one else", async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'orch', isTeammate: true })
+    await step($, 'agent1')
+    await spawn($, { prompt: 'F', name: 'fg', parentAgentId: 'agent1', background: false })
+    await step($, 'agent2')
+    await end($, 'agent2', 'R: verdict')
+    expect(forwards(w)).toHaveLength(1)
+    expect(forwards(w)[0]!.text).toContain('R: verdict')
+  })
+
+  test('a child spawned by a teammate is warned about once per parent in the activity log', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'orch', isTeammate: true })
+    await spawn($, { prompt: 'A', name: 'a', parentAgentId: 'agent1' })
+    await spawn($, { prompt: 'B', name: 'b', parentAgentId: 'agent1' })
+    await w.clock.advance(10)
+    const log = w.files.get(`${RUN_DIR}/activity.log`) ?? ''
+    expect(log.split('is a teammate').length - 1).toBe(1)
+    expect(log).toContain('orch is a teammate: SubagentHandback from its children cannot reach it')
   })
 
   test('each run is judged on its own: a resumed child that does not report is forwarded', async ($, on) => {
