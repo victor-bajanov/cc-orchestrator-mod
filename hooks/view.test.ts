@@ -972,6 +972,12 @@ describe('forwardTarget', () => {
     expect(forwardTarget(child({ report: { t: 1, text: 'All done: R', ok: true, final: false } }), 'All done: R', 'answer')).toBe('skip')
   })
 
+  test("a foreground child of a teammate is forwarded: the engine withholds its answer from the teammate's Agent result", () => {
+    const rows = [row({ id: 'agent1', isTeammate: true })]
+    expect(forwardTarget(child({ background: false }), 'R', 'answer', rows)).toEqual({ agentId: 'agent1', mayDuplicate: false })
+    expect(forwardTarget(child({ background: false }), 'R', 'answer', [row({ id: 'agent1' })])).toBe('skip')
+  })
+
   test('a replacement is forwarded even when it inherited foreground', () => {
     expect(forwardTarget(child({ background: false, replaces: 'agent9' }), 'R', 'answer')).toEqual({ agentId: 'agent1', mayDuplicate: false })
     expect(forwardTarget(child({ background: false, replaces: 'agent9', isTeammate: true }), 'R', 'answer')).toBe('skip')

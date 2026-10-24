@@ -641,7 +641,7 @@ export const watchdogTurnEnded = (w?: AgentRow['watchdog']) => w && { watchdog: 
 /**
  * Whether a child's final answer goes to its parent agent, and whether it may repeat what the child
  * already sent. Skipped: a parent that is main or unknown (the engine tells main), a teammate or a
- * foreground child (its answer is delivered), a handover, an empty or unfinished answer, and a run
+ * foreground child of a subagent (its answer is delivered), a handover, an empty or unfinished answer, and a run
  * whose delivered report to the parent was its last act or says the same as the answer. A lost
  * report costs more than a duplicate, so anything else is forwarded, to the parent's `latest`.
  */
@@ -654,7 +654,10 @@ export const forwardTarget = (
   const parent = row.parentId
   if (parent === undefined || parent === 'main') return 'skip'
   // A replacement's own spawn was the mod's, so its answer reaches no one unless forwarded, foreground or not.
-  if (row.isTeammate || (row.background === false && row.replaces === undefined)) return 'skip'
+  // A teammate's Agent result withholds its child's answer (the engine expects a handback, which never reaches a
+  // teammate), so a foreground child of a teammate is forwarded too.
+  const toTeammate = rows.some(r => r.id === parent && r.isTeammate)
+  if (row.isTeammate || (row.background === false && row.replaces === undefined && !toTeammate)) return 'skip'
   if (row.status === 'handing-over' || row.status === 'stalled') return 'skip'
   if (reason !== 'answer' || answer.trim() === '') return 'skip'
   const r = row.report

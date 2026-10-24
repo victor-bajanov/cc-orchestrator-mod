@@ -194,6 +194,8 @@ export const isOwnCall = (input: unknown, inFlight: readonly OwnCall[]): boolean
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
+/** Teammates already warned that their children's handbacks cannot reach them. */
+const teammatesWarned = new Set<string>()
 /** Main is mid-turn: from its `turn.start` (main's alone) to its `turn.complete`. */
 let mainBusy = false
 /** A main handover asked for mid-turn: it starts when that turn ends. */
@@ -1095,17 +1097,21 @@ async function noteReport($: $, id: string, tool: string, args: Record<string, u
   const parentId = c.parentId ?? 'main'
   // Its parent as spawned, or the replacement now carrying that parent's work.
   const parents = [parentId, latest(rows, parentId)].map(p => rows.find(r => r.id === p) ?? { id: p })
-  // A SubagentHandback may reach main rather than the parent: it is no report to the parent (never ok), but
-  // it is noted, so the forward that follows is flagged as a possible duplicate.
-  const isReport = tool === 'SendMessage' && parents.some(p => namesAgent(args.to, p))
+  const out = res as { deny?: unknown; isError?: unknown; result?: unknown }
+  const result = out.result && typeof out.result === 'object' ? (out.result as { success?: unknown }) : {}
+  const sent = out.deny === undefined && !out.isError && result.success !== false
+  // The engine delivers a SubagentHandback to the parent only while that parent's run, or a live child, keeps it
+  // live, and never to a teammate; otherwise it goes to main or is refused. One that reached the parent is its report.
+  const spawner = rows.find(r => r.id === parentId)
+  const handedBack =
+    tool === 'SubagentHandback' && result.success === true && sent && !!spawner && LIVE.includes(spawner.status) && !spawner.isTeammate
+  const isReport = handedBack || (tool === 'SendMessage' && parents.some(p => namesAgent(args.to, p)))
   if (isReport) {
-    const out = res as { deny?: unknown; isError?: unknown; result?: unknown }
-    const result = out.result && typeof out.result === 'object' ? (out.result as { success?: unknown }) : {}
-    const ok = out.deny === undefined && !out.isError && result.success !== false
-    const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok, final: true }
+    const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok: sent, final: true }
     await update($, agentsAtom, l => patch(l, id, { report, ...DISARMED }))
     await persist($)
   } else if (tool === 'SubagentHandback' && c.report === undefined) {
+    // Refused, or gone to main: no report to the parent, but noted, so the forward that follows is flagged.
     const report = { t: await $.clock.now(), text: String(args.message ?? args.report ?? ''), ok: false, final: false }
     await update($, agentsAtom, l => patch(l, id, { report }))
     await persist($)
@@ -1701,6 +1707,7 @@ export const register: Register = (on, options) => {
   cfg.idleWatchdogMinutes = numberSetting(options.idleWatchdogMinutes, 5)
   cfg.shellCeilingMinutes = numberSetting(options.shellCeilingMinutes, 60)
   paneOffered = false
+  teammatesWarned.clear()
   mainBusy = false
   mainHandoverQueued = false
   mainHandoverStarting = false
@@ -1791,9 +1798,20 @@ export const register: Register = (on, options) => {
       },
     ])
     await log($, `spawned ${name ?? e.description} (${id})`)
+    const rows = await read($, agentsAtom)
+    // The engine never delivers a SubagentHandback to a teammate: its children's reports rely on the forward.
+    const spawner = rows.find(r => r.id === e.parentAgentId)
+    if (spawner?.isTeammate && !teammatesWarned.has(spawner.id)) {
+      teammatesWarned.add(spawner.id)
+      await log(
+        $,
+        `${label(spawner)} is a teammate: SubagentHandback from its children cannot reach it (an engine limit); ` +
+          'their final answers are auto-forwarded. Spawn an orchestrator without a name to avoid this.',
+        'warn',
+      )
+    }
     // A parent's own replacement for a failed respawn names the old agent's note: link the two.
     // Only the agent told of the gap (the old parent's latest) links it: not by name, which the engine may suffix.
-    const rows = await read($, agentsAtom)
     const gap = rows.find(
       r =>
         r.status === 'respawn-failed' &&
