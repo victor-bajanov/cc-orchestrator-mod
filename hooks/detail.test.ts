@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { SECTION_CHARS, TOTAL_CHARS, cleanBlock, editDiff, readExcerpt, toolDetail } from './detail'
+import { SECTION_CHARS, TOTAL_CHARS, cleanBlock, editDiff, fitTables, readExcerpt, toolDetail } from './detail'
 import type { DetailSection } from './detail'
 import { hhmm } from './view'
 import type { ToolUseSummary } from 'claude-code'
@@ -319,5 +319,39 @@ describe('review fixes', () => {
     expect(body(last)).toBe('… (1 more section)')
     const total = d.sections.reduce((n, s) => n + body(s).length, 0)
     expect(total).toBeLessThanOrEqual(TOTAL_CHARS)
+  })
+})
+
+describe('fitTables', () => {
+  const table = '| Device | Live | Rate |\n|---|---|---|\n| 213 Heat | OK, binarySwitch | 0.4/day |\n| 214 Cool | OK | 0.5/day |'
+
+  test('a table that fits is left as it is', () => {
+    const md = `# Head\n\n${table}\n\ntail`
+    expect(fitTables(md, 80)).toBe(md)
+  })
+
+  test('a table wider than the columns becomes one record per row, header cells as field names', () => {
+    expect(fitTables(`before\n\n${table}\n\nafter`, 30)).toBe(
+      [
+        'before',
+        '',
+        '**213 Heat**',
+        '- **Live:** OK, binarySwitch',
+        '- **Rate:** 0.4/day',
+        '',
+        '**214 Cool**',
+        '- **Live:** OK',
+        '- **Rate:** 0.5/day',
+        '',
+        'after',
+      ].join('\n'),
+    )
+  })
+
+  test('escaped pipes stay in their cell, empty cells are left out, fenced tables are untouched', () => {
+    const t = '| Key | Value | Note |\n|:--|--:|---|\n| a \\| b | 1 |  |'
+    expect(fitTables(t, 10)).toBe('**a \\| b**\n- **Value:** 1')
+    const fenced = '```\n' + table + '\n```'
+    expect(fitTables(fenced, 10)).toBe(fenced)
   })
 })

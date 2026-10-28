@@ -1977,8 +1977,8 @@ describe('tool detail', () => {
   }
   const said = (...toolUses: unknown[]) => ({ value: [brief, { role: 'assistant', text: '', toolUses }] as never })
   type Ui = Awaited<ReturnType<typeof mountPane>>
-  const mountTool = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile' = 'desktop') =>
-    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: TOOL, props: { bodyColumns: 100 } as never })
+  const mountTool = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile' = 'desktop', bodyColumns = 100) =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: TOOL, props: { bodyColumns } as never })
   /** agent1 running, its transcript open in the main pane. */
   const opened = async ($: Engine, w: World, surface: 'terminal' | 'desktop') => {
     await running($, w)
@@ -2044,6 +2044,27 @@ describe('tool detail', () => {
       await ui.unmount()
     })
   }
+
+  test('a markdown table wider than the dialog is drawn as records, one that fits as a table', async ($, on) => {
+    const w = world(on)
+    const message = '## Per device\n\n| Device | Live | Rate |\n|---|---|---|\n| 213 Heat | OK, binarySwitch | 0.4/day |'
+    const h = { tool_use_id: 'h', tool: 'SubagentHandback', input: { message }, text: '{"success":true}' }
+    on('session.messages', () => said(h))
+    const ui = await opened($, w, 'desktop')
+    await ui.press({ key: 'tool:agent1:h' })
+    await w.clock.settle()
+    const md = async (cols: number) => {
+      const tool = await mountTool($, 'desktop', cols)
+      const texts = (await tool.findAll({ type: 'Markdown' })).map(m => String((m.props as { text: string }).text))
+      await tool.unmount()
+      return texts.join('\n')
+    }
+    expect(await md(100)).toContain('| 213 Heat | OK, binarySwitch | 0.4/day |')
+    const narrow = await md(30)
+    expect(narrow).toContain('**213 Heat**\n- **Live:** OK, binarySwitch')
+    expect(narrow).not.toContain('|---|')
+    await ui.unmount()
+  })
 
   test('loading… before the read settles; not readable when the call is gone', async ($, on) => {
     const w = world(on)

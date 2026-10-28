@@ -132,6 +132,67 @@ const resultDraft = (out: string): Draft => {
   return MARKDOWN.test(out) ? markdown('Result', out) : code('Result', out)
 }
 
+const SEPARATOR = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/
+const FENCE = /^\s*(?:```|~~~)/
+
+/** A table row's cells, trimmed; `\|` stays inside its cell. */
+const cells = (row: string): string[] =>
+  row
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/(?<!\\)\|$/, '')
+    .split(/(?<!\\)\|/)
+    .map((c) => c.trim())
+
+/** Cells a cell takes on screen, without the markers markdown hides. */
+const shown = (c: string): number => c.replace(/\*\*|`/g, '').length
+
+/**
+ * Markdown with each table wider than `columns` drawn as one record per row (`psql`'s expanded
+ * display): the row's first cell in bold, then a `- **header:** cell` line for each other non-empty
+ * cell. A terminal wraps a too-wide table mid-border, which leaves it unreadable. Tables inside
+ * fences, and tables that fit, are left as they are.
+ */
+export const fitTables = (md: string, columns: number): string => {
+  const rows = md.split('\n')
+  const out: string[] = []
+  let fenced = false
+  for (let i = 0; i < rows.length; i++) {
+    const line = rows[i] as string
+    if (FENCE.test(line)) fenced = !fenced
+    const next = rows[i + 1]
+    if (fenced || !line.includes('|') || next === undefined || !SEPARATOR.test(next) || !next.includes('-')) {
+      out.push(line)
+      continue
+    }
+    const head = cells(line)
+    const body: string[][] = []
+    let j = i + 2
+    for (; j < rows.length && (rows[j] as string).includes('|') && (rows[j] as string).trim() !== ''; j++) {
+      body.push(cells(rows[j] as string))
+    }
+    const widths = head.map((h, c) => Math.max(shown(h), ...body.map((r) => shown(r[c] ?? ''))))
+    const natural = widths.reduce((a, w) => a + w, 0) + 3 * head.length + 1
+    if (natural <= columns) {
+      out.push(...rows.slice(i, j))
+    } else {
+      out.push(
+        body
+          .map((r) => {
+            const fields = head.slice(1).flatMap((h, c) => {
+              const v = r[c + 1] ?? ''
+              return v === '' ? [] : [`- **${h}:** ${v}`]
+            })
+            return [`**${r[0] ?? ''}**`, ...fields].join('\n')
+          })
+          .join('\n\n'),
+      )
+    }
+    i = j - 1
+  }
+  return out.join('\n')
+}
+
 const CHANGE = 'Change (line numbers relative to the edit)'
 
 const editDrafts = (input: Record<string, unknown>, path: string | undefined): Draft[] => {
