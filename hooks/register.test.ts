@@ -1263,6 +1263,9 @@ describe('agent timeline', () => {
       await open(ui, w)
       const head = (await ui.find({ key: 'timeline-header' }))!
       expect(head.props.flexDirection).toBe('row')
+      expect(head.props.justifyContent).toBe('space-between')
+      expect(head.props.flexGrow).toBe(1)
+      expect(head.props.width).toBeUndefined()
       expect(head.text).toContain('Timeline')
       expect(head.text).toContain('impl-1')
       expect(head.text).toContain('2 turns')
@@ -1440,6 +1443,10 @@ describe('agent timeline', () => {
       const note = (await ui.find({ key: pressed.replace('turn:agent1:', 'jump-note:') }))!
       expect(note.text).toContain('nothing to jump to in this turn (no tool calls)')
       expect(o.calls).toEqual([])
+      // Only the inline note: pressing again adds no activity line.
+      await ui.press({ key: pressed })
+      await w.clock.settle()
+      expect(w.files.get(`${RUN_DIR}/activity.log`) ?? '').not.toMatch(/no jump|nothing to jump/)
       await ui.press({ key: 'jump-note-dismiss' })
       expect(await ui.find({ text: /nothing to jump to/ })).toBeUndefined()
       await ui.unmount()
@@ -1544,6 +1551,25 @@ describe('agent timeline', () => {
       await ui.unmount()
     })
 
+    test(`a wide-character preview keeps the columns aligned (${surface})`, async ($, on) => {
+      const w = world(on)
+      const wideTurns = [
+        { role: 'user', text: `日本語のテキスト ${'漢字'.repeat(60)}`, toolUses: [] },
+        { role: 'user', text: `emoji 🚀🚀🚀 ${'🎉'.repeat(60)}`, toolUses: [] },
+        { role: 'user', text: 'plain', toolUses: [] },
+      ]
+      on('session.messages', () => ({ value: wideTurns as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      const cells = (t: string) => [...t].reduce((n, c) => n + (c.codePointAt(0)! >= 0x1100 && /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uff00-\uff60]|\p{Extended_Pictographic}/u.test(c) ? 2 : 1), 0)
+      if (surface === 'terminal') {
+        const texts = await Promise.all([0, 1, 2].map(n => rowText(ui, n)))
+        expect(new Set(texts.map(cells)).size).toBe(1)
+      }
+      await ui.unmount()
+    })
+
     test(`a transcript the session refuses shows one dim line and no turns (${surface})`, async ($, on) => {
       const w = world(on)
       on('session.messages', () => ({ value: { deny: 'agent1 runs in another process' } }))
@@ -1568,6 +1594,131 @@ describe('agent timeline', () => {
       await ui.unmount()
     })
   }
+})
+
+describe('main thread Timeline: live reads', () => {
+  const TOOL = 'orchestrator-tool'
+  const brief = { role: 'user', text: 'Fix the bug', toolUses: [] }
+  const bash = { tool_use_id: 'b', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS 3 tests' }
+  const said = (...toolUses: unknown[]) => ({ value: [brief, { role: 'assistant', text: 'On it', toolUses }] as never })
+  const openMain = async ($: Engine, w: World, surface: 'terminal' | 'desktop' = 'terminal') => {
+    await running($, w)
+    await step($)
+    const ui = await mountPane($, surface)
+    await ui.press({ key: 'agent:main' })
+    await w.clock.settle()
+    return ui
+  }
+  const mainTool = ($: Engine, id = 'tm') => $.tool.call({ tool: 'Read', file_path: '/x', tool_use_id: id } as never)
+
+  test("main's tool detail is read with no agentId", async ($, on) => {
+    const w = world(on)
+    const asked: (string | undefined)[] = []
+    on('session.messages', ($, e) => {
+      asked.push(e.agentId)
+      return said(bash)
+    })
+    const ui = await openMain($, w)
+    for (const b of await ui.findAll({ type: 'Button' })) if ((b.key ?? '').startsWith('turnfold:')) await ui.press({ key: b.key! })
+    asked.length = 0
+    await ui.press({ key: 'tool:main:b' })
+    await w.clock.settle()
+    expect(asked).toEqual([undefined])
+    const tool = await $.ui.mount({ plugin: 'orchestrator', surface: 'desktop', component: 'Pane', requestId: TOOL, props: { bodyColumns: 100 } as never })
+    expect((await tool.findAll({ type: 'Code' })).some(c => c.props.source === 'npm test')).toBe(true)
+    await tool.unmount()
+    await ui.unmount()
+  })
+
+  test("a finished tool call of main rereads the open Timeline", async ($, on) => {
+    const w = world(on)
+    let calls = 0
+    on('session.messages', () => (calls++, said(bash)))
+    const ui = await openMain($, w)
+    expect(calls).toBe(1)
+    await w.clock.advance(2_100)
+    await mainTool($)
+    await w.clock.settle()
+    expect(calls).toBe(2)
+    await ui.unmount()
+  })
+
+  test("a finished tool call of main rereads the open tool detail", async ($, on) => {
+    const w = world(on)
+    let calls = 0
+    on('session.messages', () => (calls++, said(bash)))
+    const ui = await openMain($, w)
+    for (const b of await ui.findAll({ type: 'Button' })) if ((b.key ?? '').startsWith('turnfold:')) await ui.press({ key: b.key! })
+    await ui.press({ key: 'tool:main:b' })
+    await w.clock.advance(2_100)
+    const before = calls
+    await mainTool($, 'b')
+    await w.clock.settle()
+    // The Timeline's reread and the detail's own.
+    expect(calls).toBe(before + 2)
+    await ui.unmount()
+  })
+
+  test("main's reads are throttled to one per 2 s, with one trailing reread", async ($, on) => {
+    const w = world(on)
+    let calls = 0
+    on('session.messages', () => (calls++, said()))
+    const ui = await openMain($, w)
+    expect(calls).toBe(1)
+    for (let i = 0; i < 5; i++) await step($)
+    await w.clock.settle()
+    expect(calls).toBe(1)
+    await w.clock.advance(2_100)
+    expect(calls).toBe(2)
+    await w.clock.advance(10_000)
+    expect(calls).toBe(2)
+    await step($)
+    await w.clock.settle()
+    expect(calls).toBe(3)
+    await ui.unmount()
+  })
+
+  test("an agent's reads are not throttled", async ($, on) => {
+    const w = world(on)
+    let calls = 0
+    on('session.messages', () => (calls++, said()))
+    await running($, w)
+    const ui = await mountPane($, 'terminal')
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle()
+    for (let i = 0; i < 3; i++) {
+      await step($, 'agent1')
+      await w.clock.settle()
+    }
+    expect(calls).toBe(4)
+    await ui.unmount()
+  })
+
+  test("main's answers, tool calls and prompts are stamped, so its rows show real times", async ($, on) => {
+    const w = world(on)
+    const convo = [
+      { role: 'user', text: 'first ask', toolUses: [] },
+      { role: 'assistant', text: 'doing it', toolUses: [{ tool_use_id: 'tm', tool: 'Read', input: { file_path: '/x' }, text: 'ok' }] },
+      { role: 'user', text: 'second ask', toolUses: [] },
+      { role: 'assistant', text: 'all done', toolUses: [] },
+      { role: 'user', text: 'third ask', toolUses: [] },
+    ]
+    on('session.messages', () => ({ value: convo as never }))
+    await running($, w)
+    await step($)
+    await $.prompt.submit({ text: 'first ask' } as never).catch(() => undefined)
+    await mainTool($)
+    await w.clock.advance(60_000)
+    await $.prompt.submit({ text: 'second ask' } as never).catch(() => undefined)
+    const ui = await mountPane($, 'terminal')
+    await ui.press({ key: 'agent:main' })
+    await w.clock.settle()
+    const keys = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('turn:main:'))
+    const two = (await ui.find({ key: keys[1]!.replace('turn:main:', 'turnrow:') }))!.text
+    expect(two).not.toContain('--:--')
+    expect(two).toMatch(/\d\d:\d\d/)
+    await ui.unmount()
+  })
 })
 
 describe('agent timeline: final review', () => {

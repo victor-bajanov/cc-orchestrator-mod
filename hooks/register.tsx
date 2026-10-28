@@ -204,6 +204,11 @@ export const isOwnCall = (input: unknown, inFlight: readonly OwnCall[]): boolean
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
+/** When main's transcript was last read, and whether a read is already waiting its turn (see schedulePeek). */
+let mainReadAt = 0
+let mainReadQueued = false
+/** Main's transcript is read at most this often: a long session's read is large, and main steps and syncs often. */
+const MAIN_READ_MS = 2_000
 /** Teammates already warned that their children's handbacks cannot reach them. */
 const teammatesWarned = new Set<string>()
 /** Main is mid-turn: from its `turn.start` (main's alone) to its `turn.complete`. */
@@ -462,8 +467,8 @@ async function jumpTo(
   }
   const requestId = o.turn.jumpTo
   if (requestId === undefined) {
-    await note('nothing to jump to in this turn (no tool calls)')
-    return log($, `no jump to ${where}: it has no tool calls`)
+    // The note alone: a repeated press would only flood the activity list.
+    return note('nothing to jump to in this turn (no tool calls)')
   }
   // Main is in view when no agent is.
   const want = o.agentId === 'main' ? undefined : o.agentId
@@ -624,7 +629,25 @@ function scheduleRead($: $, slot: ReadSlot, key: string, run: () => Promise<unkn
 
 /** Starts a transcript read outside the dispatch that asked for it, so no hook or press waits on it. */
 function schedulePeek($: $, id: string) {
+  if (id === 'main') return scheduleMainPeek($)
   scheduleRead($, transcriptReads, id, () => refreshTranscript($, id))
+}
+
+/**
+ * Starts main's transcript read: at once when none ran in the last MAIN_READ_MS, else once that time is up.
+ * Any number of triggers meanwhile are one trailing read. Never rejects.
+ */
+function scheduleMainPeek($: $) {
+  if (mainReadQueued) return
+  mainReadQueued = true
+  const run = async () => {
+    const wait = Math.max(0, mainReadAt + MAIN_READ_MS - (await $.clock.now()))
+    if (wait > 0) await new Promise<void>(resolve => $.clock.after(wait, () => resolve()))
+    mainReadQueued = false
+    mainReadAt = await $.clock.now()
+    await refreshTranscript($, 'main')
+  }
+  $.clock.after(0, () => void run().catch(() => (mainReadQueued = false)))
 }
 
 /** Rereads the transcript of the agent an event came from, when it is the one open in the pane. Never throws. */
@@ -677,7 +700,7 @@ async function refreshTool($: $, agentId: string, toolUseId: string) {
     toolReads,
     `${agentId}:${toolUseId}`,
     () =>
-      $.session.messages({ agentId }).then(f => {
+      (agentId === 'main' ? $.session.messages() : $.session.messages({ agentId })).then(f => {
         if ('deny' in f) return undefined
         for (let i = f.length - 1; i >= 0; i--) {
           const found = f[i]!.toolUses.find(u => u.tool_use_id === toolUseId)
@@ -1833,7 +1856,7 @@ function timelineBody(
   }
   return (
     <Box key={`transcript:${id}`} flexDirection="column">
-      <Box key="timeline-header" flexDirection="row" justifyContent="space-between" width={o.cols - 2}>
+      <Box key="timeline-header" flexDirection="row" justifyContent="space-between" flexGrow={1}>
         <Box flexDirection="row" gap={1}>
           <Button key="timeline-back" plain hotkey="b" label="‹ agents" onPress={() => resetTimeline($)} />
           <Text color={ACCENT}>◆</Text>
@@ -1856,7 +1879,7 @@ function timelineBody(
         const num = <Text dimColor>{cells.num}</Text>
         const preview = (pad: boolean) => (
           <Text bold={jumped} color={jumped ? ACCENT : undefined} wrap="truncate">
-            {pad ? cells.preview.padEnd(cells.room) : cells.preview}
+            {pad ? cells.preview + ' '.repeat(cells.pad) : cells.preview}
           </Text>
         )
         const outcome = <Text color={outcomeColor(cells.outcome)} dimColor={outcomeColor(cells.outcome) === undefined}>{cells.outcome}</Text>
@@ -1929,6 +1952,8 @@ export const register: Register = (on, options) => {
   cfg.idleWatchdogMinutes = numberSetting(options.idleWatchdogMinutes, 5)
   cfg.shellCeilingMinutes = numberSetting(options.shellCeilingMinutes, 60)
   paneOffered = false
+  mainReadAt = 0
+  mainReadQueued = false
   teammatesWarned.clear()
   mainBusy = false
   mainHandoverQueued = false
@@ -2092,7 +2117,7 @@ export const register: Register = (on, options) => {
       })
       try {
         // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
-        if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now, true)
+        if (res.answer) stamp(id, textKey('assistant', res.answer), now, true)
       } catch {
         // A lost stamp only leaves the item's time `--:--`.
       }
@@ -2120,7 +2145,7 @@ export const register: Register = (on, options) => {
     }
     // Last, after the step is recorded and any handover started: the peek can cost them nothing.
     await peekIfSelected($, e.agentId ?? 'main')
-    if (e.agentId !== undefined) await toolIfPending($, e.agentId)
+    await toolIfPending($, e.agentId ?? 'main')
     return res
   })
 
@@ -2132,10 +2157,10 @@ export const register: Register = (on, options) => {
       if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, {}, answer).catch(() => undefined)
       return answer as never
     }
-    if (e.agentId !== undefined) {
+    {
       // Stamped as the call starts, when the mod saw it, for the transcript. The call never waits on the clock,
       // and a lost stamp only leaves the item's time `--:--`: the call and its HANDOVER go ahead.
-      const agentId = e.agentId
+      const agentId = e.agentId ?? 'main'
       const id = e.tool_use_id
       try {
         void $.clock.now().then(
@@ -2181,7 +2206,12 @@ export const register: Register = (on, options) => {
     } catch (err) {
       $.ui.log(`orchestrator: shell not tracked: ${String(err)}`)
     }
-    if (e.agentId === undefined) return out
+    if (e.agentId === undefined) {
+      // Main's own call has settled: its open Timeline and tool detail read it.
+      await peekIfSelected($, 'main')
+      await toolIfOpen($, 'main', e.tool_use_id)
+      return out
+    }
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
       if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
@@ -2300,6 +2330,16 @@ export const register: Register = (on, options) => {
       $.ui.log(`orchestrator: turn end not handled: ${String(err)}`)
     }
     return res
+  })
+
+  // When main's prompt was typed, for its Timeline (the host stamps no times). It can cost the prompt nothing.
+  on('prompt.submit', async ($, e, next) => {
+    try {
+      stamp('main', textKey('user', e.text), await $.clock.now(), true)
+    } catch {
+      // A lost stamp only leaves the turn's time `--:--`.
+    }
+    return next(e)
   })
 
   on('command.run', { command: 'orch' }, async ($, e) => {

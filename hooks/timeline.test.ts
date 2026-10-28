@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { PEEK_DENIED } from './view'
-import { buildTimeline, stampOf, timelineCols, timelineOf, timelineRow, turnCount } from './timeline'
+import { buildTimeline, cutCells, stampOf, timelineCols, timelineOf, timelineRow, turnCount, widthOf } from './timeline'
 import type { TimelineTurn } from './timeline'
 import type { TranscriptItem } from '../types'
 
@@ -238,5 +238,33 @@ describe('timelineRow', () => {
     const r = timelineRow(turn({ preview: 'y'.repeat(100) }), 10, cols, NOW)
     expect(r.preview).toHaveLength(8)
     expect(r.preview.endsWith('…')).toBe(true)
+  })
+})
+
+describe('widthOf', () => {
+  test('counts terminal cells: wide characters two, combining marks none', () => {
+    expect(widthOf('abc')).toBe(3)
+    expect(widthOf('日本')).toBe(4)
+    expect(widthOf('🚀')).toBe(2)
+    expect(widthOf('e\u0301')).toBe(1)
+    expect(widthOf('👨\u200d👩')).toBe(4)
+  })
+})
+
+describe('cutCells', () => {
+  test('keeps what fits, and ends a cut text in … within the cells', () => {
+    expect(cutCells('hello', 10)).toBe('hello')
+    expect(cutCells('日本語日本語', 7)).toBe('日本語…')
+    expect(widthOf(cutCells('日本語日本語', 8))).toBeLessThanOrEqual(8)
+    expect(cutCells('🚀🚀🚀🚀', 5)).toBe('🚀🚀…')
+  })
+})
+
+describe('timelineRow with wide characters', () => {
+  test('the preview and its pad fill the room in cells', () => {
+    for (const preview of ['日本語'.repeat(40), '🚀 launch '.repeat(30), 'short']) {
+      const r = timelineRow(turn({ preview }), 60, cols, NOW)
+      expect(widthOf(r.preview) + r.pad).toBe(r.room)
+    }
   })
 })
