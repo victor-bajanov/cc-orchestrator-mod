@@ -116,6 +116,18 @@ describe('buildTimeline', () => {
     expect(turns[0]!.items.map((i) => i.key)).toEqual(['u1', 'r1'])
   })
 
+  test('a cut reminder-only text, with no closing tag, opens no turn', () => {
+    const turns = buildTimeline([user('u1', 'real ask'), user('r1', '<system-reminder>\nlong body that was cut off…'), reply('a1')])
+    expect(turns).toHaveLength(1)
+    expect(turns[0]!.items.map((i) => i.key)).toEqual(['u1', 'r1', 'a1'])
+  })
+
+  test('the preview drops reminder blocks around the real text', () => {
+    expect(buildTimeline([user('u1', '<system-reminder>x</system-reminder>\nreal ask')])[0]!.preview).toBe('real ask')
+    expect(buildTimeline([user('u1', 'real ask\n<system-reminder>x</system-reminder>')])[0]!.preview).toBe('real ask')
+    expect(buildTimeline([user('u1', 'real ask <system-reminder>cut off…')])[0]!.preview).toBe('real ask')
+  })
+
   test('steps before the first user text form a leading turn', () => {
     const turns = buildTimeline([reply('a0'), tool('t0', 'Read'), user('u1', 'now this')])
     expect(turns.map((t) => [t.key, t.number, t.preview])).toEqual([

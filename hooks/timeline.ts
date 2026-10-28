@@ -20,15 +20,15 @@ export type TimelineTurn = {
   items: TranscriptItem[]
 }
 
-const REMINDER = /^(?:<system-reminder>(?:(?!<\/system-reminder>)[\s\S])*<\/system-reminder>\s*)+$/
+const REMINDERS = /<system-reminder>(?:(?!<\/system-reminder>)[\s\S])*(?:<\/system-reminder>|$)/g
 const FILE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit'])
 
-/** Whether an item opens a turn: a user text with something in it besides a system reminder. */
-const opens = (item: TranscriptItem): boolean => {
-  if (item.kind !== 'text' || item.role !== 'user') return false
-  const text = item.text.trim()
-  return text !== '' && !REMINDER.test(text)
-}
+/** A user item's text on one line with system-reminder blocks removed (a block cut short loses the rest); undefined for anything else. */
+const askOf = (item: TranscriptItem): string | undefined =>
+  item.kind === 'text' && item.role === 'user' ? item.text.replace(REMINDERS, ' ').replace(/\s+/g, ' ').trim() : undefined
+
+/** Whether an item opens a turn: a user text with something in it besides system reminders and a cut marker. */
+const opens = (item: TranscriptItem): boolean => (askOf(item) ?? '').replace(/…$/, '').trim() !== ''
 
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`
 
@@ -65,7 +65,7 @@ export const buildTimeline = (items: readonly TranscriptItem[]): TimelineTurn[] 
   for (const item of items) {
     if (opens(item)) {
       close()
-      open = { key: item.key, preview: item.kind === 'text' ? item.text.replace(/\s+/g, ' ').trim() : '', items: [item] }
+      open = { key: item.key, preview: askOf(item) ?? '', items: [item] }
     } else if (open) {
       open.items.push(item)
     } else {
