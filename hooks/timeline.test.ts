@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { PEEK_DENIED } from './view'
-import { buildTimeline, cutCells, stampOf, timelineCols, timelineOf, timelineRow, turnCount, widthOf } from './timeline'
+import { buildTimeline, cutCells, jumpScroll, stampOf, timelineCols, timelineOf, timelineRow, turnCount, widthOf } from './timeline'
 import type { TimelineTurn } from './timeline'
 import type { TranscriptItem } from '../types'
 
@@ -266,5 +266,15 @@ describe('timelineRow with wide characters', () => {
       const r = timelineRow(turn({ preview }), 60, cols, NOW)
       expect(widthOf(r.preview) + r.pad).toBe(r.room)
     }
+  })
+})
+
+describe('jumpScroll', () => {
+  test('a turn with no tool call has nowhere to scroll', () => {
+    expect(jumpScroll(turn())).toBeUndefined()
+  })
+
+  test("the first tool call lands at the window's foot, so the opening prompt above it stays in view", () => {
+    expect(jumpScroll(turn({ jumpTo: 'use-1' }))).toEqual({ to: { requestId: 'use-1' }, block: 'end' })
   })
 })

@@ -76,6 +76,16 @@ export const buildTimeline = (items: readonly TranscriptItem[]): TimelineTurn[] 
   return groups.map((g, i) => ({ ...g, number: i + 1, isCurrent: i === groups.length - 1 }))
 }
 
+/**
+ * Where a press on a turn scrolls the transcript: its first tool call, set at the window's foot so the
+ * opening prompt above it stays in view. A prompt row has a message id of its own, but the transcript the
+ * mod reads (`$.session.messages()`) carries none, and a `UserMessage` render hook sees only rows drawn
+ * (not an agent's just switched to), so the tool row is the one target the mod can always name.
+ * Undefined for a turn with no tool call.
+ */
+export const jumpScroll = (turn: TimelineTurn): { to: { requestId: string }; block: 'end' } | undefined =>
+  turn.jumpTo === undefined ? undefined : { to: { requestId: turn.jumpTo }, block: 'end' }
+
 /** `{ dim }` for undefined (`loading…`), denied (PEEK_DENIED) and no turns (`no messages yet`); else the turns. */
 export const timelineOf = (tr: Transcript | undefined): { dim: string } | { turns: TimelineTurn[] } => {
   if (!tr) return { dim: 'loading…' }

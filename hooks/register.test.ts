@@ -1452,7 +1452,7 @@ describe('agent timeline', () => {
       await ui.unmount()
     })
 
-    test(`every jump is in the activity log: info as it goes ahead, WARN when refused (${surface})`, async ($, on) => {
+    test(`a jump writes nothing to the activity log and raises no toast, gone ahead or refused (${surface})`, async ($, on) => {
       const w = world(on)
       const o = ops(on)
       on('session.messages', () => ({ value: convo as never }))
@@ -1463,13 +1463,21 @@ describe('agent timeline', () => {
         await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[n]! })
         await w.clock.settle()
       }
+      // The press trace every press on the mod's surfaces leaves is not the jump's: only it may be added.
+      const act = () => (w.files.get(`${RUN_DIR}/activity.log`) ?? '').split('\n').filter(l => !/ info press /.test(l)).join('\n')
+      const before = act()
+      const toasts = w.toasts.length
+      // The view switches, then the scroll is refused (the test host cannot scroll a transcript row).
       await press(1)
-      const act = () => w.files.get(`${RUN_DIR}/activity.log`) ?? ''
-      expect(act()).toMatch(/info jumping to turn 2 of impl-1/)
-      expect(act()).toMatch(/WARN jump to turn 2 of impl-1 refused: no implementation for ui\.scroll/)
+      expect(await ui.find({ text: /ui\.scroll/ })).toBeDefined()
       o.viewDeny = 'teammate in a pane of its own'
       await press(1)
-      expect(act()).toMatch(/WARN jump to turn 2 of impl-1 refused: teammate in a pane of its own/)
+      expect(await ui.find({ text: /teammate in a pane of its own/ })).toBeDefined()
+      o.viewThrows = true
+      await press(1)
+      expect(act()).toBe(before)
+      expect(act()).not.toMatch(/jump/)
+      expect(w.toasts).toHaveLength(toasts)
       await ui.unmount()
     })
 
