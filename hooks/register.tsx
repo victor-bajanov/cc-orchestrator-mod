@@ -81,6 +81,7 @@ import {
   watchdogTurnEnded,
 } from './view'
 import type { TranscriptLine } from './view'
+import { timelineHeader, timelineOf, timelineRow } from './timeline'
 
 type $ = EngineInterface
 
@@ -100,8 +101,12 @@ const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'i
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 /** The line (activity or transcript text) whose full text a press shows beneath it, in flow ('' for none). */
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
-/** The agent a click selected: its chart line is highlighted and its transcript shown beneath its row ('' for none). */
+/** The agent a click selected: its chart line is highlighted and its Timeline takes over the pane ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
+/** The turns of the open Timeline the person expanded, by turn key. */
+const expandedAtom = atom({ plugin: 'orchestrator', key: 'expandedTurns' } as const, [] as string[])
+/** Why the last jump could not go ('' for none), drawn under the Timeline's header. */
+const jumpNoteAtom = atom({ plugin: 'orchestrator', key: 'jumpNote' } as const, '')
 /** Messages timers queued for the next hook to deliver (a send from a timer wakes a run without hooks). */
 const outboxAtom = atom({ plugin: 'orchestrator', key: 'outbox' } as const, [] as Delivery[])
 /** Rows the person collapsed with a row's fold glyph or the `c` hotkey, their finished descendants hidden; display only. */
@@ -394,8 +399,42 @@ function togglePinned($: $, id: string) {
 
 async function toggleSelected($: $, id: string) {
   await update($, selectedAtom, s => (s === id ? '' : id))
+  // A Timeline opens folded and without a stale note.
+  await update($, expandedAtom, () => [])
+  await update($, jumpNoteAtom, () => '')
   // Opening a transcript starts its read; the pane shows `loading…` until it settles.
   if ((await read($, selectedAtom)) === id) schedulePeek($, id)
+}
+
+/** Leaves the Timeline for the list and chart. */
+async function leaveTimeline($: $) {
+  await update($, selectedAtom, () => '')
+  await update($, expandedAtom, () => [])
+  await update($, jumpNoteAtom, () => '')
+}
+
+function toggleTurn($: $, key: string) {
+  return update($, expandedAtom, x => (x.includes(key) ? x.filter(k => k !== key) : [...x, key]))
+}
+
+/**
+ * Takes the person to a turn's first tool call: switches the main view to the agent when it is not
+ * already in view (engines from 2.1.312), then scrolls there. All in the press, so both count as the
+ * person's own input. A refusal is kept as the note under the Timeline's header.
+ */
+async function jumpTo($: $, o: { viewed: string | undefined; agentId: string; name: string; requestId: string }) {
+  const note = (text: string) => update($, jumpNoteAtom, () => text)
+  if (o.viewed !== o.agentId) {
+    // An engine before 2.1.312 has no $.ui.view: the call throws, and the person is told where to go. The module may not
+    // test for the op's presence ($.ui.view is only ever called).
+    const v = await Promise.resolve()
+      .then(() => $.ui.view({ agentId: o.agentId }))
+      .catch(() => undefined)
+    if (!v) return note(`Open ${o.name} from /tasks to jump there`)
+    if (v.deny) return note(v.deny)
+  }
+  const s = await $.ui.scroll({ to: { requestId: o.requestId }, block: 'start' }).catch(err => ({ deny: String(err) }))
+  return note(s.deny ?? '')
 }
 
 /** Copies to the pressing surface's clipboard and says so in a toast. Never throws. */
@@ -438,10 +477,8 @@ async function toggleCollapsed($: $, id: string) {
 
 /** How long a transcript read may take before the pane calls it not readable. */
 export const PEEK_TIMEOUT_MS = 3_000
-/** The most items a transcript keeps: the desktop's; the terminal shows fewer. */
-const TRANSCRIPT_MAX = 12
-/** The terminal's transcript items. */
-const TRANSCRIPT_TERMINAL = 6
+/** The most items a transcript keeps: what the Timeline builds its turns from. */
+const TIMELINE_ITEMS = 600
 /** The longest text item stored: whole enough to expand, short enough to keep state small. */
 const STEP_CHARS = 2000
 
@@ -477,7 +514,7 @@ async function refreshTranscript($: $, id: string) {
   if (messages === IN_FLIGHT) return
   const startedAt = (await read($, agentsAtom)).find(r => r.id === id)?.startedAt ?? 0
   const items = messages
-    ? transcriptItems(messages, key => stamps.get(id)?.get(key), { n: TRANSCRIPT_MAX, chars: STEP_CHARS, startedAt })
+    ? transcriptItems(messages, key => stamps.get(id)?.get(key), { n: TIMELINE_ITEMS, chars: STEP_CHARS, startedAt })
     : undefined
   await update($, transcriptsAtom, p =>
     items ? { ...p, [id]: { items } } : p[id] && 'items' in p[id] ? p : { ...p, [id]: { denied: true as const } },
@@ -1696,6 +1733,83 @@ async function checkMain($: $, tokens: number) {
   }
 }
 
+/**
+ * An agent's Timeline, which takes the whole pane: a back button, the header, a note on the last
+ * refused jump, then one row per turn. A row's press expands its items in place (drawn by the
+ * surface's own `item`); its `↗` jumps to the turn's first tool call, and is dim and inert without one.
+ */
+function timelineBody(
+  $: $,
+  ui: Ui,
+  e: { props: { view?: { agentId?: string } } },
+  o: {
+    row: AgentRow
+    tr: Transcript | undefined
+    expanded: readonly string[]
+    note: string
+    cols: number
+    item: (agentId: string, it: TranscriptLine) => ReturnType<typeof h>
+  },
+) {
+  const { Box, Button, Text } = ui
+  const id = o.row.id
+  const name = label(o.row)
+  const t = timelineOf(o.tr)
+  const turns = 'turns' in t ? t.turns : []
+  const numW = String(turns.length).length
+  return (
+    <Box key={`transcript:${id}`} flexDirection="column">
+      <Box flexDirection="row" flexWrap="wrap" gap={1}>
+        <Button key="timeline-back" plain hotkey="b" label="← agents" onPress={() => leaveTimeline($)} />
+        <Text bold>{timelineHeader(name, turns.length)}</Text>
+      </Box>
+      {o.note !== '' && (
+        <Box key="jump-note" flexDirection="row" flexWrap="wrap" gap={1}>
+          <Text dimColor>{o.note}</Text>
+          <Button key="jump-note-dismiss" plain label="dismiss" onPress={() => update($, jumpNoteAtom, () => '')} />
+        </Box>
+      )}
+      {'dim' in t && (
+        <Text dimColor wrap="truncate">
+          {t.dim}
+        </Text>
+      )}
+      {turns.flatMap(turn => {
+        const cells = timelineRow(turn, o.cols - 2, numW)
+        const open = o.expanded.includes(turn.key)
+        const lines = open ? transcriptView({ items: turn.items }, o.cols - 6, turn.items.length) : undefined
+        const requestId = turn.jumpTo
+        return [
+          <Box key={`turnrow:${turn.key}`} flexDirection="row" gap={1}>
+            <Button key={`turn:${id}:${turn.key}`} plain onPress={() => toggleTurn($, turn.key)}>
+              <Text dimColor>{`${cells.num} `}</Text>
+              <Text bold={open}>{cells.preview}</Text>
+              <Text dimColor>{` ${cells.outcome}`}</Text>
+              {cells.here && <Text>{' • here'}</Text>}
+              <Text dimColor>{` ${cells.time}`}</Text>
+            </Button>
+            {requestId === undefined ? (
+              <Text dimColor>↗</Text>
+            ) : (
+              <Button
+                key={`jump:${id}:${turn.key}`}
+                plain
+                label="↗"
+                onPress={() => jumpTo($, { viewed: e.props.view?.agentId, agentId: id, name, requestId })}
+              />
+            )}
+          </Box>,
+          lines && 'items' in lines && (
+            <Box key={`turnitems:${turn.key}`} flexDirection="column" marginLeft={2}>
+              {lines.items.map(it => o.item(id, it))}
+            </Box>
+          ),
+        ]
+      })}
+    </Box>
+  )
+}
+
 export const register: Register = (on, options) => {
   cfg.agentThreshold = Number(options.agentThreshold ?? 450_000)
   cfg.mainThreshold = Number(options.mainThreshold ?? 450_000)
@@ -2266,10 +2380,6 @@ export const register: Register = (on, options) => {
         selected: hl,
       })
       const fits = cols - 6
-      // Main is the main view already: only a subagent's transcript is shown.
-      // Drawn from the cache alone: the read is refreshPeek's, never the render's.
-      const peek =
-        selected && selected !== 'main' ? transcriptView((await read($, transcriptsAtom))[selected], fits, TRANSCRIPT_MAX) : undefined
       // A session that places no dialog shows the open call's detail in flow beneath it.
       const tv = await read($, toolViewAtom)
       const ui = $.ui.resolve(e)
@@ -2321,6 +2431,15 @@ export const register: Register = (on, options) => {
             )}
           </Box>
         )
+      }
+      // A selected subagent's Timeline takes the pane. Main is the main view already: it has none.
+      // Drawn from the cache alone: the read is refreshTranscript's, never the render's.
+      const open = selected && selected !== 'main' ? rows.find(r => r.id === selected) : undefined
+      if (open) {
+        const tr = (await read($, transcriptsAtom))[open.id]
+        const expanded = await read($, expandedAtom)
+        const note = await read($, jumpNoteAtom)
+        return timelineBody($, ui, e, { row: open, tr, expanded, note, cols, item })
       }
       return (
         <Box flexDirection="column" gap={1}>
@@ -2375,11 +2494,6 @@ export const register: Register = (on, options) => {
                     />
                   )}
                 </Box>,
-                peek && selected === row.id && (
-                  <Box key={`transcript:${row.id}`} borderStyle="round" flexDirection="column" marginLeft={depth * 2}>
-                    {'dim' in peek ? <Text dimColor>{peek.dim}</Text> : peek.items.map(it => item(row.id, it))}
-                  </Box>
-                ),
               ]
             })}
           </Box>
@@ -2439,32 +2553,24 @@ export const register: Register = (on, options) => {
       'respawn-failed': '✗',
     }
     const selected = liveSelection(visible, await read($, selectedAtom))
-    // Main is the main view already: only a subagent's transcript is shown, in a bordered box beneath its row.
-    const peek =
-      selected && selected !== 'main'
-        ? transcriptView((await read($, transcriptsAtom))[selected], Math.max(10, cols - 4), TRANSCRIPT_TERMINAL)
-        : undefined
-    const peekRows = peek ? ('items' in peek ? peek.items.length : 1) + 2 : 0
+    // A selected subagent's Timeline takes the pane (main is the main view already: it has none).
+    const open = selected && selected !== 'main' ? rows.find(r => r.id === selected) : undefined
     // A session that places no dialog (too narrow, or no surface places panes) shows the open call's detail in flow.
     const tv = await read($, toolViewAtom)
     const ui = $.ui.resolve(e)
     // Rows left for an open expansion and the activity; the activity gives up exactly the rows an expansion takes.
-    // The header's button can wrap onto a row of its own.
-    const base = terminalBase({ rows: e.viewport?.rows ?? 30, agents: ordered.length, peekRows, buttonRow: shown })
+    // The header's button can wrap onto a row of its own. A Timeline has no list, button row or activity beside it.
+    const base = terminalBase({ rows: e.viewport?.rows ?? 30, agents: open ? 0 : ordered.length, peekRows: 0, buttonRow: open ? false : shown })
     // A pane too small for an expansion (cap 0) shows none: a press then only pins.
     const cap = expandCap(base)
     const fits = cols - 6
-    // Inside the transcript box's border, the expansion's border, its padding spaces and slack.
+    // Inside the turn's indent, the expansion's border, its padding spaces and slack.
     const textLines = (full: string) => capLines(wrapFill(full, Math.max(10, cols - 8)), cap)
     // Inside the expansion's border, its padding spaces and slack.
     const logLines = (text: string) => capLines(wrapFill(text, Math.max(10, cols - 6)), cap)
     const pinOf = (agentId: string, it: TranscriptLine) => it.id.replace(/^step-/, `step-${agentId}-`)
     const expRows = (() => {
       if (pinned === '' || cap === 0) return 0
-      if (peek && 'items' in peek && selected) {
-        const it = peek.items.find(it => it.kind !== 'tool' && it.full !== undefined && pinOf(selected, it) === pinned)
-        if (it) return textLines(it.full!).length + 2
-      }
       const l = entries.slice(-Math.max(3, base)).find(l => l.text.length > fits && logId(l) === pinned)
       return l ? logLines(l.text).length + 2 : 0
     })()
@@ -2520,6 +2626,12 @@ export const register: Register = (on, options) => {
           )}
         </Box>
       )
+    }
+    if (open) {
+      const tr = (await read($, transcriptsAtom))[open.id]
+      const expanded = await read($, expandedAtom)
+      const note = await read($, jumpNoteAtom)
+      return timelineBody($, ui, e, { row: open, tr, expanded, note, cols, item })
     }
     return (
       <Box flexDirection="column">
@@ -2587,17 +2699,6 @@ export const register: Register = (on, options) => {
                 {` ${shows.padEnd(12)}`}
               </Text>
             </Box>,
-            peek && selected === row.id && (
-              <Box key={`transcript:${row.id}`} borderStyle="round" flexDirection="column" width={cols}>
-                {'dim' in peek ? (
-                  <Text dimColor wrap="truncate">
-                    {peek.dim}
-                  </Text>
-                ) : (
-                  peek.items.map(it => item(row.id, it))
-                )}
-              </Box>
-            ),
           ]
         })}
         <Text dimColor>

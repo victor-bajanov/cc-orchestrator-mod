@@ -24,6 +24,8 @@ Date: 2026-10-11 · Branch: `agent-focus` · Mod version now: 0.2.0 · Engines: 
 
 ## Feasibility findings: task 2 (bring an agent into the main view)
 
+> **Superseded 2026-10-28.** Findings 1 and 3 and Escalation N held for 2.1.296 only. Engine 2.1.312 adds `$.ui.view(view: SiteView)`, which switches the main view to an agent while it answers the person's own input. The Timeline's `↗` jump uses it; see `2026-10-28-agent-timeline.md` (D6).
+
 1. **No op lets a mod change which transcript is in view.**
    - `$.agent` has only `spawn`, `list` and `register` (T:3173-3222). `$.session` has `messages`, `cwd`, `root`, `model`, `turns`, `id`, `send`, `compact` and similar; none of them views anything (T:2745-2830). `$.ui` has `open`, `close`, `scroll`, `focus` (moves a focus ring inside *this plugin's* site, T:2550-2564), `copy`, `status`, `toast` and similar; none of them views anything.
    - The full list of event and op names (T:3962-7190) has no `agent.view`, `agent.focus`, `ui.view` or `session.switch`.
