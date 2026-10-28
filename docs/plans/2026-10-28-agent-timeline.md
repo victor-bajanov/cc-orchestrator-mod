@@ -40,7 +40,7 @@ Replace the per-agent transcript peek (the box under a selected row) with a **Ti
 
 | # | Decision |
 | --- | --- |
-| D1 | **Cache.** No new atom for transcript data. `refreshTranscript` keeps the last `TIMELINE_ITEMS = 600` items (rename `TRANSCRIPT_MAX`; delete `TRANSCRIPT_TERMINAL`). The builder works on `TranscriptItem[]`. Numbering and the first turn are relative to the cached window. |
+| D1 | **Cache.** No new atom for transcript data. `refreshTranscript` keeps the last `TIMELINE_ITEMS = 200` items (rename `TRANSCRIPT_MAX`; delete `TRANSCRIPT_TERMINAL`). The builder works on `TranscriptItem[]`. Numbering and the first turn are relative to the cached window. |
 | D2 | **Turn.** A turn starts at a `role: 'user'` text item whose text, trimmed, is non-empty and is not wholly a `<system-reminder>…</system-reminder>` block. It holds the following items until the next such item. Items before the first start (window cut) form a leading turn with preview `earlier steps` and no start text. |
 | D3 | **Outcome**, first match: distinct `brief` (the path) of `Edit`/`Write`/`MultiEdit` tool items, N≥1 → `✎ N files` (`✎ 1 file`); else `Bash` count N≥1 → `› N cmds` (`› 1 cmd`); else any tool items N≥1 → `N tools` (`1 tool`); else `reply`. |
 | D4 | **Row** (`timelineRow`): right-aligned number, preview cut to fill, outcome, `• here` on the last turn, `hh:mm` dim at the right end (`--:--` when the turn's first item has no `t`; `hhmm` from V:45), then the jump control `↗`. Header `Timeline · <name> · N turns` (`1 turn`). |
@@ -144,7 +144,7 @@ export const timelineRow: (turn: TimelineTurn, width: number, numW: number) => T
 **Implementation notes:**
 - New module-level atoms `expandedAtom` (`expandedTurns`) and `jumpNoteAtom` (`jumpNote`), defined beside R:104-115 in the same style, declared in `types/index.d.ts`.
 - One top-level function `timelineBody($, ui, e, { row, tr, expanded, note, cols, item })` returns the shared tree; each surface branch calls it with its own `item` closure, then returns early (D5). `$` is only passed to top-level functions (README:147 explains why). Press handlers are top-level `toggleTurn($, key)`, `jumpTo($, view, row, turn)` and `leaveTimeline($)`.
-- `refreshTranscript` (R:468-484): replace `TRANSCRIPT_MAX` with `TIMELINE_ITEMS = 600`. `transcriptItems` already yields what the builder needs.
+- `refreshTranscript` (R:468-484): replace `TRANSCRIPT_MAX` with `TIMELINE_ITEMS = 200`. `transcriptItems` already yields what the builder needs.
 - Docs: README lines 50, 58 and 67 and the terminal/desktop bullet lists (README:42-60, 67-71) now describe the Timeline instead of the box beneath a row: clicking a subagent opens its Timeline over the pane; turn rows, outcome cells, `• here`, expand in place, `↗` jump (it switches the main view to the agent on engine 2.1.312 and later, then scrolls to the turn's first tool call; on older engines it says to open the agent from `/tasks`), `← agents` and the `b` hotkey with the pane focused; Esc closes the pane (host behaviour) and `/orch` reopens it. Remove the sentence "The host gives mods no way to switch the main view to an agent". Keep the times paragraph. `skills/orchestrated-run/SKILL.md:74`: replace "clicking a subagent shows its timestamped transcript there" with the Timeline wording in one clause.
 
 ## Final steps (orchestrator, not a task)
