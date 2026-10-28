@@ -205,6 +205,35 @@ describe('other tools, errors and time', () => {
     expect(body(section(d.sections, 'Result'))).toBe('r')
   })
 
+  test('a multi-line markdown field gets its own Markdown section, the rest stays JSON Input', () => {
+    const message = '## Summary\n- **Live state:** works\n\n| a | b |\n|---|---|\n| 1 | 2 |'
+    const d = toolDetail(use({ tool: 'SubagentHandback', input: { message, to: 'orch' } }))
+    const m = section(d.sections, 'message')
+    expect(m?.kind).toBe('markdown')
+    expect(body(m)).toBe(message)
+    expect(body(section(d.sections, 'Input'))).toBe(JSON.stringify({ to: 'orch' }, null, 2))
+  })
+
+  test('a multi-line plain field is a Code section, a long one-line field wraps as Text', () => {
+    const script = 'line one\nline two'
+    const note = 'word '.repeat(40).trim()
+    const d = toolDetail(use({ tool: 'mcp__s__t', input: { script, note } }))
+    expect(section(d.sections, 'script')?.kind).toBe('code')
+    expect(body(section(d.sections, 'script'))).toBe(script)
+    expect(section(d.sections, 'note')?.kind).toBe('text')
+    expect(body(section(d.sections, 'note'))).toBe(note)
+    expect(section(d.sections, 'Input')).toBeUndefined()
+  })
+
+  test('a JSON result is pretty-printed, a markdown result is rendered', () => {
+    const j = toolDetail(use({ tool: 'mcp__s__t', text: '{"success":true,"n":[1,2]}' }))
+    const r = section(j.sections, 'Result')
+    expect(r?.kind === 'code' ? r.language : undefined).toBe('json')
+    expect(body(r)).toBe(JSON.stringify({ success: true, n: [1, 2] }, null, 2))
+    const md = toolDetail(use({ tool: 'mcp__s__t', text: '# Done\n- one\n- two' }))
+    expect(section(md.sections, 'Result')?.kind).toBe('markdown')
+  })
+
   test('an error result sets isError', () => {
     expect(toolDetail(use({ input: { command: 'x' }, text: 'boom', isError: true })).isError).toBe(true)
     expect(toolDetail(use({ input: { command: 'x' }, text: 'fine' })).isError).toBe(false)

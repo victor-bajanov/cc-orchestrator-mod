@@ -96,6 +96,42 @@ const json = (v: unknown): string => {
   }
 }
 
+/** A one-line string longer than this leaves the JSON for a wrapped Text section. */
+const LONG_LINE = 120
+/** Headings, list items, table rows, bold or a fence: text worth drawing as Markdown. */
+const MARKDOWN = /^#{1,6} |^\s*(?:[-*+]|\d+\.) |^\|.*\|\s*$|\*\*\S|^```/m
+
+/** A free-text field drawn on its own: Markdown when it reads as markdown, Code when multi-line, else wrapped Text. */
+const prose = (label: string, t: string): DetailSection =>
+  MARKDOWN.test(t) ? markdown(label, t) : t.includes('\n') ? code(label, t) : text(label, t)
+
+/**
+ * An unknown tool's input: each multi-line or long string field as its own section, so its newlines
+ * render instead of showing as `\n` on one line; whatever is left as pretty JSON `Input`.
+ */
+const inputDrafts = (input: Record<string, unknown>): Draft[] => {
+  const rest: Record<string, unknown> = {}
+  const own: Draft[] = []
+  for (const [k, v] of Object.entries(input)) {
+    if (typeof v === 'string' && (v.includes('\n') || v.length > LONG_LINE)) own.push(prose(k, v))
+    else rest[k] = v
+  }
+  return [...own, ...(Object.keys(rest).length > 0 || own.length === 0 ? [code('Input', json(rest), { language: 'json' })] : [])]
+}
+
+/** A tool result: pretty JSON when it parses as an object or array, else as `prose` would draw it. */
+const resultDraft = (out: string): Draft => {
+  const t = out.trim()
+  if (t.startsWith('{') || t.startsWith('[')) {
+    try {
+      return code('Result', json(JSON.parse(t)), { language: 'json' })
+    } catch {
+      // Not JSON after all: fall through.
+    }
+  }
+  return MARKDOWN.test(out) ? markdown('Result', out) : code('Result', out)
+}
+
 const CHANGE = 'Change (line numbers relative to the edit)'
 
 const editDrafts = (input: Record<string, unknown>, path: string | undefined): Draft[] => {
@@ -190,7 +226,7 @@ const drafts = (use: ToolUseSummary): Draft[] => {
       ]
     }
     default:
-      return [code('Input', json(input), { language: 'json' }), ...(done ? [code('Result', out)] : [])]
+      return [...inputDrafts(input), ...(done ? [resultDraft(out)] : [])]
   }
 }
 
