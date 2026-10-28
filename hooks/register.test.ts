@@ -363,7 +363,7 @@ const expandTurns = async (ui: {
   findAll: (q: { type: 'Button' }) => Promise<readonly { key?: string }[]>
   press: (q: { key: string }) => Promise<unknown>
 }) => {
-  for (const b of await ui.findAll({ type: 'Button' })) if ((b.key ?? '').startsWith('turn:')) await ui.press({ key: b.key! })
+  for (const b of await ui.findAll({ type: 'Button' })) if ((b.key ?? '').startsWith('turnfold:')) await ui.press({ key: b.key! })
 }
 
 /** One live agent at 300k; main stays at its default 1,000 tokens, below every threshold. */
@@ -898,14 +898,17 @@ describe('desktop pane', () => {
     await term.unmount()
   })
 
-  test('pressing main selects its line; pressing again clears it', async ($, on) => {
+  test('pressing main opens its Timeline; back returns the chart', async ($, on) => {
     const w = world(on)
     await running($, w)
     await step($)
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:main' })
-    expect(String((await ui.find({ type: 'Svg' }))!.props.source)).toContain('stroke-width="3"')
-    await ui.press({ key: 'agent:main' })
+    // Main's Timeline takes the pane, chart and all; back brings the list and chart again.
+    expect(await ui.find({ type: 'Svg' })).toBeUndefined()
+    expect(await ui.find({ key: 'timeline-header' })).toBeDefined()
+    await ui.press({ key: 'timeline-back' })
+    expect(await ui.find({ type: 'Svg' })).toBeDefined()
     expect(String((await ui.find({ type: 'Svg' }))!.props.source)).not.toContain('stroke-width="3"')
     await ui.unmount()
   })
@@ -1118,17 +1121,18 @@ describe('agent in view', () => {
     await ui.unmount()
   })
 
-  test('desktop: a click selection wins the highlight; the in-view mark stays put', async ($, on) => {
+  test('desktop: a click opens a Timeline, and closing it leaves the in-view mark where it was', async ($, on) => {
     const w = world(on)
+    on('session.messages', () => ({ value: [] }))
     await running($, w)
     await step($)
     const ui = await mountViewed($, 'desktop', { agentId: 'agent1' })
     const before = await source(ui)
     expect(before.match(/stroke-width="3"/g)).toHaveLength(1)
     await ui.press({ key: 'agent:main' })
-    const src = await source(ui)
-    expect(src.match(/stroke-width="3"/g)).toHaveLength(1)
-    expect(src).not.toBe(before)
+    expect(await ui.find({ type: 'Svg' })).toBeUndefined()
+    await ui.press({ key: 'timeline-back' })
+    expect(await source(ui)).toBe(before)
     expect((await ui.find({ key: 'agent:agent1' }))!.text).toContain('in view')
     expect((await ui.find({ key: 'agent:main' }))!.text).not.toContain('in view')
     await ui.unmount()
@@ -1198,8 +1202,9 @@ describe('agent timeline', () => {
     $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns: 100, view } as never })
   const keysOf = async (ui: Ui, prefix: string) =>
     (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith(prefix))
-  /** The jump key of the nth turn (the turn row's key with its prefix swapped). */
-  const jumpKey = async (ui: Ui, n: number) => (await keysOf(ui, 'turn:agent1:'))[n]!.replace('turn:', 'jump:')
+  /** The shown text of the nth turn's row. */
+  const rowText = async (ui: Ui, n: number) =>
+    (await ui.find({ key: (await keysOf(ui, 'turn:agent1:'))[n]!.replace('turn:agent1:', 'turnrow:') }))!.text
   const open = async (ui: Ui, w: World) => {
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle() // the read runs off the render
@@ -1223,30 +1228,66 @@ describe('agent timeline', () => {
       const ui = await mountPane($, surface)
       if (surface === 'desktop') expect(await ui.find({ type: 'Svg' })).toBeDefined()
       await open(ui, w)
-      expect(await ui.find({ text: /Timeline · impl-1 · 2 turns/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-1.*2 turns/ })).toBeDefined()
       expect(await ui.find({ key: 'agent:agent1' })).toBeUndefined()
       expect(await ui.find({ type: 'Svg' })).toBeUndefined()
       await ui.unmount()
     })
 
-    test(`each turn is a row with its number, preview, outcome and time; the last is here (${surface})`, async ($, on) => {
+    test(`each turn is one row: number, preview, outcome, time; the last is here (${surface})`, async ($, on) => {
       const w = world(on)
       on('session.messages', () => ({ value: convo as never }))
       await running($, w)
       const ui = await mountPane($, surface)
       await open(ui, w)
-      const [first, last] = await keysOf(ui, 'turn:agent1:')
-      const one = (await ui.find({ key: first! }))!.text
+      const one = await rowText(ui, 0)
       expect(one).toContain('1')
       expect(one).toContain('Implement task 1')
       expect(one).toContain('reply')
       expect(one).toContain(hhmm(1_000_000)) // the brief carries the agent's start
       expect(one).not.toContain('• here')
-      const two = (await ui.find({ key: last! }))!.text
+      const two = await rowText(ui, 1)
       expect(two).toContain('Now run the tests')
       expect(two).toContain('› 1 cmd')
-      expect(two).toContain('--:--')
-      expect(two).toContain('• here')
+      expect(two).toContain('• here') // in place of its time
+      expect(two).not.toContain('--:--')
+      expect(two).not.toContain('\n')
+      await ui.unmount()
+    })
+
+    test(`the header is the title, the name and the turn count on one line, with a compact back control (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      const head = (await ui.find({ key: 'timeline-header' }))!
+      expect(head.props.flexDirection).toBe('row')
+      expect(head.text).toContain('Timeline')
+      expect(head.text).toContain('impl-1')
+      expect(head.text).toContain('2 turns')
+      const back = (await ui.find({ key: 'timeline-back' }))!
+      expect(back.props.hotkey).toBe('b')
+      expect(back.props.label).toBe('‹ agents')
+      const title = (await ui.find({ type: 'Text', text: 'Timeline' }))!
+      expect(title.props.bold).toBe(true)
+      expect((await ui.find({ type: 'Text', text: '2 turns' }))!.props.dimColor).toBe(true)
+      await ui.unmount()
+    })
+
+    test(`the outcome is coloured by kind and the current turn's here is accented (${surface})`, async ($, on) => {
+      const w = world(on)
+      const edits = [
+        { role: 'user', text: 'Edit it', toolUses: [{ tool_use_id: 'te', tool: 'Edit', input: { file_path: '/a.ts' }, text: 'ok' }] },
+        { role: 'user', text: 'Say hi', toolUses: [] },
+      ]
+      on('session.messages', () => ({ value: edits as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      expect((await ui.find({ type: 'Text', text: /✎ 1 file/ }))!.props.color).toBe('success')
+      expect((await ui.find({ type: 'Text', text: /reply/ }))!.props.dimColor).toBe(true)
+      expect((await ui.find({ type: 'Text', text: /• here/ }))!.props.color).toBe('claude')
       await ui.unmount()
     })
 
@@ -1256,29 +1297,31 @@ describe('agent timeline', () => {
       await running($, w)
       const ui = await mountPane($, surface)
       await open(ui, w)
-      const back = (await ui.find({ key: 'timeline-back' }))!
-      expect(back.props.hotkey).toBe('b')
-      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
+      await ui.press({ key: (await keysOf(ui, 'turnfold:agent1:'))[1]! })
       expect(await ui.find({ key: 'tool:agent1:tb' })).toBeDefined()
       await ui.press({ key: 'timeline-back' })
       expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
       expect(await ui.find({ text: /Timeline/ })).toBeUndefined()
       await open(ui, w)
-      expect(await ui.find({ text: /Timeline · impl-1/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-1/ })).toBeDefined()
       expect(await ui.find({ key: 'tool:agent1:tb' })).toBeUndefined()
       await ui.unmount()
     })
 
-    test(`pressing a turn expands it in place, and again folds it (${surface})`, async ($, on) => {
+    test(`the fold glyph expands a turn in place, and again folds it; a row press does not (${surface})`, async ($, on) => {
       const w = world(on)
       on('session.messages', () => ({ value: convo as never }))
       await running($, w)
       const ui = await mountPane($, surface)
       await open(ui, w)
-      const [first, last] = await keysOf(ui, 'turn:agent1:')
+      const [first, last] = await keysOf(ui, 'turnfold:agent1:')
+      expect((await ui.find({ key: last! }))!.text).toBe('▸')
+      expect(await ui.find({ key: 'tool:agent1:tb' })).toBeUndefined()
+      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
       expect(await ui.find({ key: 'tool:agent1:tb' })).toBeUndefined()
       await ui.press({ key: last! })
       expect(await ui.find({ key: 'tool:agent1:tb' })).toBeDefined()
+      expect((await ui.find({ key: last! }))!.text).toBe('▾')
       await ui.press({ key: first! })
       const card = (await keysOf(ui, 'step-agent1-'))[0]!
       expect(card).toBeDefined()
@@ -1297,41 +1340,57 @@ describe('agent timeline', () => {
       await running($, w)
       const ui = await mountPane($, surface)
       await open(ui, w)
-      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
+      await ui.press({ key: (await keysOf(ui, 'turnfold:agent1:'))[1]! })
       await ui.press({ key: 'tool:agent1:tb' })
       expect(w.opened).toContain('orchestrator-tool')
       await ui.unmount()
     })
 
-    // The mounted pane answers a scroll of a transcript row itself, beneath nothing a test can hook: the mod
+    // The mounted pane answers a scroll of a transcript row itself, beneath nothing a test can hook (not even an
+    // on('ui.scroll'): the target is not a drawn instance), so a scroll always fails here: the mod
     // turns that refusal into the note, which shows the call was made (its target is read in the real host).
-    test(`a jump with the agent already in view scrolls and switches nothing (${surface})`, async ($, on) => {
+    test(`a press with the agent already in view scrolls and switches nothing (${surface})`, async ($, on) => {
       const w = world(on)
       const o = ops(on)
       on('session.messages', () => ({ value: convo as never }))
       await running($, w)
       const ui = await mountWith($, surface, { agentId: 'agent1' })
       await open(ui, w)
-      await ui.press({ key: await jumpKey(ui, 1) })
+      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
       expect(o.calls).toEqual([])
       expect(await ui.find({ text: /ui\.scroll/ })).toBeDefined()
       await ui.unmount()
     })
 
-    test(`a jump with main in view switches the view first, then scrolls (${surface})`, async ($, on) => {
+    test(`a press with main in view switches the view first, then scrolls (${surface})`, async ($, on) => {
       const w = world(on)
       const o = ops(on)
       on('session.messages', () => ({ value: convo as never }))
       await running($, w)
       const ui = await mountWith($, surface, {})
       await open(ui, w)
-      await ui.press({ key: await jumpKey(ui, 1) })
+      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
       expect(o.calls).toEqual([{ view: { agentId: 'agent1' } }])
       expect(await ui.find({ text: /ui\.scroll/ })).toBeDefined()
       await ui.unmount()
     })
 
-    test(`a refused view shows its reason until dismissed, and scrolls nowhere (${surface})`, async ($, on) => {
+    test(`the turn last pressed is marked: bold, in the accent colour, and only that one (${surface})`, async ($, on) => {
+      const w = world(on)
+      ops(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, { agentId: 'agent1' })
+      await open(ui, w)
+      const preview = async (text: string) => (await ui.find({ type: 'Text', text: new RegExp(text) }))!.props
+      expect((await preview('Now run the tests')).bold).not.toBe(true)
+      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
+      expect(await preview('Now run the tests')).toMatchObject({ bold: true, color: 'claude' })
+      expect((await preview('Implement task 1')).bold).not.toBe(true)
+      await ui.unmount()
+    })
+
+    test(`a refused view shows its reason under the pressed row with the agent's name, until dismissed (${surface})`, async ($, on) => {
       const w = world(on)
       const o = ops(on)
       o.viewDeny = 'teammate in a pane of its own'
@@ -1340,8 +1399,11 @@ describe('agent timeline', () => {
       const ui = await mountWith($, surface, {})
       await open(ui, w)
       expect(await ui.find({ key: 'jump-note-dismiss' })).toBeUndefined()
-      await ui.press({ key: await jumpKey(ui, 1) })
-      expect(await ui.find({ text: /teammate in a pane of its own/ })).toBeDefined()
+      const pressed = (await keysOf(ui, 'turn:agent1:'))[1]!
+      await ui.press({ key: pressed })
+      const note = (await ui.find({ key: pressed.replace('turn:agent1:', 'jump-note:') }))!
+      expect(note.text).toContain('impl-1: teammate in a pane of its own')
+      expect((await ui.find({ type: 'Text', text: /teammate in a pane/ }))!.props.color).toBe('warning')
       expect(await ui.find({ text: /ui\.scroll/ })).toBeUndefined()
       await ui.press({ key: 'jump-note-dismiss' })
       expect(await ui.find({ text: /teammate in a pane of its own/ })).toBeUndefined()
@@ -1358,21 +1420,127 @@ describe('agent timeline', () => {
       await running($, w)
       const ui = await mountWith($, surface, {})
       await open(ui, w)
-      await ui.press({ key: await jumpKey(ui, 1) })
+      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
       expect(await ui.find({ text: /Open impl-1 from \/tasks to jump there/ })).toBeDefined()
       expect(o.calls).toHaveLength(1) // the attempt
       expect(await ui.find({ text: /ui\.scroll/ })).toBeUndefined()
       await ui.unmount()
     })
 
-    test(`a turn with no tool call has no jump button (${surface})`, async ($, on) => {
+    test(`a turn with no tool call says so under its row when pressed, and switches nothing (${surface})`, async ($, on) => {
       const w = world(on)
+      const o = ops(on)
       on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await open(ui, w)
+      expect(await ui.find({ text: '↗' })).toBeUndefined()
+      const pressed = (await keysOf(ui, 'turn:agent1:'))[0]!
+      await ui.press({ key: pressed })
+      const note = (await ui.find({ key: pressed.replace('turn:agent1:', 'jump-note:') }))!
+      expect(note.text).toContain('nothing to jump to in this turn (no tool calls)')
+      expect(o.calls).toEqual([])
+      await ui.press({ key: 'jump-note-dismiss' })
+      expect(await ui.find({ text: /nothing to jump to/ })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`every jump is in the activity log: info as it goes ahead, WARN when refused (${surface})`, async ($, on) => {
+      const w = world(on)
+      const o = ops(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await open(ui, w)
+      const press = async (n: number) => {
+        await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[n]! })
+        await w.clock.settle()
+      }
+      await press(1)
+      const act = () => w.files.get(`${RUN_DIR}/activity.log`) ?? ''
+      expect(act()).toMatch(/info jumping to turn 2 of impl-1/)
+      expect(act()).toMatch(/WARN jump to turn 2 of impl-1 refused: no implementation for ui\.scroll/)
+      o.viewDeny = 'teammate in a pane of its own'
+      await press(1)
+      expect(act()).toMatch(/WARN jump to turn 2 of impl-1 refused: teammate in a pane of its own/)
+      await ui.unmount()
+    })
+
+    test(`pressing main opens main's Timeline, read with no agentId (${surface})`, async ($, on) => {
+      const w = world(on)
+      const asked: (string | undefined)[] = []
+      on('session.messages', ($, e) => {
+        asked.push(e.agentId)
+        return { value: convo as never }
+      })
+      await running($, w)
+      await step($)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:main' })
+      await w.clock.settle()
+      expect(asked).toEqual([undefined])
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*main thread.*2 turns/ })).toBeDefined()
+      expect(await ui.find({ key: 'agent:main' })).toBeUndefined()
+      expect(await keysOf(ui, 'turn:main:')).toHaveLength(2)
+      await ui.press({ key: 'timeline-back' })
+      expect(await ui.find({ key: 'agent:main' })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a press on main's turn with an agent in view returns the view to main first (${surface})`, async ($, on) => {
+      const w = world(on)
+      const o = ops(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      await step($)
+      const ui = await mountWith($, surface, { agentId: 'agent1' })
+      await ui.press({ key: 'agent:main' })
+      await w.clock.settle()
+      await ui.press({ key: (await keysOf(ui, 'turn:main:'))[1]! })
+      expect(o.calls).toEqual([{ view: {} }])
+      expect(await ui.find({ text: /ui\.scroll/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a press on main's turn with main already in view only scrolls (${surface})`, async ($, on) => {
+      const w = world(on)
+      const o = ops(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      await step($)
+      const ui = await mountWith($, surface, {})
+      await ui.press({ key: 'agent:main' })
+      await w.clock.settle()
+      await ui.press({ key: (await keysOf(ui, 'turn:main:'))[1]! })
+      expect(o.calls).toEqual([])
+      expect(await ui.find({ text: /ui\.scroll/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`rows are one line each, no blank lines between them, aligned in columns (${surface})`, async ($, on) => {
+      const w = world(on)
+      const mixed = [
+        { role: 'user', text: 'short', toolUses: [] },
+        { role: 'user', text: `a very long ask ${'word '.repeat(60)}`, toolUses: [{ tool_use_id: 'x', tool: 'Edit', input: { file_path: '/a' }, text: 'ok' }] },
+        { role: 'user', text: 'run it', toolUses: [{ tool_use_id: 'y', tool: 'Bash', input: { command: 'ls' }, text: 'ok' }] },
+      ]
+      on('session.messages', () => ({ value: mixed as never }))
       await running($, w)
       const ui = await mountPane($, surface)
       await open(ui, w)
-      expect(await keysOf(ui, 'jump:agent1:')).toHaveLength(1)
-      expect(await ui.find({ text: '↗' })).toBeDefined()
+      const texts = await Promise.all([0, 1, 2].map(n => rowText(ui, n)))
+      for (const t of texts) expect(t).not.toContain('\n')
+      if (surface === 'terminal') {
+        // 100 columns less the pane's frame: every row fills it exactly, so the columns line up.
+        expect(new Set(texts.map(t => t.length)).size).toBe(1)
+        expect(texts[1]).toContain('…')
+        expect(texts[1]!.indexOf('✎ 1 file')).toBe(texts[0]!.indexOf('reply') - 3)
+      } else {
+        const row = (await ui.find({ key: 'turnrow:' + (await keysOf(ui, 'turn:agent1:'))[0]!.replace('turn:agent1:', '') }))!
+        expect(row.props.flexDirection).toBe('row')
+        const grow = (await ui.findAll({ type: 'Box' })).filter(b => b.props.flexGrow === 1)
+        expect(grow.length).toBeGreaterThan(0)
+      }
       await ui.unmount()
     })
 
@@ -1396,7 +1564,7 @@ describe('agent timeline', () => {
       const ui = await mountPane($, surface)
       await open(ui, w)
       expect(await keysOf(ui, 'turn:agent1:')).toHaveLength(30)
-      expect(await ui.find({ text: /Timeline · impl-1 · 30 turns/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-1.*30 turns/ })).toBeDefined()
       await ui.unmount()
     })
   }
@@ -1410,7 +1578,7 @@ describe('agent timeline: final review', () => {
   const mountWith = ($: Engine, surface: 'terminal' | 'desktop', view?: { agentId?: string }) =>
     $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns: 100, view } as never })
   const jump = async (ui: Parameters<typeof expandTurns>[0]) => {
-    const key = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('jump:agent1:'))!
+    const key = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('turn:agent1:'))!
     await ui.press({ key })
   }
 
@@ -1423,7 +1591,7 @@ describe('agent timeline: final review', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle()
-      expect(await ui.find({ text: /Timeline · impl-1 · 200 turns/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-1.*200 turns/ })).toBeDefined()
       await ui.unmount()
     })
 
@@ -1439,11 +1607,11 @@ describe('agent timeline: final review', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle()
-      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-1.*1 turn/ })).toBeDefined()
       await ui.press({ key: 'timeline-back' })
       await ui.press({ key: 'agent:agent2' })
       await w.clock.settle()
-      expect(await ui.find({ text: /Timeline · impl-2 · 1 turn/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-2.*1 turn/ })).toBeDefined()
       await ui.press({ key: 'timeline-back' })
       // agent1's read now never answers: a cached copy would still show its turn.
       holdAgent1 = true
@@ -1471,10 +1639,10 @@ describe('agent timeline: final review', () => {
       await ui.press({ key: 'timeline-back' })
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle()
-      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-1.*1 turn/ })).toBeDefined()
       release2()
       await w.clock.settle()
-      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-1.*1 turn/ })).toBeDefined()
       // agent2 was not stored: opening it again waits for a fresh read.
       holdAgent2 = true
       await ui.press({ key: 'timeline-back' })
@@ -1546,7 +1714,7 @@ describe('agent timeline: final review', () => {
       await ui.press({ key: 'fold:agent1' })
       await ui.press({ key: 'agent:agent2' })
       await w.clock.settle()
-      expect(await ui.find({ text: /Timeline · impl-2/ })).toBeDefined()
+      expect(await ui.find({ key: 'timeline-header', text: /Timeline.*impl-2/ })).toBeDefined()
       // It finishes, so the fold hides it from the list; the Timeline goes with it.
       await complete($, 'agent2', 'R2')
       w.agents = [{ id: 'agent1', name: 'impl-1' }]
@@ -1667,7 +1835,7 @@ describe('agent transcript', () => {
     })
   }
 
-  test('terminal: main is pressable (to collapse it) but opens no transcript', async ($, on) => {
+  test('terminal: pressing main opens its Timeline, read once with no agentId', async ($, on) => {
     const w = world(on)
     let asked = 0
     on('session.messages', () => {
@@ -1680,12 +1848,12 @@ describe('agent transcript', () => {
     expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
     await ui.press({ key: 'agent:main' })
     await w.clock.settle()
-    expect(await ui.find({ key: 'transcript:main' })).toBeUndefined()
-    expect(asked).toBe(0)
+    expect(await ui.find({ key: 'transcript:main' })).toBeDefined()
+    expect(asked).toBe(1)
     await ui.unmount()
   })
 
-  test('desktop: pressing main highlights it but opens no transcript', async ($, on) => {
+  test('desktop: pressing main opens its Timeline, read once with no agentId', async ($, on) => {
     const w = world(on)
     let asked = 0
     on('session.messages', () => {
@@ -1696,8 +1864,9 @@ describe('agent transcript', () => {
     await step($)
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:main' })
-    expect(await ui.find({ key: 'transcript:main' })).toBeUndefined()
-    expect(asked).toBe(0)
+    await w.clock.settle()
+    expect(await ui.find({ key: 'transcript:main' })).toBeDefined()
+    expect(asked).toBe(1)
     await ui.unmount()
   })
 })
@@ -3562,14 +3731,15 @@ describe('collapse', () => {
       expect(key.props.hotkey).toBe('c')
       expect(key.props.plain).toBe(true)
       expect(key.props.label).toBe('collapse main thread')
-      await ui.press({ key: 'agent:main' })
-      expect((await hotkey(ui))!.props.label).toBe('collapse main thread')
       await ui.press({ key: 'fold-hotkey' })
       expect((await hotkey(ui))!.props.label).toBe('expand main thread')
       await ui.press({ key: 'fold-hotkey' })
       expect((await hotkey(ui))!.props.label).toBe('collapse main thread')
-      // A subagent's Timeline takes the pane, and the header with its hotkey.
+      // A Timeline takes the pane, main's too, and the header with its hotkey.
       await ui.press({ key: 'agent:agent4' })
+      expect(await hotkey(ui)).toBeUndefined()
+      await ui.press({ key: 'timeline-back' })
+      await ui.press({ key: 'agent:main' })
       expect(await hotkey(ui)).toBeUndefined()
       await ui.unmount()
     })

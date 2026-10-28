@@ -84,27 +84,54 @@ export const timelineOf = (tr: Transcript | undefined): { dim: string } | { turn
   return turns.length > 0 ? { turns } : { dim: 'no messages yet' }
 }
 
-/** `Timeline · <name> · N turns` (`1 turn`). */
-export const timelineHeader = (name: string, turns: number): string => `Timeline · ${name} · ${plural(turns, 'turn', 'turns')}`
+/** `3 turns` (`1 turn`). */
+export const turnCount = (turns: number): string => plural(turns, 'turn', 'turns')
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const DAY_MS = 86_400_000
+
+/** The width of the time column: `28 Oct`, and `• here` in its place on the current turn. */
+export const TIME_W = 6
+
+/** A turn's time: `hh:mm` for today, `D Mon` for an earlier day (both UTC, as the log's), `--:--` when unknown. */
+export const stampOf = (t: number | undefined, now: number): string => {
+  if (t === undefined) return '--:--'
+  if (Math.floor(t / DAY_MS) === Math.floor(now / DAY_MS)) return hhmm(t)
+  const d = new Date(t)
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`
+}
+
+export type TimelineCols = { numW: number; outW: number }
+
+/** The number column (the count's digits) and the outcome column (the widest outcome) of a Timeline's rows. */
+export const timelineCols = (turns: readonly TimelineTurn[]): TimelineCols => ({
+  numW: String(turns.length).length,
+  outW: turns.reduce((w, t) => Math.max(w, t.outcome.length), 0),
+})
 
 export type TimelineRow = {
+  /** Right-aligned in the number column. */
   num: string
+  /** Cut to `room`, not padded. */
   preview: string
+  /** The preview column's width. */
+  room: number
+  /** Right-aligned in the outcome column. */
   outcome: string
   here: boolean
+  /** Right-aligned in TIME_W; the current turn draws `• here` instead. */
   time: string
 }
 
-/** One row's cells: the fixed ones (number, outcome, time, jump, `• here`) and single-space gaps come off the width, the preview gets the rest, never under 8 columns. */
-export const timelineRow = (turn: TimelineTurn, width: number, numW: number): TimelineRow => {
-  const cells = turn.isCurrent ? 6 : 5
-  const fixed = numW + turn.outcome.length + 5 + 2 + (turn.isCurrent ? 7 : 0) + (cells - 1)
-  const room = Math.max(8, width - fixed)
+/** One row's cells: the fold glyph, number, outcome and time columns and four single-space gaps come off the width, the preview gets the rest, never under 8 columns. */
+export const timelineRow = (turn: TimelineTurn, width: number, cols: TimelineCols, now: number): TimelineRow => {
+  const room = Math.max(8, width - (1 + cols.numW + cols.outW + TIME_W + 4))
   return {
-    num: String(turn.number).padStart(numW),
+    num: String(turn.number).padStart(cols.numW),
     preview: turn.preview.length > room ? cut(turn.preview, room) : turn.preview,
-    outcome: turn.outcome,
+    room,
+    outcome: turn.outcome.padStart(cols.outW),
     here: turn.isCurrent,
-    time: turn.t === undefined ? '--:--' : hhmm(turn.t),
+    time: stampOf(turn.t, now).padStart(TIME_W),
   }
 }
