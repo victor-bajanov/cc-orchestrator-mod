@@ -161,8 +161,12 @@ declare module 'claude-code' {
       runId: string
       /** The one cut line shown whole: an activity line (`log-…`) or a transcript text (`step-<agentId>-…`); '' for none. */
       pinnedLog: string
-      /** The agent a click selected: its chart line highlighted, its transcript shown beneath its row ('' for none). */
+      /** The agent a click selected: its chart line highlighted, its Timeline taking over the pane ('' for none). */
       selectedAgent: string
+      /** Turns of the open timeline shown expanded, by turn key. */
+      expandedTurns: string[]
+      /** Why the last jump could not go ('' for none); drawn under the timeline's header. */
+      jumpNote: string
       /** Each agent's last transcript items by id, read off the render; the pane draws the selected one's. */
       transcripts: Record<string, Transcript>
       /** Messages queued by timers, delivered by the next hook to run. */

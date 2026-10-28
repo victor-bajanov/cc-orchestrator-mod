@@ -358,6 +358,14 @@ const phase = (w: World) => snapshot(w).mainPhase
 const mountPane = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile', bodyColumns = 100) =>
   $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns } as never })
 
+/** Expands every turn of the open Timeline, so its items are drawn. */
+const expandTurns = async (ui: {
+  findAll: (q: { type: 'Button' }) => Promise<readonly { key?: string }[]>
+  press: (q: { key: string }) => Promise<unknown>
+}) => {
+  for (const b of await ui.findAll({ type: 'Button' })) if ((b.key ?? '').startsWith('turn:')) await ui.press({ key: b.key! })
+}
+
 /** One live agent at 300k; main stays at its default 1,000 tokens, below every threshold. */
 const running = async ($: Engine, w: World) => {
   await start($)
@@ -890,13 +898,14 @@ describe('desktop pane', () => {
     await term.unmount()
   })
 
-  test('pressing an agent selects its line; pressing again clears it', async ($, on) => {
+  test('pressing main selects its line; pressing again clears it', async ($, on) => {
     const w = world(on)
     await running($, w)
+    await step($)
     const ui = await mountPane($, 'desktop')
-    await ui.press({ key: 'agent:agent1' })
+    await ui.press({ key: 'agent:main' })
     expect(String((await ui.find({ type: 'Svg' }))!.props.source)).toContain('stroke-width="3"')
-    await ui.press({ key: 'agent:agent1' })
+    await ui.press({ key: 'agent:main' })
     expect(String((await ui.find({ type: 'Svg' }))!.props.source)).not.toContain('stroke-width="3"')
     await ui.unmount()
   })
@@ -1112,16 +1121,16 @@ describe('agent in view', () => {
   test('desktop: a click selection wins the highlight; the in-view mark stays put', async ($, on) => {
     const w = world(on)
     await running($, w)
-    await spawn($, { prompt: 'P2', name: 'impl-2' })
-    await step($, 'agent2')
+    await step($)
     const ui = await mountViewed($, 'desktop', { agentId: 'agent1' })
-    await ui.press({ key: 'agent:agent2' })
+    const before = await source(ui)
+    expect(before.match(/stroke-width="3"/g)).toHaveLength(1)
+    await ui.press({ key: 'agent:main' })
     const src = await source(ui)
     expect(src.match(/stroke-width="3"/g)).toHaveLength(1)
-    expect(src).toContain('stroke="#E69F00" stroke-width="3"')
-    expect(src).toContain('stroke="#0072B2" stroke-width="1.5" opacity="0.3"')
+    expect(src).not.toBe(before)
     expect((await ui.find({ key: 'agent:agent1' }))!.text).toContain('in view')
-    expect((await ui.find({ key: 'agent:agent2' }))!.text).not.toContain('in view')
+    expect((await ui.find({ key: 'agent:main' }))!.text).not.toContain('in view')
     await ui.unmount()
   })
 
@@ -1176,6 +1185,385 @@ describe('agent in view', () => {
   }
 })
 
+describe('agent timeline', () => {
+  const LONG = `Long thoughts: ${'the plan has many parts and each needs care. '.repeat(12)}END`
+  const convo = [
+    { role: 'user', text: 'Implement task 1', toolUses: [] },
+    { role: 'assistant', text: LONG, toolUses: [] },
+    { role: 'user', text: 'Now run the tests', toolUses: [] },
+    { role: 'assistant', text: 'Running them', toolUses: [{ tool_use_id: 'tb', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS' }] },
+  ]
+  type Ui = Awaited<ReturnType<typeof mountPane>>
+  const mountWith = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile', view?: { agentId?: string }) =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns: 100, view } as never })
+  const keysOf = async (ui: Ui, prefix: string) =>
+    (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith(prefix))
+  /** The jump key of the nth turn (the turn row's key with its prefix swapped). */
+  const jumpKey = async (ui: Ui, n: number) => (await keysOf(ui, 'turn:agent1:'))[n]!.replace('turn:', 'jump:')
+  const open = async (ui: Ui, w: World) => {
+    await ui.press({ key: 'agent:agent1' })
+    await w.clock.settle() // the read runs off the render
+  }
+  /** Records each ui.view the plugin raises; it answers `deny` when set, and throws when `viewThrows`. */
+  const ops = (on: On) => {
+    const o = { calls: [] as unknown[], viewDeny: '', viewThrows: false }
+    on('ui.view', ($, e) => {
+      o.calls.push({ view: e })
+      if (o.viewThrows) throw new Error('no such op')
+      return { value: o.viewDeny ? { deny: o.viewDeny } : {} } as never
+    })
+    return o
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`pressing an agent takes the pane over with its timeline (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      if (surface === 'desktop') expect(await ui.find({ type: 'Svg' })).toBeDefined()
+      await open(ui, w)
+      expect(await ui.find({ text: /Timeline · impl-1 · 2 turns/ })).toBeDefined()
+      expect(await ui.find({ key: 'agent:agent1' })).toBeUndefined()
+      expect(await ui.find({ type: 'Svg' })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`each turn is a row with its number, preview, outcome and time; the last is here (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      const [first, last] = await keysOf(ui, 'turn:agent1:')
+      const one = (await ui.find({ key: first! }))!.text
+      expect(one).toContain('1')
+      expect(one).toContain('Implement task 1')
+      expect(one).toContain('reply')
+      expect(one).toContain(hhmm(1_000_000)) // the brief carries the agent's start
+      expect(one).not.toContain('• here')
+      const two = (await ui.find({ key: last! }))!.text
+      expect(two).toContain('Now run the tests')
+      expect(two).toContain('› 1 cmd')
+      expect(two).toContain('--:--')
+      expect(two).toContain('• here')
+      await ui.unmount()
+    })
+
+    test(`← agents returns to the list, and a second open starts folded (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      const back = (await ui.find({ key: 'timeline-back' }))!
+      expect(back.props.hotkey).toBe('b')
+      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
+      expect(await ui.find({ key: 'tool:agent1:tb' })).toBeDefined()
+      await ui.press({ key: 'timeline-back' })
+      expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
+      expect(await ui.find({ text: /Timeline/ })).toBeUndefined()
+      await open(ui, w)
+      expect(await ui.find({ text: /Timeline · impl-1/ })).toBeDefined()
+      expect(await ui.find({ key: 'tool:agent1:tb' })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`pressing a turn expands it in place, and again folds it (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      const [first, last] = await keysOf(ui, 'turn:agent1:')
+      expect(await ui.find({ key: 'tool:agent1:tb' })).toBeUndefined()
+      await ui.press({ key: last! })
+      expect(await ui.find({ key: 'tool:agent1:tb' })).toBeDefined()
+      await ui.press({ key: first! })
+      const card = (await keysOf(ui, 'step-agent1-'))[0]!
+      expect(card).toBeDefined()
+      await ui.press({ key: card })
+      expect((await ui.find({ key: `full:${card}` }))!.text).toContain('END')
+      await ui.press({ key: last! })
+      expect(await ui.find({ key: 'tool:agent1:tb' })).toBeUndefined()
+      await ui.press({ key: first! })
+      expect(await ui.find({ key: card })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`pressing an expanded tool line opens its detail (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      await ui.press({ key: (await keysOf(ui, 'turn:agent1:'))[1]! })
+      await ui.press({ key: 'tool:agent1:tb' })
+      expect(w.opened).toContain('orchestrator-tool')
+      await ui.unmount()
+    })
+
+    // The mounted pane answers a scroll of a transcript row itself, beneath nothing a test can hook: the mod
+    // turns that refusal into the note, which shows the call was made (its target is read in the real host).
+    test(`a jump with the agent already in view scrolls and switches nothing (${surface})`, async ($, on) => {
+      const w = world(on)
+      const o = ops(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, { agentId: 'agent1' })
+      await open(ui, w)
+      await ui.press({ key: await jumpKey(ui, 1) })
+      expect(o.calls).toEqual([])
+      expect(await ui.find({ text: /ui\.scroll/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a jump with main in view switches the view first, then scrolls (${surface})`, async ($, on) => {
+      const w = world(on)
+      const o = ops(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await open(ui, w)
+      await ui.press({ key: await jumpKey(ui, 1) })
+      expect(o.calls).toEqual([{ view: { agentId: 'agent1' } }])
+      expect(await ui.find({ text: /ui\.scroll/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a refused view shows its reason until dismissed, and scrolls nowhere (${surface})`, async ($, on) => {
+      const w = world(on)
+      const o = ops(on)
+      o.viewDeny = 'teammate in a pane of its own'
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await open(ui, w)
+      expect(await ui.find({ key: 'jump-note-dismiss' })).toBeUndefined()
+      await ui.press({ key: await jumpKey(ui, 1) })
+      expect(await ui.find({ text: /teammate in a pane of its own/ })).toBeDefined()
+      expect(await ui.find({ text: /ui\.scroll/ })).toBeUndefined()
+      await ui.press({ key: 'jump-note-dismiss' })
+      expect(await ui.find({ text: /teammate in a pane of its own/ })).toBeUndefined()
+      expect(await ui.find({ key: 'jump-note-dismiss' })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`an engine without ui.view says to open the agent from /tasks (${surface})`, async ($, on) => {
+      const w = world(on)
+      const o = ops(on)
+      // The call fails, as on an engine before 2.1.312 where it does not exist.
+      o.viewThrows = true
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await open(ui, w)
+      await ui.press({ key: await jumpKey(ui, 1) })
+      expect(await ui.find({ text: /Open impl-1 from \/tasks to jump there/ })).toBeDefined()
+      expect(o.calls).toHaveLength(1) // the attempt
+      expect(await ui.find({ text: /ui\.scroll/ })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`a turn with no tool call has no jump button (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      expect(await keysOf(ui, 'jump:agent1:')).toHaveLength(1)
+      expect(await ui.find({ text: '↗' })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a transcript the session refuses shows one dim line and no turns (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: { deny: 'agent1 runs in another process' } }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      expect(await ui.find({ key: 'agent:agent1' })).toBeUndefined()
+      expect(await ui.find({ text: DENIED })).toBeDefined()
+      expect(await keysOf(ui, 'turn:agent1:')).toHaveLength(0)
+      await ui.unmount()
+    })
+
+    test(`thirty turns are thirty rows in one column, none dropped (${surface})`, async ($, on) => {
+      const w = world(on)
+      const many = Array.from({ length: 30 }, (_, i) => ({ role: 'user', text: `ask ${i}`, toolUses: [] }))
+      on('session.messages', () => ({ value: many as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await open(ui, w)
+      expect(await keysOf(ui, 'turn:agent1:')).toHaveLength(30)
+      expect(await ui.find({ text: /Timeline · impl-1 · 30 turns/ })).toBeDefined()
+      await ui.unmount()
+    })
+  }
+})
+
+describe('agent timeline: final review', () => {
+  const convo = [
+    { role: 'user', text: 'Implement task 1', toolUses: [] },
+    { role: 'assistant', text: 'Running them', toolUses: [{ tool_use_id: 'tb', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS' }] },
+  ]
+  const mountWith = ($: Engine, surface: 'terminal' | 'desktop', view?: { agentId?: string }) =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns: 100, view } as never })
+  const jump = async (ui: Parameters<typeof expandTurns>[0]) => {
+    const key = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('jump:agent1:'))!
+    await ui.press({ key })
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`only the last 200 items are kept (${surface})`, async ($, on) => {
+      const w = world(on)
+      const many = Array.from({ length: 250 }, (_, i) => ({ role: 'user', text: `ask ${i}`, toolUses: [] }))
+      on('session.messages', () => ({ value: many as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 200 turns/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`reading one agent drops the cached transcripts of the others (${surface})`, async ($, on) => {
+      const w = world(on)
+      let holdAgent1 = false
+      on('session.messages', ($, e) =>
+        e.agentId === 'agent1' && holdAgent1 ? new Promise(() => {}) : ({ value: convo as never }),
+      )
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2' })
+      await step($, 'agent2')
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      await ui.press({ key: 'timeline-back' })
+      await ui.press({ key: 'agent:agent2' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-2 · 1 turn/ })).toBeDefined()
+      await ui.press({ key: 'timeline-back' })
+      // agent1's read now never answers: a cached copy would still show its turn.
+      holdAgent1 = true
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /loading…/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a read that settles after another agent was opened leaves that agent's turns alone (${surface})`, async ($, on) => {
+      const w = world(on)
+      let holdAgent2 = true
+      let release2 = () => {}
+      on('session.messages', ($, e) =>
+        e.agentId === 'agent2' && holdAgent2
+          ? new Promise(resolve => (release2 = () => resolve({ value: convo as never })))
+          : ({ value: convo as never }),
+      )
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2' })
+      await step($, 'agent2')
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent2' }) // its read is held
+      await w.clock.settle()
+      await ui.press({ key: 'timeline-back' })
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      release2()
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      // agent2 was not stored: opening it again waits for a fresh read.
+      holdAgent2 = true
+      await ui.press({ key: 'timeline-back' })
+      await ui.press({ key: 'agent:agent2' })
+      expect(await ui.find({ text: /loading…/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a view that fails for another reason shows its message, bare (${surface})`, async ($, on) => {
+      const w = world(on)
+      // A hook's deny rejects the call.
+      on('ui.view', () => ({ deny: 'the view is busy' }) as never)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      await jump(ui)
+      const note = await ui.find({ text: /the view is busy/ })
+      expect(note).toBeDefined()
+      expect(note!.text).not.toContain('Error')
+      expect(await ui.find({ text: /from \/tasks/ })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`a view missing from the engine still says to open the agent from /tasks (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('ui.view', () => {
+        throw new TypeError('$.ui.view is not a function')
+      })
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      await jump(ui)
+      expect(await ui.find({ text: /Open impl-1 from \/tasks to jump there/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a scroll that fails shows its reason with no Error prefix (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('ui.view', () => ({ value: {} }) as never)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, { agentId: 'agent1' })
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      await jump(ui)
+      const note = (await ui.find({ text: /ui\.scroll/ }))!
+      expect(note).toBeDefined()
+      expect(note.text).not.toMatch(/Error:/)
+      await ui.unmount()
+    })
+
+    test(`a selected agent that leaves the list does not bring its Timeline back with it (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      await step($)
+      for (const n of [2, 3]) {
+        await spawn($, { prompt: `P${n}`, name: `impl-${n}`, parentAgentId: 'agent1' })
+        await step($, `agent${n}`)
+      }
+      await complete($, 'agent3', 'R3')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+      await w.clock.advance(30_000)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'fold:agent1' })
+      await ui.press({ key: 'agent:agent2' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-2/ })).toBeDefined()
+      // It finishes, so the fold hides it from the list; the Timeline goes with it.
+      await complete($, 'agent2', 'R2')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }]
+      await w.clock.advance(30_000)
+      expect(await ui.find({ text: /Timeline/ })).toBeUndefined()
+      expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
+      // It runs again and is back in the list: the list shows, not the Timeline.
+      await step($, 'agent2')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+      await w.clock.advance(30_000)
+      expect(await ui.find({ text: /Timeline/ })).toBeUndefined()
+      expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
+      await ui.unmount()
+    })
+  }
+})
+
 describe('agent transcript', () => {
   const transcript = [
     { role: 'user', text: 'Implement task 1', toolUses: [] },
@@ -1192,7 +1580,7 @@ describe('agent transcript', () => {
   ]
 
   for (const surface of ['terminal', 'desktop'] as const) {
-    test(`pressing an agent opens its transcript beneath it; pressing again closes it (${surface})`, async ($, on) => {
+    test(`an expanded turn lists a text and a line per tool call; ← agents closes the Timeline (${surface})`, async ($, on) => {
       const w = world(on)
       const asked: (string | undefined)[] = []
       on('session.messages', ($, e) => {
@@ -1204,8 +1592,9 @@ describe('agent transcript', () => {
       expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle() // the read runs off the render
+      expect(await ui.find({ key: 'transcript:agent1' })).toBeDefined()
+      await expandTurns(ui)
       const peek = (await ui.find({ key: 'transcript:agent1' }))!
-      expect(peek).toBeDefined()
       expect(peek.text).toContain('Tests are red, as expected')
       // One item per message text and per tool call, no summary line.
       expect(peek.text).toContain('Reading the plan')
@@ -1213,8 +1602,7 @@ describe('agent transcript', () => {
       expect(peek.text.match(/⚙ Bash/g)).toHaveLength(2)
       expect(peek.text).not.toContain('Bash×2')
       expect(asked).toContain('agent1')
-      await ui.press({ key: 'agent:agent1' })
-      await w.clock.settle() // the read runs off the render
+      await ui.press({ key: 'timeline-back' })
       expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
       await ui.unmount()
     })
@@ -1272,7 +1660,7 @@ describe('agent transcript', () => {
       const walk = (n: unknown): Drawn[] =>
         n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
       const box = walk(await ui.drawn()).find(b => b.type === 'Box' && b.props?.key === 'transcript:agent1')!
-      const lines = walk(box).filter(b => b.type === 'Text')
+      const lines = walk(box).filter(b => b.type === 'Text' && b.props?.wrap === 'truncate')
       expect(lines).toHaveLength(1)
       expect(lines[0]!.props?.wrap).toBe('truncate')
       await ui.unmount()
@@ -1312,29 +1700,6 @@ describe('agent transcript', () => {
     expect(asked).toBe(0)
     await ui.unmount()
   })
-
-  test('terminal: an open transcript takes its rows from the activity', async ($, on) => {
-    const w = world(on)
-    // Three items: the brief, then a text and its one tool call.
-    const three = [transcript[0], { role: 'assistant', text: 'Reading the plan', toolUses: [{ tool_use_id: 'a', tool: 'Read', input: {} }] }]
-    on('session.messages', () => ({ value: three as never }))
-    await start($)
-    for (let i = 1; i <= 12; i++) await spawn($, { prompt: 'P', name: `impl-${i}` })
-    const ui = await mountPane($, 'terminal', 80)
-    type Drawn = { type: string; props?: Record<string, unknown>; children?: unknown[] }
-    const walk = (n: unknown): Drawn[] =>
-      n && typeof n === 'object' ? [n as Drawn, ...((n as Drawn).children ?? []).flatMap(walk)] : []
-    const activity = async () =>
-      walk(await ui.drawn()).filter(
-        b => b.type === 'Text' && b.props?.wrap === 'truncate' && (b.children ?? []).some(c => typeof c === 'string' && c.includes('spawned')),
-      ).length
-    const ROOM = 30 - 12 - 8 - 1 // the Hand over main button's row, as in 'terminal pane header'
-    expect(await activity()).toBe(ROOM)
-    await ui.press({ key: 'agent:agent1' })
-    await w.clock.settle() // the read runs off the render
-    expect(await activity()).toBe(ROOM - (3 + 2)) // three transcript items inside a border
-    await ui.unmount()
-  })
 })
 
 describe('transcript read off the render', () => {
@@ -1360,6 +1725,7 @@ describe('transcript read off the render', () => {
       await ui.press({ key: 'agent:agent1' })
       expect(await ui.find({ text: /impl-1/ })).toBeDefined()
       expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain('loading…')
+      await ui.press({ key: 'timeline-back' })
       if (surface === 'desktop') {
         await ui.press({ key: 'handover:agent1' })
         expect(row(w, 'agent1')!.status).toBe('handing-over')
@@ -1377,9 +1743,11 @@ describe('transcript read off the render', () => {
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       await w.clock.settle()
+      await expandTurns(ui)
       expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain('loading…')
       h.release()
       await w.clock.settle()
+      await expandTurns(ui)
       const peek = (await ui.find({ key: 'transcript:agent1' }))!.text
       expect(peek).toContain('Tests are red, as expected')
       expect(peek).not.toContain('loading…')
@@ -1420,12 +1788,13 @@ describe('transcript read off the render', () => {
     const ui = await mountPane($, 'desktop', 4000)
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     const text = (await ui.find({ key: 'transcript:agent1' }))!.text
     expect(text).toContain('yyy')
     // Kept whole up to STEP_CHARS (2000) so it can be expanded, and cut there.
     expect(text).toContain('…')
-    expect(text.match(/y+/)![0].length).toBeLessThan(2000)
-    expect(text.match(/y+/)![0].length).toBeGreaterThan(500)
+    expect(text.match(/y{3,}/)![0].length).toBeLessThan(2000)
+    expect(text.match(/y{3,}/)![0].length).toBeGreaterThan(500)
     await ui.unmount()
   })
 
@@ -1436,6 +1805,7 @@ describe('transcript read off the render', () => {
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     await step($, 'agent1')
     await tool($, 'agent1')
     await w.clock.settle()
@@ -1472,6 +1842,7 @@ describe('transcript reads under load', () => {
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     await ui.unmount()
     await $.command.run({ command: 'orch', args: 'handover impl-1' } as never)
     expect(row(w, 'agent1')!.status).toBe('handing-over')
@@ -1489,6 +1860,7 @@ describe('transcript reads under load', () => {
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     await step($, 'agent1')
     await w.clock.settle()
     expect(q).toHaveLength(1)
@@ -1497,6 +1869,7 @@ describe('transcript reads under load', () => {
     expect(q).toHaveLength(2)
     q[1]!(said('second'))
     await w.clock.settle()
+    await expandTurns(ui)
     expect((await ui.find({ key: 'transcript:agent1' }))!.text).toContain('second')
     await ui.unmount()
   })
@@ -1508,10 +1881,12 @@ describe('transcript reads under load', () => {
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     q[0]!(said('first'))
     await w.clock.settle()
     await step($, 'agent1')
     await w.clock.advance(PEEK_TIMEOUT_MS + 10)
+    await expandTurns(ui)
     const text = (await ui.find({ key: 'transcript:agent1' }))!.text
     expect(text).toContain('first')
     expect(text).not.toContain(DENIED)
@@ -1526,6 +1901,7 @@ describe('transcript reads under load', () => {
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     await complete($, 'agent1')
     await w.clock.advance(30_000)
     await w.clock.settle()
@@ -1722,6 +2098,7 @@ describe('timestamped transcript', () => {
     const ui = await mountPane($, surface, cols)
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     return ui
   }
 
@@ -1869,13 +2246,11 @@ describe('timestamped transcript', () => {
     const button = await stepButton(ui)
     await ui.press({ key: button.key! })
     const drawn = walk(await ui.drawn())
-    const box = drawn.find(b => b.props?.key === 'transcript:agent1')!
-    const peekRows = (box.children ?? []).filter(c => c && typeof c === 'object').length + 2
     const full = drawn.find(b => b.props?.key === `full:${button.key}`)!
     expect(full).toBeDefined()
     const lines = (full.children as Drawn[]).filter(c => c.type === 'Text')
-    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
-    expect(lines.length).toBeLessThanOrEqual(expandCap(terminalBase({ rows: 30, agents, peekRows, buttonRow: true })))
+    // A Timeline has no list, button row or activity beside it.
+    expect(lines.length).toBeLessThanOrEqual(expandCap(terminalBase({ rows: 30, agents: 0, peekRows: 0, buttonRow: false })))
     expect(JSON.stringify(lines[lines.length - 1]!.children)).toContain('…')
     expect(JSON.stringify(full.children)).not.toContain('END')
     // The frame's budget reserves 5 rows of slack: the pane draws at most the viewport less those.
@@ -1887,8 +2262,8 @@ describe('timestamped transcript', () => {
     const w = world(on)
     longStub(on)
     await running($, w)
-    // agent1's row, the button row and the transcript box (brief and text: 2 items + border) on 18 rows: base 4.
-    const ROWS = 18
+    // The Timeline has the frame's 8 rows around it: on 14 rows base is 6, which leaves no room for an expansion.
+    const ROWS = 14
     const ui = await $.ui.mount({
       plugin: 'orchestrator',
       surface: 'terminal',
@@ -1899,10 +2274,8 @@ describe('timestamped transcript', () => {
     })
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
-    const box = walk(await ui.drawn()).find(b => b.props?.key === 'transcript:agent1')!
-    const peekRows = (box.children ?? []).filter(c => c && typeof c === 'object').length + 2
-    const agents = (await ui.findAll({ type: 'Button' })).filter(b => (b.key ?? '').startsWith('agent:')).length
-    expect(terminalBase({ rows: ROWS, agents, peekRows, buttonRow: true })).toBe(4)
+    await expandTurns(ui)
+    expect(terminalBase({ rows: ROWS, agents: 0, peekRows: 0, buttonRow: false })).toBe(6)
     const button = (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
     await ui.press({ key: button.key! })
     expect(await ui.find({ key: `full:${button.key}` })).toBeUndefined()
@@ -1949,18 +2322,17 @@ describe('timestamped transcript', () => {
     await ui.unmount()
   })
 
-  test('the terminal shows the last 6 items, the desktop the last 12', async ($, on) => {
+  test('an expanded turn shows all its items, not just the last few', async ($, on) => {
     const w = world(on)
     const many = Array.from({ length: 20 }, (_, i) => ({ role: 'assistant', text: `item ${i}`, toolUses: [] }))
     on('session.messages', () => ({ value: [brief, ...many] as never }))
     await running($, w)
-    for (const [surface, n] of [['terminal', 6], ['desktop', 12]] as const) {
+    for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await open($, w, surface)
       const text = (await ui.find({ key: 'transcript:agent1' }))!.text
       expect(text).toContain('item 19')
-      expect(text).toContain(`item ${20 - n}`)
-      expect(text).not.toContain(`item ${19 - n}`)
-      await ui.press({ key: 'agent:agent1' })
+      expect(text).toContain('item 0')
+      await ui.press({ key: 'timeline-back' })
       await ui.unmount()
     }
   })
@@ -1985,6 +2357,7 @@ describe('tool detail', () => {
     const ui = await mountPane($, surface)
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     return ui
   }
   const codes = async (ui: Ui) => (await ui.findAll({ type: 'Code' })).map(c => c.props as Record<string, unknown>)
@@ -1997,6 +2370,7 @@ describe('tool detail', () => {
       const ui = await opened($, w, surface)
       await ui.press({ key: 'tool:agent1:b' })
       expect(w.opened).toContain(TOOL)
+      await ui.press({ key: 'timeline-back' })
       if (surface === 'desktop') {
         await ui.press({ key: 'handover:agent1' })
         expect(row(w, 'agent1')!.status).toBe('handing-over')
@@ -3119,14 +3493,14 @@ describe('collapse', () => {
       await ui.unmount()
     })
 
-    test(`a row press only opens and closes the transcript; it never collapses (${surface})`, async ($, on) => {
+    test(`a row press only opens and closes the Timeline; it never collapses (${surface})`, async ($, on) => {
       const w = world(on)
       on('session.messages', () => ({ value: [] }))
       await crew($, w)
       const ui = await mountPane($, surface)
       await ui.press({ key: 'agent:agent1' })
       expect(await ui.find({ key: 'transcript:agent1' })).toBeDefined()
-      await ui.press({ key: 'agent:agent1' })
+      await ui.press({ key: 'timeline-back' })
       expect(await ui.find({ key: 'transcript:agent1' })).toBeUndefined()
       expect(await drawn(ui, surface, 'agent2')).toBe(true)
       expect(await drawn(ui, surface, 'agent3')).toBe(true)
@@ -3144,19 +3518,6 @@ describe('collapse', () => {
       expect(await ui.find({ key: 'nofold:agent4' })).toBeDefined()
       await fold(ui, 'agent1')
       expect(await ui.find({ key: 'fold:agent1' })).toBeDefined()
-      await ui.unmount()
-    })
-
-    test(`folding keeps the open transcript (${surface})`, async ($, on) => {
-      const w = world(on)
-      on('session.messages', () => ({ value: [] }))
-      await crew($, w)
-      const ui = await mountPane($, surface)
-      await ui.press({ key: 'agent:agent4' })
-      await fold(ui, 'agent1')
-      await w.clock.settle()
-      expect(await drawn(ui, surface, 'agent2')).toBe(false)
-      expect(await ui.find({ key: 'transcript:agent4' })).toBeDefined()
       await ui.unmount()
     })
 
@@ -3201,14 +3562,13 @@ describe('collapse', () => {
       expect(key.props.hotkey).toBe('c')
       expect(key.props.plain).toBe(true)
       expect(key.props.label).toBe('collapse main thread')
-      await ui.press({ key: 'agent:agent1' })
-      expect((await hotkey(ui))!.props.label).toBe('collapse impl-1')
+      await ui.press({ key: 'agent:main' })
+      expect((await hotkey(ui))!.props.label).toBe('collapse main thread')
       await ui.press({ key: 'fold-hotkey' })
-      expect(await drawn(ui, surface, 'agent2')).toBe(false)
-      key = (await hotkey(ui))!
-      expect(key.props.label).toBe('expand impl-1')
+      expect((await hotkey(ui))!.props.label).toBe('expand main thread')
       await ui.press({ key: 'fold-hotkey' })
-      expect(await drawn(ui, surface, 'agent2')).toBe(true)
+      expect((await hotkey(ui))!.props.label).toBe('collapse main thread')
+      // A subagent's Timeline takes the pane, and the header with its hotkey.
       await ui.press({ key: 'agent:agent4' })
       expect(await hotkey(ui)).toBeUndefined()
       await ui.unmount()
@@ -3277,6 +3637,7 @@ describe('repeated answers', () => {
     const ui = await mountPane($, 'desktop')
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     const text = (await ui.find({ key: 'transcript:agent1' }))!.text
     expect(text).toContain(`${hhmm(t1)} Still working`)
     expect(text).toContain(`${hhmm(t2)} Still working`)
@@ -4726,6 +5087,7 @@ describe('copy', () => {
     const ui = await mountPane($, surface, cols)
     await ui.press({ key: 'agent:agent1' })
     await w.clock.settle()
+    await expandTurns(ui)
     return ui
   }
   const mountTool = ($: Engine, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') =>
@@ -4757,6 +5119,7 @@ describe('copy', () => {
     const step = (await ui.findAll({ type: 'Button' })).find(b => (b.key ?? '').startsWith('step-agent1-'))!
     await ui.press({ key: step.key! })
     expect(await copyKeys(ui)).toHaveLength(0)
+    await ui.press({ key: 'timeline-back' })
     const line = (await ui.findAll({ type: 'Button' })).find(b => b.text.includes('spawned'))!
     expect(line).toBeDefined()
     await ui.press({ key: line.key! })
