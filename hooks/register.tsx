@@ -81,7 +81,7 @@ import {
   watchdogTurnEnded,
 } from './view'
 import type { TranscriptLine } from './view'
-import { TIME_W, timelineCols, timelineOf, timelineRow, turnCount } from './timeline'
+import { TIME_W, jumpScroll, timelineCols, timelineOf, timelineRow, turnCount } from './timeline'
 import type { TimelineTurn } from './timeline'
 
 type $ = EngineInterface
@@ -446,30 +446,21 @@ function toggleTurn($: $, key: string) {
 }
 
 /**
- * Takes the person to a turn's first tool call: switches the main view to the agent (or back to main)
- * when it is not already in view (engines from 2.1.312), then scrolls there. All in the press, so both
- * count as the person's own input. A refusal is kept as the note under the pressed row, and every
- * outcome is in the activity log.
+ * Takes the person to a turn: switches the main view to the agent (or back to main) when it is not
+ * already in view (engines from 2.1.312), then scrolls to the turn (jumpScroll). All in the press, so
+ * both count as the person's own input. A refusal shows only as the note under the pressed row: a jump
+ * writes nothing to the activity log and raises no toast.
  */
 async function jumpTo(
   $: $,
   o: { viewed: string | undefined; agentId: string; name: string; turn: TimelineTurn },
 ) {
-  const where = `turn ${o.turn.number} of ${o.name}`
   const note = async (text: string) => {
     await update($, jumpNoteAtom, () => text)
     await update($, jumpNoteTurnAtom, () => (text === '' ? '' : o.turn.key))
   }
-  // A refusal: the note says it under the row, the log gets the engine's reason as it came.
-  const refuse = async (text: string, why: string) => {
-    await note(text)
-    await log($, `jump to ${where} refused: ${why}`, 'warn')
-  }
-  const requestId = o.turn.jumpTo
-  if (requestId === undefined) {
-    // The note alone: a repeated press would only flood the activity list.
-    return note('nothing to jump to in this turn (no tool calls)')
-  }
+  const scroll = jumpScroll(o.turn)
+  if (scroll === undefined) return note('nothing to jump to in this turn (no tool calls)')
   // Main is in view when no agent is.
   const want = o.agentId === 'main' ? undefined : o.agentId
   if (o.viewed !== want) {
@@ -483,19 +474,16 @@ async function jumpTo(
         return undefined
       })
     if (failed) {
-      const missing = failed.err instanceof TypeError || MISSING_OP.test(reasonOf(failed.err))
       const why = reasonOf(failed.err)
-      return refuse(missing ? `Open ${o.name} from /tasks to jump there` : `${o.name}: ${why}`, why)
+      const missing = failed.err instanceof TypeError || MISSING_OP.test(why)
+      return note(missing ? `Open ${o.name} from /tasks to jump there` : `${o.name}: ${why}`)
     }
-    if (v?.deny) return refuse(`${o.name}: ${v.deny}`, v.deny)
+    if (v?.deny) return note(`${o.name}: ${v.deny}`)
   }
   // Marked as the jump goes ahead: the row stays the one last pressed even when the scroll is refused, and the note says so.
   await update($, jumpedAtom, () => o.turn.key)
-  await log($, `jumping to ${where}`)
-  const s = await $.ui.scroll({ to: { requestId }, block: 'start' }).catch((err: unknown) => ({ deny: reasonOf(err) }))
-  if (s.deny !== undefined) return refuse(s.deny, s.deny)
-  await note('')
-  return log($, `jumped to ${where}`)
+  const s = await $.ui.scroll(scroll).catch((err: unknown) => ({ deny: reasonOf(err) }))
+  return note(s.deny ?? '')
 }
 
 /** Copies to the pressing surface's clipboard and says so in a toast. Never throws. */
@@ -1823,8 +1811,8 @@ const outcomeColor = (outcome: string) => (outcome.startsWith('✎') ? 'success'
 /**
  * An agent's (or main's) Timeline, which takes the whole pane: a header (title, name, turn count and a
  * back button), then one line per turn: a fold glyph, number, preview, outcome and time. A press on the
- * row jumps to the turn's first tool call in the transcript; the fold glyph expands its items in place
- * (drawn by the surface's own `item`). A note on a refused jump sits under the row that was pressed.
+ * row jumps to the turn in the transcript (its first tool call at the window's foot, the prompt above
+ * it); the fold glyph expands its items in place (drawn by the surface's own `item`). A note on a refused jump sits under the row that was pressed.
  * The terminal pads its cells to the exact widths timelineRow computed; the desktop lays them out with
  * the Box's own widths and grow.
  */
