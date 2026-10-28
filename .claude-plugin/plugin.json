@@ -1,6 +1,6 @@
 {
   "name": "orchestrator",
-  "version": "0.3.11",
+  "version": "0.3.12",
   "author": { "name": "Victor Bajanov" },
   "license": "MIT",
   "description": "Watches every agent's context, hands over and respawns agents near the ceiling, restarts the main thread from a handover note, and charts it all in a pane.",
