@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { AgentRow, Delivery, DisplayStatus, LogEntry, MainPhase, ShellExit, ToolView, Transcript } from '../types'
-import { bodyOf, toolDetail } from './detail'
+import { bodyOf, fitTables, toolDetail } from './detail'
 import type { ToolDetail } from './detail'
 import {
   ACTIVITY_MAX,
@@ -635,9 +635,10 @@ type Ui = ReturnType<$['ui']['resolve']>
 
 /**
  * A tool call's detail as elements: header, then each section labelled (D11). With `copy`, each label has a
- * copy control (`copy:sec:<toolUseId>:<i>`); `$` serves only that control's press.
+ * copy control (`copy:sec:<toolUseId>:<i>`); `$` serves only that control's press. Markdown tables wider
+ * than `columns` are drawn as records; the copy control still copies the text as written.
  */
-function detailBody($: $, ui: Ui, d: ToolDetail, copy?: { toolUseId: string }) {
+function detailBody($: $, ui: Ui, d: ToolDetail, columns: number, copy?: { toolUseId: string }) {
   const { Box, Text, Code, Markdown } = ui
   return (
     <Box flexDirection="column" gap={1}>
@@ -664,7 +665,7 @@ function detailBody($: $, ui: Ui, d: ToolDetail, copy?: { toolUseId: string }) {
               format={sec.diff ? 'diff' : 'source'}
             />
           ) : sec.kind === 'markdown' ? (
-            <Markdown text={sec.text} />
+            <Markdown text={fitTables(sec.text, columns)} />
           ) : (
             <Text wrap="wrap">{sec.text}</Text>
           )}
@@ -675,10 +676,10 @@ function detailBody($: $, ui: Ui, d: ToolDetail, copy?: { toolUseId: string }) {
 }
 
 /** What the dialog shows for the open call: its detail (with copy controls when `copyable`), or one dim line. */
-function toolBody($: $, ui: Ui, v: ToolView | null, copyable: boolean) {
+function toolBody($: $, ui: Ui, v: ToolView | null, copyable: boolean, columns: number) {
   const { Text } = ui
   if (!v) return <Text dimColor>No tool call selected.</Text>
-  if (v.detail) return detailBody($, ui, v.detail, copyable ? { toolUseId: v.toolUseId } : undefined)
+  if (v.detail) return detailBody($, ui, v.detail, columns, copyable ? { toolUseId: v.toolUseId } : undefined)
   if (v.denied) return <Text dimColor>tool call not readable (teammate in another pane, or finished)</Text>
   return <Text dimColor>loading…</Text>
 }
@@ -2180,7 +2181,7 @@ export const register: Register = (on, options) => {
     const v = await read($, toolViewAtom)
     return (
       <Box flexDirection="column" gap={1}>
-        {toolBody($, ui, v, e.surface !== 'terminal')}
+        {toolBody($, ui, v, e.surface !== 'terminal', e.props.bodyColumns ?? e.viewport?.columns ?? 80)}
         <Button key="close" role="dismiss" label="Close" onPress={() => closeTool($)} />
       </Box>
     )
@@ -2289,7 +2290,7 @@ export const register: Register = (on, options) => {
             <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
               {button}
               <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
-                {toolBody($, ui, tv, true)}
+                {toolBody($, ui, tv, true, cols - 6)}
               </Box>
             </Box>
           )
@@ -2486,7 +2487,7 @@ export const register: Register = (on, options) => {
           <Box key={`toolrow:${it.toolUseId}`} flexDirection="column">
             {button}
             <Box key={`tooldetail:${it.toolUseId}`} borderStyle="round" flexDirection="column">
-              {toolBody($, ui, tv, false)}
+              {toolBody($, ui, tv, false, cols - 6)}
             </Box>
           </Box>
         )
