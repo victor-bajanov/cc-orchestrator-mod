@@ -2477,9 +2477,9 @@ export const register: Register = (on, options) => {
     const viewed = liveSelection(visible, e.props.view?.agentId ?? '')
     // A row folds when it is collapsed or collapsing it would hide something; read from every row, as `hidden` is.
     const foldable = (id: string) => canFold(rows, id, collapsed)
-    /** The header's `c` hotkey: folds the selected row, else main; drawn only when that row can fold. */
-    const foldHotkey = (Button: ReturnType<typeof $.ui.resolve>['Button'], selected: string) => {
-      const target = liveSelection(visible, selected) || 'main'
+    /** The header's `c` hotkey: folds main; drawn only when main can fold. */
+    const foldHotkey = (Button: ReturnType<typeof $.ui.resolve>['Button']) => {
+      const target = 'main'
       const tRow = rows.find(r => r.id === target)
       if (!tRow || !foldable(target)) return undefined
       return (
@@ -2513,8 +2513,7 @@ export const register: Register = (on, options) => {
       const selected = liveSelection(visible, await read($, selectedAtom))
       // Colours and the time axis come from every row, so collapsing neither recolours nor rescales.
       const colors = seriesColors(rows)
-      // A click selection wins; with none, the agent in view stands out.
-      const hl = selected || viewed
+      // A click opens a Timeline, so the chart is only drawn with nothing selected: the agent in view stands out.
       const chart = contextChart({
         rows: visible,
         t0: rows.reduce((m, r) => Math.min(m, r.startedAt), now),
@@ -2524,7 +2523,7 @@ export const register: Register = (on, options) => {
         agentThreshold: cfg.agentThreshold,
         mainThreshold: cfg.mainThreshold,
         colors,
-        selected: hl,
+        selected: viewed,
       })
       const fits = cols - 6
       // A session that places no dialog shows the open call's detail in flow beneath it.
@@ -2602,7 +2601,7 @@ export const register: Register = (on, options) => {
                 onPress={() => startMainHandover($)}
               />
             )}
-            {foldHotkey(Button, selected)}
+            {foldHotkey(Button)}
           </Box>
           {rows.length === 0 ? (
             <Text dimColor>No model requests yet.</Text>
@@ -2621,7 +2620,7 @@ export const register: Register = (on, options) => {
                   {foldCell(ui, row.id)}
                   <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
-                    <Text bold={hl === row.id}>{label(row)} </Text>
+                    <Text bold={viewed === row.id}>{label(row)} </Text>
                     {row.resumedAt !== undefined && <Text dimColor>↻ </Text>}
                     {folded !== '' && <Text dimColor>{folded} </Text>}
                     {model !== '' && <Text dimColor>{model} </Text>}
@@ -2800,7 +2799,7 @@ export const register: Register = (on, options) => {
               onPress={() => startMainHandover($)}
             />
           )}
-          {foldHotkey(Button, selected)}
+          {foldHotkey(Button)}
         </Box>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
         {ordered.flatMap(({ row, depth }) => {
@@ -2829,7 +2828,7 @@ export const register: Register = (on, options) => {
             ) ?? ''
           const name = label(row).slice(0, room - mark.length)
           const nameCell = (
-            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
+            <Text dimColor={!live} inverse={viewed === row.id} wrap="truncate">
               {name}
               {mark !== '' && <Text dimColor>{mark}</Text>}
               {' '.repeat(room - name.length - mark.length)}
