@@ -539,9 +539,11 @@ async function refreshTranscript($: $, id: string) {
   const items = messages
     ? transcriptItems(messages, key => stamps.get(id)?.get(key), { n: TIMELINE_ITEMS, chars: STEP_CHARS, startedAt })
     : undefined
+  // A read that settles after another agent was opened stores nothing: it would drop that agent's cache.
+  const open = await read($, selectedAtom)
   await update($, transcriptsAtom, p =>
     // Only the open Timeline reads a transcript, so the others' are dropped: each can hold a megabyte.
-    items ? { [id]: { items } } : p[id] && 'items' in p[id] ? p : { [id]: { denied: true as const } },
+    id !== open ? p : items ? { [id]: { items } } : p[id] && 'items' in p[id] ? p : { [id]: { denied: true as const } },
   )
 }
 

@@ -1453,6 +1453,36 @@ describe('agent timeline: final review', () => {
       await ui.unmount()
     })
 
+    test(`a read that settles after another agent was opened leaves that agent's turns alone (${surface})`, async ($, on) => {
+      const w = world(on)
+      let holdAgent2 = true
+      let release2 = () => {}
+      on('session.messages', ($, e) =>
+        e.agentId === 'agent2' && holdAgent2
+          ? new Promise(resolve => (release2 = () => resolve({ value: convo as never })))
+          : ({ value: convo as never }),
+      )
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2' })
+      await step($, 'agent2')
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent2' }) // its read is held
+      await w.clock.settle()
+      await ui.press({ key: 'timeline-back' })
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      release2()
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      // agent2 was not stored: opening it again waits for a fresh read.
+      holdAgent2 = true
+      await ui.press({ key: 'timeline-back' })
+      await ui.press({ key: 'agent:agent2' })
+      expect(await ui.find({ text: /loading…/ })).toBeDefined()
+      await ui.unmount()
+    })
+
     test(`a view that fails for another reason shows its message, bare (${surface})`, async ($, on) => {
       const w = world(on)
       // A hook's deny rejects the call.
