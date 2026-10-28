@@ -81,7 +81,8 @@ import {
   watchdogTurnEnded,
 } from './view'
 import type { TranscriptLine } from './view'
-import { timelineHeader, timelineOf, timelineRow } from './timeline'
+import { TIME_W, timelineCols, timelineOf, timelineRow, turnCount } from './timeline'
+import type { TimelineTurn } from './timeline'
 
 type $ = EngineInterface
 
@@ -101,12 +102,16 @@ const phaseAtom = atom({ plugin: 'orchestrator', key: 'mainPhase' } as const, 'i
 const runAtom = atom({ plugin: 'orchestrator', key: 'runId' } as const, '')
 /** The line (activity or transcript text) whose full text a press shows beneath it, in flow ('' for none). */
 const pinnedAtom = atom({ plugin: 'orchestrator', key: 'pinnedLog' } as const, '')
-/** The agent a click selected: its chart line is highlighted and its Timeline takes over the pane ('' for none). */
+/** The agent (or main) a click selected: its chart line is highlighted and its Timeline takes over the pane ('' for none). */
 const selectedAtom = atom({ plugin: 'orchestrator', key: 'selectedAgent' } as const, '')
 /** The turns of the open Timeline the person expanded, by turn key. */
 const expandedAtom = atom({ plugin: 'orchestrator', key: 'expandedTurns' } as const, [] as string[])
-/** Why the last jump could not go ('' for none), drawn under the Timeline's header. */
+/** What the last press on a turn said ('' for none: why it could not jump), drawn under that turn's row. */
 const jumpNoteAtom = atom({ plugin: 'orchestrator', key: 'jumpNote' } as const, '')
+/** The key of the turn the note is under ('' for none). */
+const jumpNoteTurnAtom = atom({ plugin: 'orchestrator', key: 'jumpNoteTurn' } as const, '')
+/** The key of the turn last jumped to, marked in the open Timeline ('' for none). */
+const jumpedAtom = atom({ plugin: 'orchestrator', key: 'jumpedTurn' } as const, '')
 /** Messages timers queued for the next hook to deliver (a send from a timer wakes a run without hooks). */
 const outboxAtom = atom({ plugin: 'orchestrator', key: 'outbox' } as const, [] as Delivery[])
 /** Rows the person collapsed with a row's fold glyph or the `c` hotkey, their finished descendants hidden; display only. */
@@ -199,6 +204,11 @@ export const isOwnCall = (input: unknown, inFlight: readonly OwnCall[]): boolean
 // The run folder outlives a /clear (the session id changes, the run does not).
 let runDirCache = ''
 let paneOffered = false
+/** When main's transcript was last read, and whether a read is already waiting its turn (see schedulePeek). */
+let mainReadAt = 0
+let mainReadQueued = false
+/** Main's transcript is read at most this often: a long session's read is large, and main steps and syncs often. */
+const MAIN_READ_MS = 2_000
 /** Teammates already warned that their children's handbacks cannot reach them. */
 const teammatesWarned = new Set<string>()
 /** Main is mid-turn: from its `turn.start` (main's alone) to its `turn.complete`. */
@@ -411,6 +421,8 @@ async function resetTimeline($: $, selected = '') {
   await update($, selectedAtom, () => selected)
   await update($, expandedAtom, () => [])
   await update($, jumpNoteAtom, () => '')
+  await update($, jumpNoteTurnAtom, () => '')
+  await update($, jumpedAtom, () => '')
   await update($, pinnedAtom, () => '')
 }
 
@@ -434,30 +446,56 @@ function toggleTurn($: $, key: string) {
 }
 
 /**
- * Takes the person to a turn's first tool call: switches the main view to the agent when it is not
- * already in view (engines from 2.1.312), then scrolls there. All in the press, so both count as the
- * person's own input. A refusal is kept as the note under the Timeline's header.
+ * Takes the person to a turn's first tool call: switches the main view to the agent (or back to main)
+ * when it is not already in view (engines from 2.1.312), then scrolls there. All in the press, so both
+ * count as the person's own input. A refusal is kept as the note under the pressed row, and every
+ * outcome is in the activity log.
  */
-async function jumpTo($: $, o: { viewed: string | undefined; agentId: string; name: string; requestId: string }) {
-  const note = (text: string) => update($, jumpNoteAtom, () => text)
-  if (o.viewed !== o.agentId) {
+async function jumpTo(
+  $: $,
+  o: { viewed: string | undefined; agentId: string; name: string; turn: TimelineTurn },
+) {
+  const where = `turn ${o.turn.number} of ${o.name}`
+  const note = async (text: string) => {
+    await update($, jumpNoteAtom, () => text)
+    await update($, jumpNoteTurnAtom, () => (text === '' ? '' : o.turn.key))
+  }
+  // A refusal: the note says it under the row, the log gets the engine's reason as it came.
+  const refuse = async (text: string, why: string) => {
+    await note(text)
+    await log($, `jump to ${where} refused: ${why}`, 'warn')
+  }
+  const requestId = o.turn.jumpTo
+  if (requestId === undefined) {
+    // The note alone: a repeated press would only flood the activity list.
+    return note('nothing to jump to in this turn (no tool calls)')
+  }
+  // Main is in view when no agent is.
+  const want = o.agentId === 'main' ? undefined : o.agentId
+  if (o.viewed !== want) {
     // An engine before 2.1.312 has no $.ui.view: the call throws as a missing op, and the person is told where to go.
     // The module may not test for the op's presence ($.ui.view is only ever called). Any other failure shows its message.
     let failed: { err: unknown } | undefined
     const v = await Promise.resolve()
-      .then(() => $.ui.view({ agentId: o.agentId }))
+      .then(() => $.ui.view(want === undefined ? {} : { agentId: want }))
       .catch((err: unknown) => {
         failed = { err }
         return undefined
       })
     if (failed) {
       const missing = failed.err instanceof TypeError || MISSING_OP.test(reasonOf(failed.err))
-      return note(missing ? `Open ${o.name} from /tasks to jump there` : reasonOf(failed.err))
+      const why = reasonOf(failed.err)
+      return refuse(missing ? `Open ${o.name} from /tasks to jump there` : `${o.name}: ${why}`, why)
     }
-    if (v?.deny) return note(v.deny)
+    if (v?.deny) return refuse(`${o.name}: ${v.deny}`, v.deny)
   }
-  const s = await $.ui.scroll({ to: { requestId: o.requestId }, block: 'start' }).catch((err: unknown) => ({ deny: reasonOf(err) }))
-  return note(s.deny ?? '')
+  // Marked as the jump goes ahead: the row stays the one last pressed even when the scroll is refused, and the note says so.
+  await update($, jumpedAtom, () => o.turn.key)
+  await log($, `jumping to ${where}`)
+  const s = await $.ui.scroll({ to: { requestId }, block: 'start' }).catch((err: unknown) => ({ deny: reasonOf(err) }))
+  if (s.deny !== undefined) return refuse(s.deny, s.deny)
+  await note('')
+  return log($, `jumped to ${where}`)
 }
 
 /** Copies to the pressing surface's clipboard and says so in a toast. Never throws. */
@@ -526,12 +564,12 @@ function stamp(agentId: string, key: string, t: number, repeat = false) {
  * cached: an agent that finished, or a slow read, keeps the last items shown.
  */
 async function refreshTranscript($: $, id: string) {
-  if (id === 'main') return
+  // Main is read with no agentId: the session's own thread.
   const messages = await guardedRead(
     $,
     transcriptReads,
     id,
-    () => $.session.messages({ agentId: id }).then(f => ('deny' in f ? undefined : f)),
+    () => (id === 'main' ? $.session.messages() : $.session.messages({ agentId: id })).then(f => ('deny' in f ? undefined : f)),
     () => schedulePeek($, id),
   )
   if (messages === IN_FLIGHT) return
@@ -591,8 +629,25 @@ function scheduleRead($: $, slot: ReadSlot, key: string, run: () => Promise<unkn
 
 /** Starts a transcript read outside the dispatch that asked for it, so no hook or press waits on it. */
 function schedulePeek($: $, id: string) {
-  if (id === 'main') return
+  if (id === 'main') return scheduleMainPeek($)
   scheduleRead($, transcriptReads, id, () => refreshTranscript($, id))
+}
+
+/**
+ * Starts main's transcript read: at once when none ran in the last MAIN_READ_MS, else once that time is up.
+ * Any number of triggers meanwhile are one trailing read. Never rejects.
+ */
+function scheduleMainPeek($: $) {
+  if (mainReadQueued) return
+  mainReadQueued = true
+  const run = async () => {
+    const wait = Math.max(0, mainReadAt + MAIN_READ_MS - (await $.clock.now()))
+    if (wait > 0) await new Promise<void>(resolve => $.clock.after(wait, () => resolve()))
+    mainReadQueued = false
+    mainReadAt = await $.clock.now()
+    await refreshTranscript($, 'main')
+  }
+  $.clock.after(0, () => void run().catch(() => (mainReadQueued = false)))
 }
 
 /** Rereads the transcript of the agent an event came from, when it is the one open in the pane. Never throws. */
@@ -645,7 +700,7 @@ async function refreshTool($: $, agentId: string, toolUseId: string) {
     toolReads,
     `${agentId}:${toolUseId}`,
     () =>
-      $.session.messages({ agentId }).then(f => {
+      (agentId === 'main' ? $.session.messages() : $.session.messages({ agentId })).then(f => {
         if ('deny' in f) return undefined
         for (let i = f.length - 1; i >= 0; i--) {
           const found = f[i]!.toolUses.find(u => u.tool_use_id === toolUseId)
@@ -1759,20 +1814,32 @@ async function checkMain($: $, tokens: number) {
   }
 }
 
+/** The accent colour of the Timeline: its title glyph, `• here` and the turn last jumped to. */
+const ACCENT = 'claude'
+
+/** The outcome's colour: files written in the success colour; the rest read dim. */
+const outcomeColor = (outcome: string) => (outcome.startsWith('✎') ? 'success' : undefined)
+
 /**
- * An agent's Timeline, which takes the whole pane: a back button, the header, a note on the last
- * refused jump, then one row per turn. A row's press expands its items in place (drawn by the
- * surface's own `item`); its `↗` jumps to the turn's first tool call, and is dim and inert without one.
+ * An agent's (or main's) Timeline, which takes the whole pane: a header (title, name, turn count and a
+ * back button), then one line per turn: a fold glyph, number, preview, outcome and time. A press on the
+ * row jumps to the turn's first tool call in the transcript; the fold glyph expands its items in place
+ * (drawn by the surface's own `item`). A note on a refused jump sits under the row that was pressed.
+ * The terminal pads its cells to the exact widths timelineRow computed; the desktop lays them out with
+ * the Box's own widths and grow.
  */
 function timelineBody(
   $: $,
   ui: Ui,
-  e: { props: { view?: { agentId?: string } } },
+  e: { surface: string; props: { view?: { agentId?: string } } },
   o: {
     row: AgentRow
     tr: Transcript | undefined
     expanded: readonly string[]
     note: string
+    noteTurn: string
+    jumped: string
+    now: number
     cols: number
     item: (agentId: string, it: TranscriptLine) => ReturnType<typeof h>
   },
@@ -1782,49 +1849,86 @@ function timelineBody(
   const name = label(o.row)
   const t = timelineOf(o.tr)
   const turns = 'turns' in t ? t.turns : []
-  const numW = String(turns.length).length
+  const cols = timelineCols(turns)
+  const dismiss = async () => {
+    await update($, jumpNoteAtom, () => '')
+    await update($, jumpNoteTurnAtom, () => '')
+  }
   return (
     <Box key={`transcript:${id}`} flexDirection="column">
-      <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        <Button key="timeline-back" plain hotkey="b" label="← agents" onPress={() => resetTimeline($)} />
-        <Text bold>{timelineHeader(name, turns.length)}</Text>
-      </Box>
-      {o.note !== '' && (
-        <Box key="jump-note" flexDirection="row" flexWrap="wrap" gap={1}>
-          <Text dimColor>{o.note}</Text>
-          <Button key="jump-note-dismiss" plain label="dismiss" onPress={() => update($, jumpNoteAtom, () => '')} />
+      <Box key="timeline-header" flexDirection="row" justifyContent="space-between" flexGrow={1}>
+        <Box flexDirection="row" gap={1}>
+          <Button key="timeline-back" plain hotkey="b" label="‹ agents" onPress={() => resetTimeline($)} />
+          <Text color={ACCENT}>◆</Text>
+          <Text bold>Timeline</Text>
+          <Text dimColor>{name}</Text>
         </Box>
-      )}
+        <Text dimColor>{turnCount(turns.length)}</Text>
+      </Box>
       {'dim' in t && (
         <Text dimColor wrap="truncate">
           {t.dim}
         </Text>
       )}
       {turns.flatMap(turn => {
-        const cells = timelineRow(turn, o.cols - 2, numW)
+        const cells = timelineRow(turn, o.cols - 2, cols, o.now)
         const open = o.expanded.includes(turn.key)
         const lines = open ? transcriptView({ items: turn.items }, o.cols - 6, turn.items.length) : undefined
-        const requestId = turn.jumpTo
+        const jumped = o.jumped === turn.key
+        const press = () => jumpTo($, { viewed: e.props.view?.agentId, agentId: id, name, turn })
+        const num = <Text dimColor>{cells.num}</Text>
+        const preview = (pad: boolean) => (
+          <Text bold={jumped} color={jumped ? ACCENT : undefined} wrap="truncate">
+            {pad ? cells.preview + ' '.repeat(cells.pad) : cells.preview}
+          </Text>
+        )
+        const outcome = <Text color={outcomeColor(cells.outcome)} dimColor={outcomeColor(cells.outcome) === undefined}>{cells.outcome}</Text>
+        const time = cells.here ? <Text color={ACCENT}>• here</Text> : <Text dimColor>{cells.time}</Text>
+        const cell = (part: string, child: ReturnType<typeof h>) => (
+          <Button key={`turncell:${id}:${turn.key}:${part}`} plain onPress={press}>
+            {child}
+          </Button>
+        )
         return [
           <Box key={`turnrow:${turn.key}`} flexDirection="row" gap={1}>
-            <Button key={`turn:${id}:${turn.key}`} plain onPress={() => toggleTurn($, turn.key)}>
-              <Text dimColor>{`${cells.num} `}</Text>
-              <Text bold={open}>{cells.preview}</Text>
-              <Text dimColor>{` ${cells.outcome}`}</Text>
-              {cells.here && <Text>{' • here'}</Text>}
-              <Text dimColor>{` ${cells.time}`}</Text>
+            <Button key={`turnfold:${id}:${turn.key}`} plain onPress={() => toggleTurn($, turn.key)}>
+              {open ? '▾' : '▸'}
             </Button>
-            {requestId === undefined ? (
-              <Text dimColor>↗</Text>
+            {e.surface === 'terminal' ? (
+              <Button key={`turn:${id}:${turn.key}`} plain onPress={press}>
+                {num}
+                <Text> </Text>
+                {preview(true)}
+                <Text> </Text>
+                {outcome}
+                <Text> </Text>
+                {time}
+              </Button>
             ) : (
-              <Button
-                key={`jump:${id}:${turn.key}`}
-                plain
-                label="↗"
-                onPress={() => jumpTo($, { viewed: e.props.view?.agentId, agentId: id, name, requestId })}
-              />
+              [
+                <Box key="num" width={cols.numW}>
+                  {cell('num', num)}
+                </Box>,
+                <Box key="preview" flexGrow={1} flexShrink={1}>
+                  <Button key={`turn:${id}:${turn.key}`} plain onPress={press}>
+                    {preview(false)}
+                  </Button>
+                </Box>,
+                <Box key="outcome" width={cols.outW} justifyContent="flex-end">
+                  {cell('outcome', outcome)}
+                </Box>,
+                <Box key="time" width={TIME_W} justifyContent="flex-end">
+                  {cell('time', time)}
+                </Box>,
+              ]
             )}
           </Box>,
+          o.note !== '' && o.noteTurn === turn.key && (
+            <Box key={`jump-note:${turn.key}`} flexDirection="row" flexWrap="wrap" gap={1} marginLeft={2}>
+              <Text color="warning">{o.note}</Text>
+              <Button key="jump-note-dismiss" plain label="dismiss" onPress={dismiss} />
+            </Box>
+          ),
           lines && 'items' in lines && (
             <Box key={`turnitems:${turn.key}`} flexDirection="column" marginLeft={2}>
               {lines.items.map(it => o.item(id, it))}
@@ -1848,6 +1952,8 @@ export const register: Register = (on, options) => {
   cfg.idleWatchdogMinutes = numberSetting(options.idleWatchdogMinutes, 5)
   cfg.shellCeilingMinutes = numberSetting(options.shellCeilingMinutes, 60)
   paneOffered = false
+  mainReadAt = 0
+  mainReadQueued = false
   teammatesWarned.clear()
   mainBusy = false
   mainHandoverQueued = false
@@ -2011,7 +2117,7 @@ export const register: Register = (on, options) => {
       })
       try {
         // When the step's visible text was seen, for the transcript; synchronous, and it can cost the step nothing.
-        if (id !== 'main' && res.answer) stamp(id, textKey('assistant', res.answer), now, true)
+        if (res.answer) stamp(id, textKey('assistant', res.answer), now, true)
       } catch {
         // A lost stamp only leaves the item's time `--:--`.
       }
@@ -2038,8 +2144,8 @@ export const register: Register = (on, options) => {
       $.ui.log(`orchestrator: step not recorded: ${String(err)}`)
     }
     // Last, after the step is recorded and any handover started: the peek can cost them nothing.
-    await peekIfSelected($, e.agentId)
-    if (e.agentId !== undefined) await toolIfPending($, e.agentId)
+    await peekIfSelected($, e.agentId ?? 'main')
+    await toolIfPending($, e.agentId ?? 'main')
     return res
   })
 
@@ -2051,10 +2157,10 @@ export const register: Register = (on, options) => {
       if (e.agentId !== undefined) await noteReport($, e.agentId, e.tool, {}, answer).catch(() => undefined)
       return answer as never
     }
-    if (e.agentId !== undefined) {
+    {
       // Stamped as the call starts, when the mod saw it, for the transcript. The call never waits on the clock,
       // and a lost stamp only leaves the item's time `--:--`: the call and its HANDOVER go ahead.
-      const agentId = e.agentId
+      const agentId = e.agentId ?? 'main'
       const id = e.tool_use_id
       try {
         void $.clock.now().then(
@@ -2100,7 +2206,12 @@ export const register: Register = (on, options) => {
     } catch (err) {
       $.ui.log(`orchestrator: shell not tracked: ${String(err)}`)
     }
-    if (e.agentId === undefined) return out
+    if (e.agentId === undefined) {
+      // Main's own call has settled: its open Timeline and tool detail read it.
+      await peekIfSelected($, 'main')
+      await toolIfOpen($, 'main', e.tool_use_id)
+      return out
+    }
     try {
       const r = (await read($, agentsAtom)).find(a => a.id === e.agentId)
       if (r?.status === 'handing-over' && !r.handoverVia && r.notePath) {
@@ -2119,7 +2230,7 @@ export const register: Register = (on, options) => {
       $.ui.log(`orchestrator: report not noted: ${String(err)}`)
     }
     // Last, after the HANDOVER is attached: the peek and the open detail's reread can cost it nothing.
-    await peekIfSelected($, e.agentId)
+    await peekIfSelected($, e.agentId ?? 'main')
     await toolIfOpen($, e.agentId, e.tool_use_id)
     return out
   })
@@ -2219,6 +2330,16 @@ export const register: Register = (on, options) => {
       $.ui.log(`orchestrator: turn end not handled: ${String(err)}`)
     }
     return res
+  })
+
+  // When main's prompt was typed, for its Timeline (the host stamps no times). It can cost the prompt nothing.
+  on('prompt.submit', async ($, e, next) => {
+    try {
+      stamp('main', textKey('user', e.text), await $.clock.now(), true)
+    } catch {
+      // A lost stamp only leaves the turn's time `--:--`.
+    }
+    return next(e)
   })
 
   on('command.run', { command: 'orch' }, async ($, e) => {
@@ -2356,9 +2477,9 @@ export const register: Register = (on, options) => {
     const viewed = liveSelection(visible, e.props.view?.agentId ?? '')
     // A row folds when it is collapsed or collapsing it would hide something; read from every row, as `hidden` is.
     const foldable = (id: string) => canFold(rows, id, collapsed)
-    /** The header's `c` hotkey: folds the selected row, else main; drawn only when that row can fold. */
-    const foldHotkey = (Button: ReturnType<typeof $.ui.resolve>['Button'], selected: string) => {
-      const target = liveSelection(visible, selected) || 'main'
+    /** The header's `c` hotkey: folds main; drawn only when main can fold. */
+    const foldHotkey = (Button: ReturnType<typeof $.ui.resolve>['Button']) => {
+      const target = 'main'
       const tRow = rows.find(r => r.id === target)
       if (!tRow || !foldable(target)) return undefined
       return (
@@ -2392,8 +2513,7 @@ export const register: Register = (on, options) => {
       const selected = liveSelection(visible, await read($, selectedAtom))
       // Colours and the time axis come from every row, so collapsing neither recolours nor rescales.
       const colors = seriesColors(rows)
-      // A click selection wins; with none, the agent in view stands out.
-      const hl = selected || viewed
+      // A click opens a Timeline, so the chart is only drawn with nothing selected: the agent in view stands out.
       const chart = contextChart({
         rows: visible,
         t0: rows.reduce((m, r) => Math.min(m, r.startedAt), now),
@@ -2403,7 +2523,7 @@ export const register: Register = (on, options) => {
         agentThreshold: cfg.agentThreshold,
         mainThreshold: cfg.mainThreshold,
         colors,
-        selected: hl,
+        selected: viewed,
       })
       const fits = cols - 6
       // A session that places no dialog shows the open call's detail in flow beneath it.
@@ -2458,14 +2578,16 @@ export const register: Register = (on, options) => {
           </Box>
         )
       }
-      // A selected subagent's Timeline takes the pane. Main is the main view already: it has none.
+      // A selected agent's Timeline (main's too) takes the pane.
       // Drawn from the cache alone: the read is refreshTranscript's, never the render's.
-      const open = selected && selected !== 'main' ? rows.find(r => r.id === selected) : undefined
+      const open = selected ? rows.find(r => r.id === selected) : undefined
       if (open) {
         const tr = (await read($, transcriptsAtom))[open.id]
         const expanded = await read($, expandedAtom)
         const note = await read($, jumpNoteAtom)
-        return timelineBody($, ui, e, { row: open, tr, expanded, note, cols, item })
+        const noteTurn = await read($, jumpNoteTurnAtom)
+        const jumped = await read($, jumpedAtom)
+        return timelineBody($, ui, e, { row: open, tr, expanded, note, noteTurn, jumped, now, cols, item })
       }
       return (
         <Box flexDirection="column" gap={1}>
@@ -2479,7 +2601,7 @@ export const register: Register = (on, options) => {
                 onPress={() => startMainHandover($)}
               />
             )}
-            {foldHotkey(Button, selected)}
+            {foldHotkey(Button)}
           </Box>
           {rows.length === 0 ? (
             <Text dimColor>No model requests yet.</Text>
@@ -2498,7 +2620,7 @@ export const register: Register = (on, options) => {
                   {foldCell(ui, row.id)}
                   <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                     <Text color={colors.get(row.id)}>● </Text>
-                    <Text bold={hl === row.id}>{label(row)} </Text>
+                    <Text bold={viewed === row.id}>{label(row)} </Text>
                     {row.resumedAt !== undefined && <Text dimColor>↻ </Text>}
                     {folded !== '' && <Text dimColor>{folded} </Text>}
                     {model !== '' && <Text dimColor>{model} </Text>}
@@ -2579,8 +2701,8 @@ export const register: Register = (on, options) => {
       'respawn-failed': '✗',
     }
     const selected = liveSelection(visible, await read($, selectedAtom))
-    // A selected subagent's Timeline takes the pane (main is the main view already: it has none).
-    const open = selected && selected !== 'main' ? rows.find(r => r.id === selected) : undefined
+    // A selected agent's Timeline (main's too) takes the pane.
+    const open = selected ? rows.find(r => r.id === selected) : undefined
     // A session that places no dialog (too narrow, or no surface places panes) shows the open call's detail in flow.
     const tv = await read($, toolViewAtom)
     const ui = $.ui.resolve(e)
@@ -2662,7 +2784,9 @@ export const register: Register = (on, options) => {
       const tr = (await read($, transcriptsAtom))[open.id]
       const expanded = await read($, expandedAtom)
       const note = await read($, jumpNoteAtom)
-      return timelineBody($, ui, e, { row: open, tr, expanded, note, cols, item })
+      const noteTurn = await read($, jumpNoteTurnAtom)
+      const jumped = await read($, jumpedAtom)
+      return timelineBody($, ui, e, { row: open, tr, expanded, note, noteTurn, jumped, now, cols, item })
     }
     return (
       <Box flexDirection="column">
@@ -2675,7 +2799,7 @@ export const register: Register = (on, options) => {
               onPress={() => startMainHandover($)}
             />
           )}
-          {foldHotkey(Button, selected)}
+          {foldHotkey(Button)}
         </Box>
         {ordered.length === 0 && <Text dimColor>No model requests yet.</Text>}
         {ordered.flatMap(({ row, depth }) => {
@@ -2704,7 +2828,7 @@ export const register: Register = (on, options) => {
             ) ?? ''
           const name = label(row).slice(0, room - mark.length)
           const nameCell = (
-            <Text dimColor={!live} inverse={viewed === row.id} bold={selected === row.id} wrap="truncate">
+            <Text dimColor={!live} inverse={viewed === row.id} wrap="truncate">
               {name}
               {mark !== '' && <Text dimColor>{mark}</Text>}
               {' '.repeat(room - name.length - mark.length)}
@@ -2716,7 +2840,7 @@ export const register: Register = (on, options) => {
               <Text>{' '.repeat(indentW)}</Text>
               {foldCell(ui, row.id)}
               <Text> </Text>
-              {/* Main too is pressable: a press selects it, so `c` acts on it; it opens no transcript. */}
+              {/* Main too is pressable: a press opens its Timeline, like any agent's. */}
               <Button key={`agent:${row.id}`} plain onPress={() => toggleSelected($, row.id)}>
                 {glyphCell}
                 {nameCell}

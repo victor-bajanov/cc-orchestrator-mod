@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { PEEK_DENIED, hhmm } from './view'
-import { buildTimeline, timelineHeader, timelineOf, timelineRow } from './timeline'
+import { PEEK_DENIED } from './view'
+import { buildTimeline, cutCells, stampOf, timelineCols, timelineOf, timelineRow, turnCount, widthOf } from './timeline'
 import type { TimelineTurn } from './timeline'
 import type { TranscriptItem } from '../types'
 
@@ -161,51 +161,110 @@ describe('timelineOf', () => {
   })
 })
 
-describe('timelineHeader', () => {
-  test('names the agent and counts turns', () => {
-    expect(timelineHeader('impl-1', 3)).toBe('Timeline · impl-1 · 3 turns')
-    expect(timelineHeader('impl-1', 1)).toBe('Timeline · impl-1 · 1 turn')
-    expect(timelineHeader('impl-1', 0)).toBe('Timeline · impl-1 · 0 turns')
+describe('turnCount', () => {
+  test('counts turns, singular for one', () => {
+    expect(turnCount(3)).toBe('3 turns')
+    expect(turnCount(1)).toBe('1 turn')
+    expect(turnCount(0)).toBe('0 turns')
   })
 })
 
-describe('timelineRow', () => {
-  test('right-aligns the number', () => {
-    expect(timelineRow(turn({ number: 7 }), 80, 3).num).toBe('  7')
-    expect(timelineRow(turn({ number: 12 }), 80, 3).num).toBe(' 12')
+describe('stampOf', () => {
+  const now = Date.UTC(2026, 9, 28, 15, 0)
+  test('today is hh:mm', () => {
+    expect(stampOf(Date.UTC(2026, 9, 28, 8, 5), now)).toBe('08:05')
   })
 
-  test('time is --:-- until the turn has a stamp', () => {
-    expect(timelineRow(turn(), 80, 2).time).toBe('--:--')
-    expect(timelineRow(turn({ t: 3_600_000 }), 80, 2).time).toBe(hhmm(3_600_000))
+  test('an older day is D Mon, with no zero on the day', () => {
+    expect(stampOf(Date.UTC(2026, 9, 27, 23, 59), now)).toBe('27 Oct')
+    expect(stampOf(Date.UTC(2026, 8, 3, 12, 0), now)).toBe('3 Sep')
+  })
+
+  test('no stamp is --:--', () => {
+    expect(stampOf(undefined, now)).toBe('--:--')
+  })
+})
+
+describe('timelineCols', () => {
+  test('the number column fits the count, the outcome column the widest outcome', () => {
+    const turns = [turn({ outcome: 'reply' }), turn({ outcome: '✎ 12 files' }), turn({ outcome: '3 tools' })]
+    expect(timelineCols(turns)).toEqual({ numW: 1, outW: 10 })
+    expect(timelineCols(Array.from({ length: 12 }, () => turn()))).toEqual({ numW: 2, outW: 5 })
+  })
+})
+
+const NOW = Date.UTC(2026, 9, 28, 15, 0)
+const cols = { numW: 2, outW: 8 }
+
+describe('timelineRow', () => {
+  test('right-aligns the number', () => {
+    expect(timelineRow(turn({ number: 7 }), 80, { numW: 3, outW: 8 }, NOW).num).toBe('  7')
+    expect(timelineRow(turn({ number: 12 }), 80, { numW: 3, outW: 8 }, NOW).num).toBe(' 12')
+  })
+
+  test('right-aligns the outcome in its column', () => {
+    expect(timelineRow(turn({ outcome: 'reply' }), 80, cols, NOW).outcome).toBe('   reply')
+    expect(timelineRow(turn({ outcome: '✎ 2 files' }), 80, { numW: 2, outW: 9 }, NOW).outcome).toBe('✎ 2 files')
+  })
+
+  test('the time is --:-- until the turn has a stamp, hh:mm today, D Mon before, right-aligned in 6', () => {
+    expect(timelineRow(turn(), 80, cols, NOW).time).toBe(' --:--')
+    expect(timelineRow(turn({ t: Date.UTC(2026, 9, 28, 8, 5) }), 80, cols, NOW).time).toBe(' 08:05')
+    expect(timelineRow(turn({ t: Date.UTC(2026, 9, 27, 8, 5) }), 80, cols, NOW).time).toBe('27 Oct')
   })
 
   test('here follows isCurrent', () => {
-    expect(timelineRow(turn({ isCurrent: true }), 80, 2).here).toBe(true)
-    expect(timelineRow(turn(), 80, 2).here).toBe(false)
+    expect(timelineRow(turn({ isCurrent: true }), 80, cols, NOW).here).toBe(true)
+    expect(timelineRow(turn(), 80, cols, NOW).here).toBe(false)
   })
 
-  test('a short preview is kept whole, with the outcome as is', () => {
-    const r = timelineRow(turn({ outcome: '✎ 2 files' }), 80, 2)
+  test('a short preview is kept whole and its room is what the fixed cells leave', () => {
+    const r = timelineRow(turn(), 80, cols, NOW)
     expect(r.preview).toBe('implement task one')
-    expect(r.outcome).toBe('✎ 2 files')
+    // fold glyph, number, outcome, time and four single-space gaps
+    expect(r.room).toBe(80 - (1 + 2 + 8 + 6 + 4))
   })
 
-  test('a long preview is cut so the row fits the width', () => {
+  test('a long preview is cut to its room, so the whole row fills the width exactly', () => {
     for (const isCurrent of [false, true]) {
-      const numW = 2
-      const r = timelineRow(turn({ preview: 'x'.repeat(200), outcome: '› 3 cmds', isCurrent }), 60, numW)
+      const r = timelineRow(turn({ preview: 'x'.repeat(200), isCurrent }), 60, cols, NOW)
+      expect(r.preview).toHaveLength(r.room)
       expect(r.preview.endsWith('…')).toBe(true)
-      const cells = [r.num, r.preview, r.outcome, ...(r.here ? ['• here'.padEnd(7)] : []), r.time, '↗ ']
-      expect(cells.join(' ').length).toBeLessThanOrEqual(60)
-      // the preview takes everything the fixed cells leave
-      expect(cells.join(' ').length).toBeGreaterThanOrEqual(58)
+      expect(['▸', r.num, r.preview, r.outcome, r.time].join(' ')).toHaveLength(60)
     }
   })
 
   test('a tiny width keeps an 8-column preview', () => {
-    const r = timelineRow(turn({ preview: 'y'.repeat(100) }), 10, 2)
+    const r = timelineRow(turn({ preview: 'y'.repeat(100) }), 10, cols, NOW)
     expect(r.preview).toHaveLength(8)
     expect(r.preview.endsWith('…')).toBe(true)
+  })
+})
+
+describe('widthOf', () => {
+  test('counts terminal cells: wide characters two, combining marks none', () => {
+    expect(widthOf('abc')).toBe(3)
+    expect(widthOf('日本')).toBe(4)
+    expect(widthOf('🚀')).toBe(2)
+    expect(widthOf('e\u0301')).toBe(1)
+    expect(widthOf('👨\u200d👩')).toBe(4)
+  })
+})
+
+describe('cutCells', () => {
+  test('keeps what fits, and ends a cut text in … within the cells', () => {
+    expect(cutCells('hello', 10)).toBe('hello')
+    expect(cutCells('日本語日本語', 7)).toBe('日本語…')
+    expect(widthOf(cutCells('日本語日本語', 8))).toBeLessThanOrEqual(8)
+    expect(cutCells('🚀🚀🚀🚀', 5)).toBe('🚀🚀…')
+  })
+})
+
+describe('timelineRow with wide characters', () => {
+  test('the preview and its pad fill the room in cells', () => {
+    for (const preview of ['日本語'.repeat(40), '🚀 launch '.repeat(30), 'short']) {
+      const r = timelineRow(turn({ preview }), 60, cols, NOW)
+      expect(widthOf(r.preview) + r.pad).toBe(r.room)
+    }
   })
 })

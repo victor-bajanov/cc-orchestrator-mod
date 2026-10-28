@@ -165,8 +165,12 @@ declare module 'claude-code' {
       selectedAgent: string
       /** Turns of the open timeline shown expanded, by turn key. */
       expandedTurns: string[]
-      /** Why the last jump could not go ('' for none); drawn under the timeline's header. */
+      /** What the last press on a turn said ('' for none: why it could not jump); drawn under that turn's row. */
       jumpNote: string
+      /** The key of the turn `jumpNote` is under ('' for none). */
+      jumpNoteTurn: string
+      /** The key of the turn last jumped to, marked in the open timeline ('' for none). */
+      jumpedTurn: string
       /** Each agent's last transcript items by id, read off the render; the pane draws the selected one's. */
       transcripts: Record<string, Transcript>
       /** Messages queued by timers, delivered by the next hook to run. */
