@@ -389,6 +389,8 @@ async function persist($: $) {
       .filter(Boolean)
       .join(' · ') || undefined,
   )
+  // Rows changed: a selection whose row left the list goes with it. Never costs the save.
+  await dropStaleSelection($).catch(() => undefined)
 }
 
 // ---- pane presses ----------------------------------------------------
@@ -398,20 +400,34 @@ function togglePinned($: $, id: string) {
 }
 
 async function toggleSelected($: $, id: string) {
-  await update($, selectedAtom, s => (s === id ? '' : id))
-  // A Timeline opens folded and without a stale note.
-  await update($, expandedAtom, () => [])
-  await update($, jumpNoteAtom, () => '')
+  const next = (await read($, selectedAtom)) === id ? '' : id
+  await resetTimeline($, next)
   // Opening a transcript starts its read; the pane shows `loading…` until it settles.
-  if ((await read($, selectedAtom)) === id) schedulePeek($, id)
+  if (next !== '') schedulePeek($, next)
 }
 
-/** Leaves the Timeline for the list and chart. */
-async function leaveTimeline($: $) {
-  await update($, selectedAtom, () => '')
+/** Selects `selected` ('' for none) with a Timeline folded, no note and no card pinned. */
+async function resetTimeline($: $, selected = '') {
+  await update($, selectedAtom, () => selected)
   await update($, expandedAtom, () => [])
   await update($, jumpNoteAtom, () => '')
+  await update($, pinnedAtom, () => '')
 }
+
+/** Clears a selection whose row has left the list (hidden by a fold, say), so it cannot come back with the row. */
+async function dropStaleSelection($: $) {
+  const selected = await read($, selectedAtom)
+  if (selected === '') return
+  const rows = await read($, agentsAtom)
+  const hidden = collapseHidden(rows, await read($, collapsedAtom))
+  if (!rows.some(r => r.id === selected && !hidden.has(r.id))) await resetTimeline($)
+}
+
+/** What an engine says when an op does not exist. */
+const MISSING_OP = /not a function|no such op|no implementation|does not exist|unknown op/i
+
+/** An error's message on its own, without the class name in front. */
+const reasonOf = (err: unknown) => String(err instanceof Error ? err.message : err).replace(/^\w*Error: /, '')
 
 function toggleTurn($: $, key: string) {
   return update($, expandedAtom, x => (x.includes(key) ? x.filter(k => k !== key) : [...x, key]))
@@ -425,15 +441,22 @@ function toggleTurn($: $, key: string) {
 async function jumpTo($: $, o: { viewed: string | undefined; agentId: string; name: string; requestId: string }) {
   const note = (text: string) => update($, jumpNoteAtom, () => text)
   if (o.viewed !== o.agentId) {
-    // An engine before 2.1.312 has no $.ui.view: the call throws, and the person is told where to go. The module may not
-    // test for the op's presence ($.ui.view is only ever called).
+    // An engine before 2.1.312 has no $.ui.view: the call throws as a missing op, and the person is told where to go.
+    // The module may not test for the op's presence ($.ui.view is only ever called). Any other failure shows its message.
+    let failed: { err: unknown } | undefined
     const v = await Promise.resolve()
       .then(() => $.ui.view({ agentId: o.agentId }))
-      .catch(() => undefined)
-    if (!v) return note(`Open ${o.name} from /tasks to jump there`)
-    if (v.deny) return note(v.deny)
+      .catch((err: unknown) => {
+        failed = { err }
+        return undefined
+      })
+    if (failed) {
+      const missing = failed.err instanceof TypeError || MISSING_OP.test(reasonOf(failed.err))
+      return note(missing ? `Open ${o.name} from /tasks to jump there` : reasonOf(failed.err))
+    }
+    if (v?.deny) return note(v.deny)
   }
-  const s = await $.ui.scroll({ to: { requestId: o.requestId }, block: 'start' }).catch(err => ({ deny: String(err) }))
+  const s = await $.ui.scroll({ to: { requestId: o.requestId }, block: 'start' }).catch((err: unknown) => ({ deny: reasonOf(err) }))
   return note(s.deny ?? '')
 }
 
@@ -478,7 +501,7 @@ async function toggleCollapsed($: $, id: string) {
 /** How long a transcript read may take before the pane calls it not readable. */
 export const PEEK_TIMEOUT_MS = 3_000
 /** The most items a transcript keeps: what the Timeline builds its turns from. */
-const TIMELINE_ITEMS = 600
+const TIMELINE_ITEMS = 200
 /** The longest text item stored: whole enough to expand, short enough to keep state small. */
 const STEP_CHARS = 2000
 
@@ -517,7 +540,8 @@ async function refreshTranscript($: $, id: string) {
     ? transcriptItems(messages, key => stamps.get(id)?.get(key), { n: TIMELINE_ITEMS, chars: STEP_CHARS, startedAt })
     : undefined
   await update($, transcriptsAtom, p =>
-    items ? { ...p, [id]: { items } } : p[id] && 'items' in p[id] ? p : { ...p, [id]: { denied: true as const } },
+    // Only the open Timeline reads a transcript, so the others' are dropped: each can hold a megabyte.
+    items ? { [id]: { items } } : p[id] && 'items' in p[id] ? p : { [id]: { denied: true as const } },
   )
 }
 
@@ -1760,7 +1784,7 @@ function timelineBody(
   return (
     <Box key={`transcript:${id}`} flexDirection="column">
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        <Button key="timeline-back" plain hotkey="b" label="← agents" onPress={() => leaveTimeline($)} />
+        <Button key="timeline-back" plain hotkey="b" label="← agents" onPress={() => resetTimeline($)} />
         <Text bold>{timelineHeader(name, turns.length)}</Text>
       </Box>
       {o.note !== '' && (
@@ -2560,7 +2584,12 @@ export const register: Register = (on, options) => {
     const ui = $.ui.resolve(e)
     // Rows left for an open expansion and the activity; the activity gives up exactly the rows an expansion takes.
     // The header's button can wrap onto a row of its own. A Timeline has no list, button row or activity beside it.
-    const base = terminalBase({ rows: e.viewport?.rows ?? 30, agents: open ? 0 : ordered.length, peekRows: 0, buttonRow: open ? false : shown })
+    const base = terminalBase({
+      rows: e.viewport?.rows ?? 30,
+      agents: open ? 0 : ordered.length,
+      peekRows: 0,
+      buttonRow: open ? false : shown,
+    })
     // A pane too small for an expansion (cap 0) shows none: a press then only pins.
     const cap = expandCap(base)
     const fits = cols - 6

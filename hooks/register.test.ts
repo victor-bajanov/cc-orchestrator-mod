@@ -1402,6 +1402,138 @@ describe('agent timeline', () => {
   }
 })
 
+describe('agent timeline: final review', () => {
+  const convo = [
+    { role: 'user', text: 'Implement task 1', toolUses: [] },
+    { role: 'assistant', text: 'Running them', toolUses: [{ tool_use_id: 'tb', tool: 'Bash', input: { command: 'npm test' }, text: 'PASS' }] },
+  ]
+  const mountWith = ($: Engine, surface: 'terminal' | 'desktop', view?: { agentId?: string }) =>
+    $.ui.mount({ plugin: 'orchestrator', surface, component: 'Pane', requestId: 'orchestrator', props: { bodyColumns: 100, view } as never })
+  const jump = async (ui: Parameters<typeof expandTurns>[0]) => {
+    const key = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').find(k => k.startsWith('jump:agent1:'))!
+    await ui.press({ key })
+  }
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`only the last 200 items are kept (${surface})`, async ($, on) => {
+      const w = world(on)
+      const many = Array.from({ length: 250 }, (_, i) => ({ role: 'user', text: `ask ${i}`, toolUses: [] }))
+      on('session.messages', () => ({ value: many as never }))
+      await running($, w)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 200 turns/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`reading one agent drops the cached transcripts of the others (${surface})`, async ($, on) => {
+      const w = world(on)
+      let holdAgent1 = false
+      on('session.messages', ($, e) =>
+        e.agentId === 'agent1' && holdAgent1 ? new Promise(() => {}) : ({ value: convo as never }),
+      )
+      await running($, w)
+      await spawn($, { prompt: 'P2', name: 'impl-2' })
+      await step($, 'agent2')
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-1 · 1 turn/ })).toBeDefined()
+      await ui.press({ key: 'timeline-back' })
+      await ui.press({ key: 'agent:agent2' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-2 · 1 turn/ })).toBeDefined()
+      await ui.press({ key: 'timeline-back' })
+      // agent1's read now never answers: a cached copy would still show its turn.
+      holdAgent1 = true
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /loading…/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a view that fails for another reason shows its message, bare (${surface})`, async ($, on) => {
+      const w = world(on)
+      // A hook's deny rejects the call.
+      on('ui.view', () => ({ deny: 'the view is busy' }) as never)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      await jump(ui)
+      const note = await ui.find({ text: /the view is busy/ })
+      expect(note).toBeDefined()
+      expect(note!.text).not.toContain('Error')
+      expect(await ui.find({ text: /from \/tasks/ })).toBeUndefined()
+      await ui.unmount()
+    })
+
+    test(`a view missing from the engine still says to open the agent from /tasks (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('ui.view', () => {
+        throw new TypeError('$.ui.view is not a function')
+      })
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, {})
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      await jump(ui)
+      expect(await ui.find({ text: /Open impl-1 from \/tasks to jump there/ })).toBeDefined()
+      await ui.unmount()
+    })
+
+    test(`a scroll that fails shows its reason with no Error prefix (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('ui.view', () => ({ value: {} }) as never)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      const ui = await mountWith($, surface, { agentId: 'agent1' })
+      await ui.press({ key: 'agent:agent1' })
+      await w.clock.settle()
+      await jump(ui)
+      const note = (await ui.find({ text: /ui\.scroll/ }))!
+      expect(note).toBeDefined()
+      expect(note.text).not.toMatch(/Error:/)
+      await ui.unmount()
+    })
+
+    test(`a selected agent that leaves the list does not bring its Timeline back with it (${surface})`, async ($, on) => {
+      const w = world(on)
+      on('session.messages', () => ({ value: convo as never }))
+      await running($, w)
+      await step($)
+      for (const n of [2, 3]) {
+        await spawn($, { prompt: `P${n}`, name: `impl-${n}`, parentAgentId: 'agent1' })
+        await step($, `agent${n}`)
+      }
+      await complete($, 'agent3', 'R3')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+      await w.clock.advance(30_000)
+      const ui = await mountPane($, surface)
+      await ui.press({ key: 'fold:agent1' })
+      await ui.press({ key: 'agent:agent2' })
+      await w.clock.settle()
+      expect(await ui.find({ text: /Timeline · impl-2/ })).toBeDefined()
+      // It finishes, so the fold hides it from the list; the Timeline goes with it.
+      await complete($, 'agent2', 'R2')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }]
+      await w.clock.advance(30_000)
+      expect(await ui.find({ text: /Timeline/ })).toBeUndefined()
+      expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
+      // It runs again and is back in the list: the list shows, not the Timeline.
+      await step($, 'agent2')
+      w.agents = [{ id: 'agent1', name: 'impl-1' }, { id: 'agent2', name: 'impl-2' }]
+      await w.clock.advance(30_000)
+      expect(await ui.find({ text: /Timeline/ })).toBeUndefined()
+      expect(await ui.find({ key: 'agent:agent1' })).toBeDefined()
+      await ui.unmount()
+    })
+  }
+})
+
 describe('agent transcript', () => {
   const transcript = [
     { role: 'user', text: 'Implement task 1', toolUses: [] },
