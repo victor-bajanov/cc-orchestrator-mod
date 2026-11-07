@@ -42,6 +42,7 @@ import {
   shellName,
   shellNudge,
   timeline,
+  windowStart,
   watchdogNudge,
   wrapFill,
 } from './core'
@@ -2676,7 +2677,7 @@ export const register: Register = (on, options) => {
     // The fold cell: the disclosure glyph (or a space) and a space.
     const FOLD = 2
     const width = Math.max(8, cols - NAME - 7 - 14 - MODEL)
-    const t0 = rows.reduce((m, r) => Math.min(m, r.startedAt), now)
+    const t0 = windowStart(rows, now)
     const ordered = orderRows(visible)
     const glyph: Record<DisplayStatus, string> = {
       running: '●',

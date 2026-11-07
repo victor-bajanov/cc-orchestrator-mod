@@ -91,6 +91,16 @@ export const sparkline = (samples: readonly Sample[], width: number, ceiling: nu
   return out
 }
 
+/** How far back the pane's time axis reaches: older readings age out. */
+export const WINDOW_MS = 2 * 60 * 60 * 1000
+
+/** The start of the shared time axis: the earliest agent's start, or `WINDOW_MS` before now in a longer session. */
+export const windowStart = (rows: readonly AgentRow[], now: number): number =>
+  Math.max(
+    now - WINDOW_MS,
+    rows.reduce((m, r) => Math.min(m, r.startedAt), now),
+  )
+
 /**
  * One column per slice of the shared axis [t0, t1]: the agent's peak in that
  * slice, its last reading carried through slices with none, blank before its
@@ -106,11 +116,17 @@ export const timeline = (
 ): string => {
   const cells: number[] = new Array(width).fill(-1)
   if (samples.length === 0 || width < 1) return ' '.repeat(Math.max(0, width))
+  // Readings before the axis have aged out: only the last of them, still holding at t0, is drawn.
+  const before = samples.filter(s => s.t < t0)
+  const inside = samples.filter(s => s.t >= t0)
+  const held = before[before.length - 1]
+  if (inside.length === 0 && !isLive) return ' '.repeat(width)
   const span = Math.max(1, t1 - t0)
   const col = (t: number) => Math.min(width - 1, Math.max(0, Math.floor(((t - t0) / span) * width)))
-  for (const s of samples) cells[col(s.t)] = Math.max(cells[col(s.t)] ?? -1, s.tokens)
-  const first = col(samples[0]?.t ?? t0)
-  const last = isLive ? width - 1 : col(samples[samples.length - 1]?.t ?? t0)
+  if (held) cells[0] = held.tokens
+  for (const s of inside) cells[col(s.t)] = Math.max(cells[col(s.t)] ?? -1, s.tokens)
+  const first = held ? 0 : col(inside[0]?.t ?? t0)
+  const last = isLive ? width - 1 : col(inside[inside.length - 1]?.t ?? t0)
   let carry = -1
   let out = ''
   for (let c = 0; c < width; c++) {

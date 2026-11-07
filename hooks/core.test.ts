@@ -18,6 +18,8 @@ import {
   rosterMarkdown,
   sparkline,
   timeline,
+  windowStart,
+  WINDOW_MS,
   handoverMessage,
   briefPathFor,
   respawnFailedNotice,
@@ -251,6 +253,37 @@ describe('timeline', () => {
   })
   test('is all blank with no samples', () => {
     expect(timeline([], 4, 0, 100, ceiling)).toBe('    ')
+  })
+  test('starts a window from the last reading before it, not the peak of everything older', () => {
+    const samples = [
+      { t: 0, tokens: 100 },
+      { t: 50, tokens: 25 },
+      { t: 150, tokens: 50 },
+    ]
+    // axis 100..200: the 100 at t 0 has aged out; 25 holds until 150.
+    expect(timeline(samples, 10, 100, 200, ceiling, true)).toBe('▃▃▃▃▃▅▅▅▅▅')
+  })
+  test('is blank for an agent that ended before the window', () => {
+    const samples = [
+      { t: 0, tokens: 100 },
+      { t: 50, tokens: 25 },
+    ]
+    expect(timeline(samples, 10, 100, 200, ceiling)).toBe('          ')
+  })
+})
+
+describe('windowStart', () => {
+  const row = (startedAt: number) => ({ ...recordStep([], { id: 'a', tokens: 1, t: startedAt, tools: 0 })[0]!, startedAt })
+  test('is the earliest start in a session shorter than the window', () => {
+    expect(windowStart([row(1000), row(5000)], 10_000)).toBe(1000)
+  })
+  test('trails now by the window in a longer session', () => {
+    expect(WINDOW_MS).toBe(2 * 60 * 60 * 1000)
+    const now = 10 * 60 * 60 * 1000
+    expect(windowStart([row(0)], now)).toBe(now - WINDOW_MS)
+  })
+  test('is now with no rows', () => {
+    expect(windowStart([], 42)).toBe(42)
   })
 })
 

@@ -49,7 +49,7 @@ Running agents survive `/clear`. This prompt is how the new context learns about
 - each row's model and effort, such as `Sonnet 5.5 med` (the model alone when the engine reports no effort)
 - click a subagent's name to open its Timeline over the whole pane (see *Timeline* below); `‹ agents`, or `b` with the pane focused, brings the tree back
 - a `▾` before a row with finished agents beneath it (main included) collapses them into `+N done`; the `▸` it becomes expands them again. With the pane focused, `c` collapses or expands main's finished agents
-- each agent's context drawn on one shared time axis, so you can see when each agent was active and how close it is to its limit (green, then amber from 60%, red at the threshold)
+- each agent's context drawn on one shared time axis, so you can see when each agent was active and how close it is to its limit (green, then amber from 60%, red at the threshold). In the terminal the axis covers the last two hours at most: older readings age out, and an agent that finished before then draws blank
 - an activity log; a line too long for the pane ends in `…`, and a click shows its full text beneath it (a second click hides it); the log gives up the rows it takes
 
 *Desktop app.* The pane has:
