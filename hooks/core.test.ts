@@ -303,6 +303,10 @@ describe('handoverMessage', () => {
 
 describe('respawnFailedNotice', () => {
   const brief = { prompt: 'P', subagentType: 'general-purpose', description: 'impl', model: 'opus', name: 'impl-2' }
+  test('leaves out a full model id, which the Agent tool refuses', () => {
+    const t = respawnFailedNotice({ label: 'x', id: 'agent2', notePath: '/n.md', reason: 'nope', brief: { ...brief, model: 'claude-mythos-5-2' } })
+    expect(t).not.toContain('model')
+  })
   test('names the note, the brief file and how to spawn', () => {
     const t = respawnFailedNotice({ label: 'impl-2', id: 'agent2', notePath: '/n.md', reason: 'nope', brief, briefPath: '/r/h/impl-2-agent2-1.brief.md' })
     for (const s of ['no replacement started: nope', 'note at /n.md', 'name "impl-2"', 'subagent_type "general-purpose"', 'model "opus"', '/r/h/impl-2-agent2-1.brief.md'])

@@ -11,6 +11,7 @@ import {
   addShell,
   adoptChildren,
   backgroundedShell,
+  agentToolModel,
   briefPathFor,
   ceilingDue,
   ceilingNudge,
@@ -1086,7 +1087,7 @@ async function respawn($: $, old: AgentRow) {
     prompt: replacementPrompt(brief, old.notePath),
     subagentType: brief.subagentType,
     description: brief.description,
-    model: brief.model,
+    model: agentToolModel(brief.model),
     name: brief.name,
   }
   let res: Awaited<ReturnType<typeof $.agent.spawn>>
@@ -2004,6 +2005,8 @@ export const register: Register = (on, options) => {
   })
 
   on('agent.spawn', async ($, e, next) => {
+    // A message waking a resting agent: its prompt is that message, not a brief, and the run is the row already kept.
+    if (e.resume) return next(e)
     const res = await next(cfg.injectClause ? { ...e, prompt: e.prompt + HANDOVER_CLAUSE } : e)
     if (res.deny !== undefined || !res.agentId) return res
     const id = res.agentId
