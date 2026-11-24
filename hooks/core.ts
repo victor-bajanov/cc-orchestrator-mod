@@ -194,6 +194,12 @@ export const handoverMessage = (notePath: string, isRespawned: boolean): string 
       : `Then end with this final reply: "HANDED OVER: note at ${notePath}. Please spawn a replacement with my original brief plus: start from the handover note at ${notePath}."`,
   ].join(' ')
 
+/**
+ * A brief's model as the Agent tool takes it: an alias (`opus`), never a full id (`claude-opus-5-5`), which its
+ * schema refuses. A full id is left out, so the agent's own definition, then the parent's model, decides.
+ */
+export const agentToolModel = (model?: string): string | undefined => (model && /^[a-z]+$/.test(model) ? model : undefined)
+
 export const replacementPrompt = (brief: Brief, notePath: string): string =>
   `${brief.prompt}\n\n---\nYou replace an agent that reached its context limit. Start from the handover note at ${notePath}: read it first and continue from its next concrete step; do not redo finished work.`
 
@@ -222,7 +228,7 @@ export const respawnFailedNotice = (o: {
   const opts = [
     b.name && `name "${b.name}"`,
     `subagent_type "${b.subagentType}"`,
-    b.model && `model "${b.model}"`,
+    agentToolModel(b.model) && `model "${b.model}"`,
     `description "${b.description}"`,
   ]
     .filter(Boolean)

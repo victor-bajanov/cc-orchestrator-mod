@@ -83,6 +83,8 @@ const world = (on: On) => {
       | undefined,
     /** The verdict of each mod spawn's Agent check (auto mode), in order. */
     spawnChecks: [] as string[],
+    /** Each resumed run's \`agent.spawn\` (a message waking a resting agent), as it reached the engine. */
+    resumes: [] as { agentId: string; prompt: string }[],
     /** Runs inside the mod's spawn, after its check: `check` asks tool.check about any Agent input. */
     duringSpawn: undefined as ((check: (input: Record<string, unknown>) => Promise<string>) => Promise<unknown>) | undefined,
     /** The next spawn is refused with this reason ('' none); 'throw' makes it throw. Refused spawns are not recorded. */
@@ -158,6 +160,11 @@ const world = (on: On) => {
     return { text: '' }
   })
   on('agent.spawn', async ($, e) => {
+    // A resumed run starts no new agent: it continues under its own id.
+    if (e.resume) {
+      w.resumes.push({ agentId: e.resume.agentId, prompt: e.prompt })
+      return { model: 'opus', agentId: e.resume.agentId }
+    }
     // Auto mode judges a spawn with no Agent tool call behind it (the mod's own; the model's carry a tool_use_id).
     if (w.checkSends && !e.tool_use_id) {
       const check = async (input: Record<string, unknown>) =>
@@ -436,6 +443,55 @@ describe('subagents', () => {
     await complete($, 'agent1', 'HANDED OVER')
     expect(w.spawns).toHaveLength(2)
     expect(row(w, 'agent1')!.status).toBe('replaced')
+  })
+
+  test('a resume woken by the HANDOVER keeps the original brief and the respawn passes no full model id', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'Original brief.', name: 'probe', model: 'claude-mythos-5-2' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    await complete($, 'agent1', 'my 16 lines')
+    const handover = w.sent[0]!.text
+    expect(handover).toContain('HANDOVER')
+
+    // the message wakes the resting agent: the engine raises a resumed run's spawn, its prompt the message
+    await $.agent.spawn({
+      tool_use_id: '',
+      prompt: handover,
+      description: 'implement task',
+      subagentType: 'general-purpose',
+      provider: { plugin: 'engine', tier: 'core' },
+      parentModel: 'claude-opus-5-5',
+      name: 'probe',
+      model: 'claude-mythos-5-2',
+      background: true,
+      fork: false,
+      resume: { agentId: 'agent1' },
+    } as never)
+    expect(w.resumes).toEqual([{ agentId: 'agent1', prompt: handover }])
+    expect(row(w, 'agent1')!.brief!.prompt).toBe('Original brief.')
+    expect(row(w, 'agent1')!.status).toBe('handing-over')
+
+    w.files.set(`${RUN_DIR}/handover/probe-agent1-1.md`, 'x')
+    await complete($, 'agent1', 'HANDED OVER')
+    expect(w.spawns).toHaveLength(2)
+    const again = w.spawns[1]!
+    expect(again.prompt.startsWith('Original brief.')).toBe(true)
+    expect(again.prompt).not.toContain('HANDOVER. Your context')
+    // the Agent tool takes only an alias: a full id is left out, and the agent's definition decides
+    expect(again.model).toBeUndefined()
+  })
+
+  test('a respawn keeps an alias model', async ($, on) => {
+    const w = world(on)
+    await start($)
+    await spawn($, { prompt: 'P', name: 'impl-1', model: 'sonnet' })
+    w.tokens.set('agent1', 460_000)
+    await step($, 'agent1')
+    w.files.set(`${RUN_DIR}/handover/impl-1-agent1-1.md`, 'x')
+    await complete($, 'agent1')
+    expect(w.spawns[1]!.model).toBe('sonnet')
   })
 
   test('a replaced agent that ends again stays replaced', async ($, on) => {
